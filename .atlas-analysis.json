@@ -1,0 +1,133 @@
+{
+  "projectType": "saas",
+  "projectName": "Kairos",
+  "projectDescription": "Kairos is a multi-venue prediction market and perpetuals trading platform with unified APIs for market data, order execution, auctions, and trader analytics across providers like Polymarket, Kalshi, and Predict.fun.",
+  "theme": "luma",
+  "primaryColor": "#807dfe",
+  "lightColor": "#060610",
+  "darkColor": "#848488",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "authentication"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/markets",
+              "concepts/venues",
+              "concepts/orders",
+              "concepts/wallets"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/trading",
+              "guides/market-data",
+              "guides/websocket",
+              "guides/auctions",
+              "guides/cross-venue-routing",
+              "guides/combos"
+            ]
+          },
+          {
+            "group": "WebSocket",
+            "pages": [
+              "websocket/overview",
+              "websocket/market-data",
+              "websocket/protobuf"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Market Data API",
+            "pages": [
+              "api/market-data/overview",
+              "api/market-data/markets",
+              "api/market-data/candles",
+              "api/market-data/trades",
+              "api/market-data/perpetuals"
+            ]
+          },
+          {
+            "group": "Data API",
+            "pages": [
+              "api/data/overview",
+              "api/data/markets",
+              "api/data/search",
+              "api/data/sports",
+              "api/data/trader-analytics",
+              "api/data/pnl"
+            ]
+          },
+          {
+            "group": "Execution API",
+            "pages": [
+              "api/execution/overview",
+              "api/execution/orders",
+              "api/execution/exchanges",
+              "api/execution/routing",
+              "api/execution/combos",
+              "api/execution/onboarding"
+            ]
+          },
+          {
+            "group": "Agora Auction API",
+            "pages": [
+              "api/agora/overview",
+              "api/agora/auctions",
+              "api/agora/quotes"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Unified market data across Polymarket, Kalshi, and Predict.fun",
+    "Order execution with cross-venue routing",
+    "Real-time WebSocket streams for orderbooks, trades, and prices",
+    "Agora private auction house for institutional block trades",
+    "Sports markets with live cross-platform matching",
+    "Trader analytics including PnL history and position tracking",
+    "Combo/parlay markets on Polymarket",
+    "Self-custody signing with EIP-712 support",
+    "Perpetuals market data via Hyperliquid integration",
+    "Market screener with presets for finding opportunities"
+  ],
+  "publicApiSurface": [
+    "GET /v1/markets — Market Data API",
+    "POST /v1/candles/batch — Market Data API",
+    "GET /v1/trades — Market Data API",
+    "GET /markets/active — Data API",
+    "GET /search/markets — Data API",
+    "GET /search/screener — Data API",
+    "GET /trader-stats/pnl-history/{wallet_address} — Data API",
+    "POST /orders — Execution API",
+    "GET /orders — Execution API",
+    "POST /orders/{order_id}/cancel — Execution API",
+    "GET /orders/route-quote — Execution API",
+    "POST /orders/route-buy — Execution API",
+    "POST /combo/execute — Execution API",
+    "POST /v1/auctions — Agora API",
+    "POST /v1/auctions/{auctionID}/quotes — Agora API",
+    "GET /v1/stream — Agora WebSocket stream",
+    "GET /providers/configs — Data API",
+    "GET /sports/live-events — Data API",
+    "POST /v2/orders/intent — Execution API (self-custody)",
+    "POST /v2/orders/submit — Execution API (self-custody)"
+  ]
+}

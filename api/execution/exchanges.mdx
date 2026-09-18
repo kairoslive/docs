@@ -1,0 +1,230 @@
+---
+title: "Execution API: Exchange Configuration and Allowances"
+sidebarTitle: "Exchanges"
+description: "List registered prediction market venues, inspect capabilities, manage on-chain allowances, and prepare wallets for trading using the Kairos Execution API."
+---
+
+Before you place your first order on any venue, use the Exchanges endpoints to discover which venues are available, understand what each one supports, and ensure your wallet holds the correct on-chain approvals. On EVM-based prediction markets like Polymarket and Predict.fun, you must approve the venue's smart contracts to spend your USDC before orders can settle — these endpoints make that setup straightforward.
+
+## Endpoints at a Glance
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/exchanges` | List registered venue IDs |
+| `GET` | `/exchanges/{exchange_id}` | Get a venue's display info and full capability set |
+| `GET` | `/exchanges/{exchange_id}/capabilities` | Get a venue's capability set only |
+| `GET` | `/exchanges/{exchange_id}/allowances` | Read your current on-chain allowances |
+| `POST` | `/exchanges/{exchange_id}/allowances` | Set the on-chain allowances the venue needs |
+| `POST` | `/exchanges/{exchange_id}/prepare-wallet` | Sponsor gas and set allowances in one call |
+| `POST` | `/credentials/invalidate` | Drop the service's cached venue credentials |
+
+---
+
+## GET /exchanges — List Registered Venues
+
+Returns the list of `exchange_id` values this Kairos deployment has registered. Use the IDs in this response as the `exchange_id` field throughout every order and configuration endpoint.
+
+```bash
+curl https://execution.kairos.trade/exchanges \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "exchanges": ["polymarket", "kalshi", "predictfun", "opinion"]
+}
+```
+
+<Note>
+  The set of available venues can vary by API key tier and deployment. Always fetch this list programmatically rather than hard-coding exchange IDs.
+</Note>
+
+### Exchange ID Reference
+
+| `exchange_id` | Venue | Collateral |
+|---|---|---|
+| `polymarket` | Polymarket CLOB | USDC (Polygon) |
+| `kalshi` | Kalshi | USD (ACH/wire) |
+| `predictfun` | Predict.fun | USDC (Base) |
+| `opinion` | Opinion Markets | USDT (Polygon) |
+
+---
+
+## GET /exchanges/{exchange_id} — Get Venue Info and Capabilities
+
+Returns the full display profile plus the capability set for one venue — everything `GET /exchanges/{exchange_id}/capabilities` returns, plus human-readable name, logo URL, and supported collateral tokens.
+
+```bash
+curl https://execution.kairos.trade/exchanges/polymarket \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "exchange_id": "polymarket",
+  "name": "Polymarket",
+  "capabilities": {
+    "order_types": ["limit", "market"],
+    "time_in_force": ["GTC", "FOK", "IOC"],
+    "self_custody": true,
+    "combos": true,
+    "ctf": true,
+    "routing": true
+  },
+  "collateral_tokens": [
+    { "symbol": "USDC", "address": "0x2791bca...", "chain_id": 137 }
+  ]
+}
+```
+
+---
+
+## GET /exchanges/{exchange_id}/capabilities — Get Capability Set
+
+Returns only the capability flags for one venue, without the display metadata. Use this for lightweight capability checks in trading logic.
+
+```bash
+curl https://execution.kairos.trade/exchanges/kalshi/capabilities \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "order_types": ["limit", "market"],
+  "time_in_force": ["GTC", "IOC"],
+  "self_custody": false,
+  "combos": false,
+  "ctf": false,
+  "routing": true
+}
+```
+
+<Tip>
+  Check `self_custody: true` before building a v2 EIP-712 order flow for a given venue. Not all venues support self-custody signing.
+</Tip>
+
+---
+
+## GET /exchanges/{exchange_id}/allowances — Read On-Chain Allowances
+
+Returns the on-chain ERC-20 allowances your connected wallet has currently granted to the venue's contracts, alongside the required amounts. Use this to detect when a wallet needs re-approval — for example, after a wallet is freshly imported or an allowance is exhausted.
+
+```bash
+curl https://execution.kairos.trade/exchanges/polymarket/allowances \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "allowances": [
+    {
+      "token_symbol": "USDC",
+      "token_address": "0x2791bca...",
+      "spender": "0xctf_exchange...",
+      "current": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "required": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+      "sufficient": true
+    }
+  ]
+}
+```
+
+---
+
+## POST /exchanges/{exchange_id}/allowances — Set On-Chain Allowances
+
+Submits on-chain `approve()` transactions to grant the venue's contracts the required ERC-20 spending allowances from your wallet. Kairos sponsors gas for this operation if your wallet is eligible; otherwise the cost is deducted from your on-chain balance.
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/allowances \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+The response includes the submitted transaction hashes and a `status` of `pending` or `confirmed`.
+
+```json
+{
+  "transactions": [
+    {
+      "token_symbol": "USDC",
+      "tx_hash": "0xfeed1234...",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+<Warning>
+  On-chain transactions are irreversible. Confirm your wallet address and the venue you're approving before calling this endpoint.
+</Warning>
+
+---
+
+## POST /exchanges/{exchange_id}/prepare-wallet — Sponsor Gas and Set Allowances
+
+A convenience endpoint that combines gas sponsorship and allowance-setting in a single call. Use this for new wallets that need both gas and approvals set up before trading. Kairos covers the gas cost so the wallet doesn't need native MATIC or ETH to get started.
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/prepare-wallet \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+```json
+{
+  "gas_sponsored": true,
+  "transactions": [
+    { "description": "Set USDC allowance", "tx_hash": "0xabc...", "status": "confirmed" }
+  ]
+}
+```
+
+---
+
+## POST /credentials/invalidate — Drop Cached Venue Credentials
+
+Tells Kairos to evict its cached copy of your venue API credentials (e.g. a Kalshi key pair or Polymarket API key). Use this after rotating credentials at the exchange level to force Kairos to re-fetch or prompt for re-authentication on the next order.
+
+```bash
+curl -X POST https://execution.kairos.trade/credentials/invalidate \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "exchange_id": "kalshi" }'
+```
+
+```json
+{ "invalidated": true }
+```
+
+<Note>
+  After invalidating credentials you must re-run the appropriate `enable-trading` onboarding endpoint for that venue before orders will succeed. See the [Onboarding guide](./onboarding) for per-venue instructions.
+</Note>
+
+---
+
+## Typical Setup Sequence
+
+<Steps>
+  <Step title="List available exchanges">
+    Call `GET /exchanges` to confirm the venue you want is registered.
+  </Step>
+
+  <Step title="Check capabilities">
+    Call `GET /exchanges/{exchange_id}/capabilities` to verify the venue supports your desired order types and TIF.
+  </Step>
+
+  <Step title="Read current allowances">
+    Call `GET /exchanges/{exchange_id}/allowances` to check whether your wallet already has sufficient approvals.
+  </Step>
+
+  <Step title="Set allowances or prepare wallet">
+    If allowances are insufficient, call `POST /exchanges/{exchange_id}/prepare-wallet` for a new wallet (gas + approvals in one step), or `POST /exchanges/{exchange_id}/allowances` for an existing funded wallet.
+  </Step>
+
+  <Step title="Enable trading">
+    Run the venue-specific `enable-trading` onboarding endpoint. See [Onboarding](./onboarding) for details.
+  </Step>
+</Steps>

@@ -1,0 +1,307 @@
+---
+title: "Execution API: Cross-Venue Order Routing Endpoints"
+sidebarTitle: "Routing"
+description: "Price, execute, and manage cross-venue routed orders that fill a single size across linked prediction markets on Polymarket and Kalshi simultaneously."
+---
+
+Cross-venue routing lets you trade a single notional size across a pair of equivalent markets on different platforms — typically one leg on Polymarket and one on Kalshi — as a unified operation. Kairos handles the split calculation, simultaneous leg submission, and position tracking. You see one routed parent order with two child legs rather than two independent orders to manage.
+
+This is useful when you find arbitrage between venues, want to hedge a position across platforms, or need deeper liquidity than any single venue can offer at your target price.
+
+## How Market Links Work
+
+A **market link** is a verified mapping between two equivalent markets on different venues. For example, "Will the Fed cut rates in December?" on Polymarket is linked to the corresponding Kalshi series. Kairos maintains a curated catalog of links; you can also create your own using `POST /orders/market-links`.
+
+When you call `POST /orders/route-buy`, Kairos:
+1. Looks up the market link to identify both legs.
+2. Calculates the optimal size split across the two legs to fill your requested total size at the best combined price.
+3. Submits both leg orders simultaneously.
+4. Returns a routed parent order with embedded leg details.
+
+## Endpoints at a Glance
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/orders/route-quote` | Price a size across both legs without executing |
+| `GET` | `/orders/route-fees` | Get the per-leg fee model for a market link |
+| `POST` | `/orders/route-buy` | Execute a cross-venue buy across both legs |
+| `POST` | `/orders/route-close` | Close a routed position across both legs |
+| `GET` | `/orders/routes` | List your routed parent orders and their legs |
+| `POST` | `/orders/market-links` | Create or preview a self-serve market link |
+
+---
+
+## GET /orders/route-quote — Price a Cross-Venue Size
+
+Get the indicative fill price and size allocation across both legs of a market link before committing. Use this to display the all-in cost to your user or to confirm that slippage stays within your acceptable range.
+
+### Query Parameters
+
+<ParamField query="market_link_id" type="string" required>
+  The ID of the cross-venue market link. Retrieve link IDs from the Data API's `/matched-markets` endpoint or from `POST /orders/market-links`.
+</ParamField>
+
+<ParamField query="side" type="string" required>
+  `BUY` or `SELL`.
+</ParamField>
+
+<ParamField query="size" type="number" required>
+  Total number of shares you want to fill across both legs combined.
+</ParamField>
+
+```bash
+curl "https://execution.kairos.trade/orders/route-quote?market_link_id=ml_fed_dec&side=BUY&size=500" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "market_link_id": "ml_fed_dec",
+  "side": "BUY",
+  "requested_size": 500,
+  "legs": [
+    {
+      "exchange_id": "polymarket",
+      "market_id": "0xabcd...",
+      "size": 300,
+      "best_ask": 0.61,
+      "estimated_fill_price": 0.612
+    },
+    {
+      "exchange_id": "kalshi",
+      "market_id": "KXFEDRATE-25DEC",
+      "size": 200,
+      "best_ask": 0.60,
+      "estimated_fill_price": 0.601
+    }
+  ],
+  "weighted_average_price": 0.607,
+  "total_estimated_cost_usdc": 303.70
+}
+```
+
+---
+
+## GET /orders/route-fees — Get Per-Leg Fee Model
+
+Returns the fee structure for each leg of a cross-venue market link — platform fee rate, exchange fee rate, and combined total. Use this alongside `route-quote` to show users the full cost breakdown before execution.
+
+### Query Parameters
+
+<ParamField query="market_link_id" type="string" required>
+  The cross-venue market link ID.
+</ParamField>
+
+```bash
+curl "https://execution.kairos.trade/orders/route-fees?market_link_id=ml_fed_dec" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "legs": [
+    {
+      "exchange_id": "polymarket",
+      "platform_fee_rate": 0.001,
+      "exchange_fee_rate": 0.0035,
+      "total_fee_rate": 0.0045
+    },
+    {
+      "exchange_id": "kalshi",
+      "platform_fee_rate": 0.001,
+      "exchange_fee_rate": 0.003,
+      "total_fee_rate": 0.004
+    }
+  ]
+}
+```
+
+---
+
+## POST /orders/route-buy — Execute a Cross-Venue Buy
+
+Buy a size split across both legs of a market link. Kairos calculates the split, submits both leg orders simultaneously, and returns a routed parent order containing both child orders.
+
+### Request Body
+
+<ParamField body="market_link_id" type="string" required>
+  The cross-venue market link to trade against.
+</ParamField>
+
+<ParamField body="side" type="string" required>
+  `BUY` — buying the YES outcome across both legs.
+</ParamField>
+
+<ParamField body="size" type="number" required>
+  Total shares to fill across both legs.
+</ParamField>
+
+<ParamField body="max_price" type="number">
+  Optional maximum average fill price (probability). The route-buy is rejected if the estimated weighted average price exceeds this threshold.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/route-buy \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "market_link_id": "ml_fed_dec",
+    "side": "BUY",
+    "size": 500,
+    "max_price": 0.65
+  }'
+```
+
+```javascript
+const resp = await fetch("https://execution.kairos.trade/orders/route-buy", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${process.env.KAIROS_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    market_link_id: "ml_fed_dec",
+    side: "BUY",
+    size: 500,
+    max_price: 0.65,
+  }),
+});
+const route = await resp.json();
+console.log(route.route_order_id, route.status);
+```
+
+### Response
+
+```json
+{
+  "route_order_id": "route_01j9...",
+  "market_link_id": "ml_fed_dec",
+  "status": "submitted",
+  "legs": [
+    {
+      "exchange_id": "polymarket",
+      "order_id": "ord_01j9xa...",
+      "market_id": "0xabcd...",
+      "size": 300,
+      "price": 0.612,
+      "status": "open"
+    },
+    {
+      "exchange_id": "kalshi",
+      "order_id": "ord_01j9xb...",
+      "market_id": "KXFEDRATE-25DEC",
+      "size": 200,
+      "price": 0.601,
+      "status": "open"
+    }
+  ],
+  "total_size": 500,
+  "weighted_average_price": 0.607,
+  "created_at": "2025-01-15T14:30:00Z"
+}
+```
+
+<Note>
+  Each leg's `order_id` is a valid Kairos order ID. You can call `GET /orders/{order_id}` on each leg independently, or use `GET /orders/routes` to see the full routed order tree.
+</Note>
+
+---
+
+## POST /orders/route-close — Close a Routed Position
+
+Close an existing routed position across both legs simultaneously. Kairos reads your current position on each leg and submits opposing sell orders to close them.
+
+### Request Body
+
+<ParamField body="route_order_id" type="string" required>
+  The `route_order_id` returned by a previous `POST /orders/route-buy`.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/route-close \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "route_order_id": "route_01j9..." }'
+```
+
+---
+
+## GET /orders/routes — List Your Routed Orders
+
+Returns all of your routed parent orders and their leg details. Use this to reconcile cross-venue positions or display a unified view of routed trades.
+
+```bash
+curl "https://execution.kairos.trade/orders/routes" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "routes": [
+    {
+      "route_order_id": "route_01j9...",
+      "market_link_id": "ml_fed_dec",
+      "status": "partially_filled",
+      "total_size": 500,
+      "filled_size": 300,
+      "legs": [ "ord_01j9xa...", "ord_01j9xb..." ],
+      "created_at": "2025-01-15T14:30:00Z"
+    }
+  ]
+}
+```
+
+---
+
+## POST /orders/market-links — Create a Self-Serve Market Link
+
+Create a new cross-venue market link between any two markets you specify, or run in preview mode to validate that the two markets are compatible before saving.
+
+### Request Body
+
+<ParamField body="provider_a" type="string" required>
+  The exchange ID for the first leg (e.g. `polymarket`).
+</ParamField>
+
+<ParamField body="market_id_a" type="string" required>
+  The market or token ID on the first venue.
+</ParamField>
+
+<ParamField body="provider_b" type="string" required>
+  The exchange ID for the second leg (e.g. `kalshi`).
+</ParamField>
+
+<ParamField body="market_id_b" type="string" required>
+  The market or token ID on the second venue.
+</ParamField>
+
+<ParamField body="preview" type="boolean">
+  If `true`, validates compatibility and returns a preview without saving the link. Defaults to `false`.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/market-links \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider_a": "polymarket",
+    "market_id_a": "0xabcd...",
+    "provider_b": "kalshi",
+    "market_id_b": "KXFEDRATE-25DEC",
+    "preview": true
+  }'
+```
+
+```json
+{
+  "market_link_id": null,
+  "preview": true,
+  "compatible": true,
+  "outcome_alignment": "YES↔YES",
+  "message": "Markets are compatible. Set preview=false to save."
+}
+```
+
+<Tip>
+  Always run with `preview: true` first to confirm outcome alignment before saving a self-serve link. An inverted link (YES on one side vs. NO on the other) would cause unexpected position behavior.
+</Tip>

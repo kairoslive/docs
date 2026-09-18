@@ -1,0 +1,568 @@
+---
+title: "Data API: Sports Markets, Live Games, and Odds Feeds"
+sidebarTitle: "Sports"
+description: "Access live and upcoming sports prediction markets matched across Polymarket and Kalshi, including scores, brackets, and futures using the Kairos Data API."
+---
+
+The Data API sports group gives you 19 endpoints to work with sports prediction markets across all Kairos-supported venues. You can query live games with urgency scores, browse matched cross-venue markets, pull tournament brackets, fetch season futures, and access enriched score and probability data from TxOdds — all in one normalized API. Several endpoints are free and require no API key.
+
+## Authentication
+
+Most sports endpoints require authentication:
+
+```http
+Authorization: Bearer <your-api-key>
+```
+
+Endpoints marked **free** below work without any credentials.
+
+---
+
+## GET `/sports/live-events`
+
+Get active sports games with urgency scores and cross-provider prices. Each result includes real-time scores where available, the time remaining in the game, and best bid/ask prices across every venue that has a market on that game.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport (e.g., `nba`, `nfl`, `mlb`, `nhl`, `soccer`). Omit for all sports.
+</ParamField>
+
+<ParamField query="provider" type="string">
+  Scope to a single venue. Omit for cross-venue results.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/live-events" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba"
+```
+
+**Example response**
+
+```json
+{
+  "events": [
+    {
+      "event_id": "nba-celtics-knicks-20250415",
+      "sport": "nba",
+      "home_team": "New York Knicks",
+      "away_team": "Boston Celtics",
+      "home_score": 88,
+      "away_score": 94,
+      "period": "4th Quarter",
+      "time_remaining": "3:42",
+      "urgency_score": 0.91,
+      "markets": [
+        {
+          "provider": "polymarket",
+          "market_id": "0xabc123",
+          "title": "Celtics vs. Knicks — Celtics win?",
+          "best_bid": 0.61,
+          "best_ask": 0.63
+        },
+        {
+          "provider": "kalshi",
+          "market_id": "NBA-CEL-NYK-20250415",
+          "title": "Boston Celtics to win",
+          "best_bid": 0.60,
+          "best_ask": 0.62
+        }
+      ]
+    }
+  ]
+}
+```
+
+<Note>
+  The `urgency_score` is a 0–1 value that reflects how close or high-stakes the game is. A score near 1 means the game is close and nearly over. Use it to sort events by trading interest.
+</Note>
+
+---
+
+## GET `/sports/trending-matched` — **Free**
+
+Get top live and upcoming sports markets matched across Polymarket and Kalshi. This endpoint is free — no API key required. Use it to surface popular sports markets without auth.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport. Omit for all sports.
+</ParamField>
+
+<ParamField query="limit" type="integer">
+  Maximum results to return. Defaults to `20`.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/trending-matched" \
+  -G \
+  --data-urlencode "limit=10"
+```
+
+---
+
+## GET `/sports/event-markets`
+
+Get all prediction markets for a single sports event across all venues. Use this to display a full market menu for a game — moneyline, spread, totals, and any other available contracts.
+
+**Parameters**
+
+<ParamField query="event_id" type="string" required>
+  The Kairos sports event identifier.
+</ParamField>
+
+<ParamField query="provider" type="string">
+  Scope to a specific venue. Omit for all venues.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/event-markets" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "event_id=nba-celtics-knicks-20250415"
+```
+
+---
+
+## GET `/sports/upcoming-events`
+
+Get upcoming sports events within a specified time window, before they go live. Use this to build a schedule view or pre-populate a watchlist.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport. Omit for all sports.
+</ParamField>
+
+<ParamField query="within_hours" type="integer">
+  Return events starting within this many hours from now. Defaults to `24`.
+</ParamField>
+
+<ParamField query="provider" type="string">
+  Scope to a single venue.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/upcoming-events" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nfl" \
+  --data-urlencode "within_hours=48"
+```
+
+---
+
+## GET `/sports/futures`
+
+Get season and tournament futures markets across sports. Futures cover long-horizon questions like "Who wins the NBA Championship?" or "Who finishes first in the NFC East?"
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport (e.g., `nba`, `nfl`, `mlb`, `nhl`).
+</ParamField>
+
+<ParamField query="provider" type="string">
+  Scope to a single venue.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/futures" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba"
+```
+
+**Example response**
+
+```json
+{
+  "futures": [
+    {
+      "market_id": "0xfut001",
+      "provider": "polymarket",
+      "title": "NBA Championship Winner 2025",
+      "type": "futures",
+      "outcomes": [
+        {"team": "Boston Celtics", "best_bid": 0.28, "best_ask": 0.30},
+        {"team": "Oklahoma City Thunder", "best_bid": 0.22, "best_ask": 0.24}
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## GET `/sports/tournament-bracket`
+
+Get a tournament bracket populated with live cross-provider prices for each matchup. Use this to render a bracket UI that shows both the sporting results and the implied market probabilities for each tie.
+
+**Parameters**
+
+<ParamField query="tournament_id" type="string" required>
+  The Kairos tournament identifier (e.g., `ncaa-march-madness-2025`).
+</ParamField>
+
+<ParamField query="provider" type="string">
+  Scope prices to a single venue. Omit to include cross-venue prices.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/tournament-bracket" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "tournament_id=ncaa-march-madness-2025"
+```
+
+---
+
+## GET `/sports/game-markets`
+
+Get all cross-venue market families for a single game, grouped by market section (e.g., moneyline, spread, totals). Use this when you want to display every available contract for one game in an organized structure.
+
+**Parameters**
+
+<ParamField query="game_id" type="string" required>
+  The Kairos game identifier.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/game-markets" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "game_id=nba-celtics-knicks-20250415"
+```
+
+---
+
+## GET `/sports/catalog`
+
+Get the enriched catalog of sport categories and leagues supported by Kairos. Use this to populate sport/league filters in your UI.
+
+```bash
+curl -s "https://data.kairos.trade/sports/catalog" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+**Example response**
+
+```json
+{
+  "sports": [
+    {
+      "sport_id": "nba",
+      "label": "NBA Basketball",
+      "league": "NBA",
+      "active_market_count": 42,
+      "has_live_events": true
+    },
+    {
+      "sport_id": "nfl",
+      "label": "NFL Football",
+      "league": "NFL",
+      "active_market_count": 18,
+      "has_live_events": false
+    }
+  ]
+}
+```
+
+---
+
+## GET `/sports/kalshi-filters` — **Free**
+
+Get the full Kalshi Sport → Competition → Scope taxonomy. This hierarchical filter structure mirrors what Kalshi uses to organize their sports markets and is free to call without authentication.
+
+```bash
+curl -s "https://data.kairos.trade/sports/kalshi-filters"
+```
+
+**Example response**
+
+```json
+{
+  "filters": [
+    {
+      "sport": "Basketball",
+      "competitions": [
+        {
+          "competition": "NBA",
+          "scopes": ["MoneyLine", "Spread", "Total Points"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+## GET `/matched-markets`
+
+Get the paginated catalog of verified cross-venue matched markets — pairs of markets from different venues confirmed to resolve on the same underlying event. Use this to enumerate all known arbitrage-eligible market pairs.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Pagination cursor from a prior response.
+</ParamField>
+
+<ParamField query="limit" type="integer">
+  Results per page. Defaults to `50`.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/matched-markets" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba" \
+  --data-urlencode "limit=20"
+```
+
+---
+
+## GET `/matched-markets/enriched`
+
+Get matched markets with full identifiers, outcome labels, and current reference prices for both legs. This is the enriched version of `/matched-markets` — use it when you need prices alongside the pairing metadata.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Pagination cursor from a prior response.
+</ParamField>
+
+<ParamField query="limit" type="integer">
+  Results per page. Defaults to `50`.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/matched-markets/enriched" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba"
+```
+
+**Example response**
+
+```json
+{
+  "matched_markets": [
+    {
+      "match_id": "nba-celtics-knicks-20250415-ml",
+      "sport": "nba",
+      "legs": [
+        {
+          "provider": "polymarket",
+          "market_id": "0xabc123",
+          "outcome": "Celtics win",
+          "best_bid": 0.61,
+          "best_ask": 0.63
+        },
+        {
+          "provider": "kalshi",
+          "market_id": "NBA-CEL-NYK-20250415",
+          "outcome": "Boston Celtics to win",
+          "best_bid": 0.60,
+          "best_ask": 0.62
+        }
+      ]
+    }
+  ],
+  "next_cursor": "eyJwYWdlIjoyfQ=="
+}
+```
+
+<Tip>
+  Combine `/matched-markets/enriched` with the Execution API's `/orders/route-quote` and `/orders/route-buy` endpoints to programmatically identify and execute cross-venue trades in one workflow.
+</Tip>
+
+---
+
+## GET `/sports/matching-markets` — **Free**
+
+Get cross-platform matching-market records for a set of game slugs. Returns the Polymarket and Kalshi market IDs that cover the same underlying game, identified by slug. This endpoint is free — no API key required.
+
+**Parameters**
+
+<ParamField query="slugs" type="string" required>
+  Comma-separated list of game slugs (e.g., `celtics-knicks-20250415`).
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/matching-markets" \
+  -G \
+  --data-urlencode "slugs=celtics-knicks-20250415,lakers-warriors-20250416"
+```
+
+---
+
+## GET `/sports/kalshi-live-games`
+
+Get currently-live Kalshi sports games for supported sports (NHL, NBA, MLB, NFL+UFL, soccer, and esports). Returns games that are actively in-play on Kalshi with current scores and market status.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport (e.g., `nba`, `nhl`, `mlb`, `nfl`, `soccer`). Omit for all supported sports.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/kalshi-live-games" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba"
+```
+
+---
+
+## GET `/sports/poly-kalshi-pairings`
+
+Get live game pairings between Polymarket and Kalshi. Returns matched game records showing which Polymarket game corresponds to which Kalshi game, with prices from both venues for comparison.
+
+```bash
+curl -s "https://data.kairos.trade/sports/poly-kalshi-pairings" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+---
+
+## GET `/sports/combo-markets`
+
+Get the catalog of combo-eligible Polymarket markets. These are the markets that can be combined into parlays using the Execution API's `/combo/execute` endpoint.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport. Omit for all sports.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/sports/combo-markets" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba"
+```
+
+<Tip>
+  Use this endpoint to populate a combo/parlay builder UI. Pass the returned market IDs to `/combo/quote` (Execution API) to price a parlay before submitting it via `/combo/execute`.
+</Tip>
+
+---
+
+## GET `/sports/metadata`
+
+Get synced sports teams and leagues reference data. Returns canonical team identifiers, league names, and logo URLs used across all Kairos sports endpoints.
+
+```bash
+curl -s "https://data.kairos.trade/sports/metadata" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+**Example response**
+
+```json
+{
+  "leagues": [
+    {"id": "nba", "label": "NBA", "sport": "basketball"},
+    {"id": "nfl", "label": "NFL", "sport": "american_football"}
+  ],
+  "teams": [
+    {"id": "bos", "league": "nba", "label": "Boston Celtics", "abbreviation": "BOS"},
+    {"id": "nyc", "league": "nba", "label": "New York Knicks", "abbreviation": "NYK"}
+  ]
+}
+```
+
+---
+
+## TxOdds Fixture Endpoints
+
+The TxOdds group provides three endpoints for score timelines, win-probability history, and possession metrics from the TxOdds data feed. Use these to enrich your sports market UI with live fixture context.
+
+---
+
+## GET `/txodds/fixtures`
+
+List sports fixtures with live status and win probabilities from TxOdds. Returns a paginated list of fixtures across all supported sports with current scores and win-probability values.
+
+**Parameters**
+
+<ParamField query="sport" type="string">
+  Filter by sport. Omit for all sports.
+</ParamField>
+
+<ParamField query="status" type="string">
+  Filter by fixture status: `live`, `upcoming`, or `finished`. Omit for all statuses.
+</ParamField>
+
+<ParamField query="limit" type="integer">
+  Maximum fixtures to return. Defaults to `50`.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/txodds/fixtures" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "sport=nba" \
+  --data-urlencode "status=live"
+```
+
+---
+
+## GET `/txodds/fixtures/{fixture_id}`
+
+Get score, timeline, and possession metrics for one fixture. Returns the full live fixture detail including current score, period, possession percentage, and key event timeline.
+
+**Path Parameters**
+
+<ParamField path="fixture_id" type="string" required>
+  The TxOdds fixture identifier.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/txodds/fixtures/txo_fixture_001" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+---
+
+## GET `/txodds/fixtures/{fixture_id}/timeseries`
+
+Get win-probability history and market read for one fixture. Returns a time-series of win-probability values for the fixture, allowing you to chart how market and statistical odds have evolved throughout the game.
+
+**Path Parameters**
+
+<ParamField path="fixture_id" type="string" required>
+  The TxOdds fixture identifier.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/txodds/fixtures/txo_fixture_001/timeseries" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+**Example response**
+
+```json
+{
+  "fixture_id": "txo_fixture_001",
+  "home_team": "Boston Celtics",
+  "away_team": "New York Knicks",
+  "series": [
+    {"timestamp": 1700000000, "home_win_prob": 0.55, "away_win_prob": 0.45},
+    {"timestamp": 1700001800, "home_win_prob": 0.61, "away_win_prob": 0.39},
+    {"timestamp": 1700003600, "home_win_prob": 0.58, "away_win_prob": 0.42}
+  ]
+}
+```

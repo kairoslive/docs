@@ -1,0 +1,387 @@
+---
+title: "Trade Polymarket Combos and Multi-Leg Parlays with Kairos"
+sidebarTitle: "Combos"
+description: "Build, price, and execute Polymarket combo (parlay) positions — and cash out or redeem them — using the Kairos Execution API combo endpoints."
+---
+
+A Polymarket combo, also called a parlay, is a single position that combines bets on multiple independent prediction markets. Instead of buying YES on three separate markets individually, you buy a combo that pays off only if all three resolve YES — which means the price is lower and the potential payout is higher. Kairos routes combo orders through the Polymarket RFQ gateway, handles all the position tracking, and gives you clean endpoints to quote, execute, cash out, or redeem.
+
+<Info>
+  All combo endpoints require an `Authorization: Bearer <your-api-key>` header. Base URL: `https://execution.kairos.trade`.
+</Info>
+
+---
+
+## How combos work
+
+A combo bundles two or more Polymarket markets into a single token. The combo resolves as a winner only if every leg resolves in the direction you chose. Because the combined probability is lower than any individual leg, combo contracts trade at a significant discount — making them a capital-efficient way to express high-conviction multi-market views.
+
+**Example:** A combo on [Fed cuts in Q1] YES × [BTC above $100k by Feb] YES might price at `0.08` when the individual markets trade at `0.40` and `0.20` respectively.
+
+---
+
+## Step 1 — Quote a combo
+
+Always get a quote before executing. `POST /combo/quote` prices the combo via the RFQ gateway without committing any capital.
+
+```bash
+curl -X POST "https://execution.kairos.trade/combo/quote" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "legs": [
+      {
+        "market_id": "0xabc123",
+        "outcome": "YES"
+      },
+      {
+        "market_id": "0xdef456",
+        "outcome": "YES"
+      },
+      {
+        "market_id": "0xghi789",
+        "outcome": "NO"
+      }
+    ],
+    "size": 1000
+  }'
+```
+
+```python
+import httpx
+
+payload = {
+    "legs": [
+        {"market_id": "0xabc123", "outcome": "YES"},
+        {"market_id": "0xdef456", "outcome": "YES"},
+        {"market_id": "0xghi789", "outcome": "NO"},
+    ],
+    "size": 1000,
+}
+
+resp = httpx.post(
+    "https://execution.kairos.trade/combo/quote",
+    json=payload,
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+quote = resp.json()
+print(f"Combo price: {quote['price']} — Cost: {quote['cost_usdc']} USDC")
+```
+
+**Example response:**
+
+```json
+{
+  "quote_id": "cqt_5nRa1bWcXzY8",
+  "legs": [
+    {"market_id": "0xabc123", "outcome": "YES", "individual_price": 0.40},
+    {"market_id": "0xdef456", "outcome": "YES", "individual_price": 0.20},
+    {"market_id": "0xghi789", "outcome": "NO",  "individual_price": 0.55}
+  ],
+  "size": 1000,
+  "price": 0.044,
+  "cost_usdc": 44.00,
+  "max_payout_usdc": 1000.00,
+  "implied_probability": 0.044,
+  "fee_usdc": 0.22,
+  "quote_expires_at": "2025-01-15T14:24:05Z"
+}
+```
+
+<Tip>
+  The `quote_id` is valid for a short window (typically 30–60 seconds). Pass it to `POST /combo/execute` to lock in this price without re-quoting.
+</Tip>
+
+---
+
+## Step 2 — Execute the combo
+
+Pass the `quote_id` from the previous step to execute at the quoted price. Omit `quote_id` to let Kairos re-quote at market on the fly.
+
+```bash
+curl -X POST "https://execution.kairos.trade/combo/execute" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "quote_id": "cqt_5nRa1bWcXzY8",
+    "legs": [
+      {"market_id": "0xabc123", "outcome": "YES"},
+      {"market_id": "0xdef456", "outcome": "YES"},
+      {"market_id": "0xghi789", "outcome": "NO"}
+    ],
+    "size": 1000
+  }'
+```
+
+```python
+resp = httpx.post(
+    "https://execution.kairos.trade/combo/execute",
+    json={
+        "quote_id": quote["quote_id"],
+        "legs": payload["legs"],
+        "size": 1000,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+position = resp.json()
+combo_id = position["combo_id"]
+print(f"Combo executed: {combo_id} at price {position['executed_price']}")
+```
+
+**Example response:**
+
+```json
+{
+  "combo_id": "cbo_7gXp2mNkQwY3",
+  "quote_id": "cqt_5nRa1bWcXzY8",
+  "legs": [
+    {"market_id": "0xabc123", "outcome": "YES"},
+    {"market_id": "0xdef456", "outcome": "YES"},
+    {"market_id": "0xghi789", "outcome": "NO"}
+  ],
+  "size": 1000,
+  "executed_price": 0.044,
+  "cost_usdc": 44.00,
+  "status": "open",
+  "created_at": "2025-01-15T14:23:05Z"
+}
+```
+
+<Warning>
+  Combo execution routes through Polymarket's RFQ gateway. Execution is not guaranteed if the quote has expired or if the RFQ gateway cannot find a maker for the requested leg combination.
+</Warning>
+
+---
+
+## Step 3 — View your combo positions
+
+List all your open and historical combo positions:
+
+```bash
+curl "https://execution.kairos.trade/combo/positions" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```python
+resp = httpx.get(
+    "https://execution.kairos.trade/combo/positions",
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+positions = resp.json()["positions"]
+for p in positions:
+    print(p["combo_id"], p["status"], f"size={p['size']}", f"current_value={p.get('current_value_usdc')}")
+```
+
+**Example response snippet:**
+
+```json
+{
+  "positions": [
+    {
+      "combo_id": "cbo_7gXp2mNkQwY3",
+      "legs": [
+        {"market_id": "0xabc123", "outcome": "YES", "resolved": false},
+        {"market_id": "0xdef456", "outcome": "YES", "resolved": false},
+        {"market_id": "0xghi789", "outcome": "NO",  "resolved": false}
+      ],
+      "size": 1000,
+      "entry_price": 0.044,
+      "current_price": 0.071,
+      "current_value_usdc": 71.00,
+      "unrealized_pnl_usdc": 27.00,
+      "status": "open"
+    }
+  ]
+}
+```
+
+---
+
+## Cash out an open combo position
+
+If you want to exit before all legs resolve, sell your combo back to pUSD via the cash-out flow.
+
+### Get a cash-out quote
+
+```bash
+curl -X POST "https://execution.kairos.trade/combo/cash-out-quote" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "combo_id": "cbo_7gXp2mNkQwY3",
+    "size": 1000
+  }'
+```
+
+```python
+resp = httpx.post(
+    "https://execution.kairos.trade/combo/cash-out-quote",
+    json={"combo_id": "cbo_7gXp2mNkQwY3", "size": 1000},
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+co_quote = resp.json()
+print(f"Cash-out price: {co_quote['price']} — Proceeds: {co_quote['proceeds_usdc']} USDC")
+```
+
+**Example response:**
+
+```json
+{
+  "cash_out_quote_id": "coq_2xKj9mQpLvT4",
+  "combo_id": "cbo_7gXp2mNkQwY3",
+  "size": 1000,
+  "price": 0.069,
+  "proceeds_usdc": 69.00,
+  "fee_usdc": 0.35,
+  "quote_expires_at": "2025-01-15T15:01:05Z"
+}
+```
+
+### Execute the cash-out
+
+```bash
+curl -X POST "https://execution.kairos.trade/combo/cash-out" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cash_out_quote_id": "coq_2xKj9mQpLvT4",
+    "combo_id": "cbo_7gXp2mNkQwY3",
+    "size": 1000
+  }'
+```
+
+```python
+resp = httpx.post(
+    "https://execution.kairos.trade/combo/cash-out",
+    json={
+        "cash_out_quote_id": co_quote["cash_out_quote_id"],
+        "combo_id": "cbo_7gXp2mNkQwY3",
+        "size": 1000,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+print(resp.json())
+```
+
+**Example response:**
+
+```json
+{
+  "combo_id": "cbo_7gXp2mNkQwY3",
+  "status": "closed",
+  "proceeds_usdc": 69.00,
+  "closed_at": "2025-01-15T15:00:45Z"
+}
+```
+
+---
+
+## Redeem a winning combo
+
+When all legs resolve in your favour, redeem the combo to collect your pUSD payout:
+
+```bash
+curl -X POST "https://execution.kairos.trade/combo/redeem" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "combo_id": "cbo_7gXp2mNkQwY3"
+  }'
+```
+
+```python
+resp = httpx.post(
+    "https://execution.kairos.trade/combo/redeem",
+    json={"combo_id": "cbo_7gXp2mNkQwY3"},
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+result = resp.json()
+print(f"Redeemed: {result['payout_usdc']} USDC")
+```
+
+**Example response:**
+
+```json
+{
+  "combo_id": "cbo_7gXp2mNkQwY3",
+  "status": "redeemed",
+  "payout_usdc": 1000.00,
+  "redeemed_at": "2025-01-20T18:00:00Z"
+}
+```
+
+<Note>
+  Redemption is only available after all legs have resolved and the combo is in a `winning` state. Attempting to redeem a combo with unresolved or losing legs returns a `409 Conflict` error.
+</Note>
+
+---
+
+## Combo lifecycle overview
+
+```
+quote → execute → [monitor] → cash-out (early exit)
+                            ↘ redeem (all legs WIN)
+                            ↘ expires worthless (any leg loses)
+```
+
+<Accordion title="Combo status values">
+
+| Status | Meaning |
+|---|---|
+| `open` | All legs are still unresolved; position is live |
+| `partial` | One or more legs have resolved correctly so far |
+| `winning` | All legs resolved in your favour; ready to redeem |
+| `losing` | At least one leg resolved against you; combo expires worthless |
+| `closed` | You cashed out before full resolution |
+| `redeemed` | You redeemed a winning combo and received payout |
+
+</Accordion>
+
+---
+
+## Full Python workflow
+
+```python
+import httpx
+
+BASE = "https://execution.kairos.trade"
+HEADERS = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+LEGS = [
+    {"market_id": "0xabc123", "outcome": "YES"},
+    {"market_id": "0xdef456", "outcome": "YES"},
+    {"market_id": "0xghi789", "outcome": "NO"},
+]
+
+# 1. Quote
+quote = httpx.post(f"{BASE}/combo/quote", json={"legs": LEGS, "size": 1000}, headers=HEADERS).json()
+print(f"Quote: {quote['price']} — expires {quote['quote_expires_at']}")
+
+# 2. Execute
+position = httpx.post(f"{BASE}/combo/execute", json={
+    "quote_id": quote["quote_id"], "legs": LEGS, "size": 1000,
+}, headers=HEADERS).json()
+combo_id = position["combo_id"]
+print(f"Position opened: {combo_id}")
+
+# 3. Later — cash out
+co_quote = httpx.post(f"{BASE}/combo/cash-out-quote", json={
+    "combo_id": combo_id, "size": 1000,
+}, headers=HEADERS).json()
+
+result = httpx.post(f"{BASE}/combo/cash-out", json={
+    "cash_out_quote_id": co_quote["cash_out_quote_id"],
+    "combo_id": combo_id,
+    "size": 1000,
+}, headers=HEADERS).json()
+print(f"Cashed out for {result['proceeds_usdc']} USDC")
+```
+
+<CardGroup cols={2}>
+  <Card title="Trading" icon="arrow-right-arrow-left" href="/guides/trading">
+    Single-market order entry and lifecycle management.
+  </Card>
+  <Card title="Cross-Venue Routing" icon="shuffle" href="/guides/cross-venue-routing">
+    Split large orders across Polymarket and Kalshi.
+  </Card>
+</CardGroup>

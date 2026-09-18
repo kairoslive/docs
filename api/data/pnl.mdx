@@ -1,0 +1,224 @@
+---
+title: "Data API: PnL, Hover Cards, and Wallet Performance"
+sidebarTitle: "PnL"
+description: "Fetch merged PnL data, live per-market hover PnL, and wallet-wide totals across providers and wallets using the Kairos Data API PnL endpoints."
+---
+
+The Data API PnL group provides four endpoints for querying profit-and-loss data at multiple levels of granularity — from a per-market hover card all the way to a merged, multi-wallet summary. All PnL endpoints require authentication.
+
+## Authentication
+
+```http
+Authorization: Bearer <your-api-key>
+```
+
+---
+
+## GET `/pnl/providers`
+
+List the PnL data providers available through the Data API. Use this endpoint to discover which venues have PnL data indexed and to verify provider IDs before calling other PnL endpoints.
+
+```bash
+curl -s "https://data.kairos.trade/pnl/providers" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+**Example response**
+
+```json
+{
+  "providers": [
+    {
+      "provider_id": "polymarket",
+      "label": "Polymarket",
+      "pnl_supported": true,
+      "realized_pnl": true,
+      "unrealized_pnl": true
+    },
+    {
+      "provider_id": "kalshi",
+      "label": "Kalshi",
+      "pnl_supported": true,
+      "realized_pnl": true,
+      "unrealized_pnl": false
+    }
+  ]
+}
+```
+
+---
+
+## GET `/pnl/{user_id}`
+
+Get merged PnL data for a user across one or more wallets and providers. This endpoint aggregates data from all the wallets and venues you specify, giving you a single unified PnL view. Useful for users who trade across multiple wallets or both Polymarket and Kalshi.
+
+**Path Parameters**
+
+<ParamField path="user_id" type="string" required>
+  Your Kairos user ID. Retrieve this from your account settings at [app.kairos.trade](https://app.kairos.trade).
+</ParamField>
+
+**Query Parameters**
+
+<ParamField query="provider" type="string">
+  Scope to a single venue (`polymarket`, `kalshi`, `predictfun`). Omit to merge all venues.
+</ParamField>
+
+<ParamField query="wallet" type="string">
+  Scope to a specific wallet address. You can pass this parameter multiple times to include several wallets.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/pnl/usr_abc123" \
+  -H "Authorization: Bearer <your-api-key>" \
+  -G \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "wallet=0xAbCd1234ef567890"
+```
+
+**Example response**
+
+```json
+{
+  "user_id": "usr_abc123",
+  "merged_pnl": {
+    "total_realized_pnl": 4520.75,
+    "total_unrealized_pnl": 310.50,
+    "total_volume": 98400.00,
+    "by_provider": [
+      {
+        "provider": "polymarket",
+        "realized_pnl": 3800.00,
+        "unrealized_pnl": 310.50,
+        "volume": 72000.00
+      },
+      {
+        "provider": "kalshi",
+        "realized_pnl": 720.75,
+        "unrealized_pnl": 0,
+        "volume": 26400.00
+      }
+    ]
+  }
+}
+```
+
+<Note>
+  Merging across multiple wallets and providers may take slightly longer than single-wallet queries. Consider caching the merged result for a short TTL (30–60 seconds) in high-traffic applications.
+</Note>
+
+---
+
+## GET `/pnl/hover/{provider_id}/{wallet}/{contract_id}`
+
+Get live per-market PnL for a specific (wallet, market) pair. This endpoint is designed for hover-card UIs — call it when a user hovers over a position to show real-time unrealized and realized PnL for that single market.
+
+**Path Parameters**
+
+<ParamField path="provider_id" type="string" required>
+  The venue identifier (`polymarket`, `kalshi`, or `predictfun`).
+</ParamField>
+
+<ParamField path="wallet" type="string" required>
+  The wallet address to query (URL-encoded if it contains special characters).
+</ParamField>
+
+<ParamField path="contract_id" type="string" required>
+  The contract token ID for the specific market outcome.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/pnl/hover/polymarket/0xAbCd1234ef567890/71321045679252212594626385532..." \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+**Example response**
+
+```json
+{
+  "provider_id": "polymarket",
+  "wallet": "0xAbCd1234ef567890",
+  "contract_id": "71321045679252212594626385532...",
+  "market_title": "Will the Fed cut rates in June?",
+  "outcome": "YES",
+  "position_size": 500,
+  "avg_entry_price": 0.38,
+  "current_mark": 0.44,
+  "realized_pnl": 0.00,
+  "unrealized_pnl": 30.00,
+  "total_invested": 190.00
+}
+```
+
+<Tip>
+  Fire this endpoint on mouse-enter with a short debounce (200ms) to avoid unnecessary requests when a user moves quickly across a list of positions.
+</Tip>
+
+---
+
+## GET `/pnl/wallet-totals/{provider_id}/{wallet}`
+
+Get wallet-wide PnL totals across all markets for a given wallet and provider. This is the summary-level view: one set of aggregate numbers for the entire wallet's history on a single venue.
+
+**Path Parameters**
+
+<ParamField path="provider_id" type="string" required>
+  The venue identifier (`polymarket`, `kalshi`, or `predictfun`).
+</ParamField>
+
+<ParamField path="wallet" type="string" required>
+  The wallet address to query.
+</ParamField>
+
+```bash
+curl -s "https://data.kairos.trade/pnl/wallet-totals/polymarket/0xAbCd1234ef567890" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+**Response Fields**
+
+<ResponseField name="provider_id" type="string">
+  The venue this summary covers.
+</ResponseField>
+
+<ResponseField name="wallet" type="string">
+  The queried wallet address.
+</ResponseField>
+
+<ResponseField name="total_realized_pnl" type="number">
+  Total realized profit and loss in USD across all resolved and exited positions for this wallet.
+</ResponseField>
+
+<ResponseField name="total_unrealized_pnl" type="number">
+  Total unrealized PnL in USD across all currently open positions, marked at current best prices.
+</ResponseField>
+
+<ResponseField name="total_volume" type="number">
+  Total notional trading volume in USD for this wallet on this venue (sum of all buy and sell fills).
+</ResponseField>
+
+<ResponseField name="open_position_count" type="integer">
+  Number of currently open positions held by this wallet.
+</ResponseField>
+
+<ResponseField name="win_rate" type="number">
+  Fraction of resolved positions that were profitable (0–1). Only counts fully closed positions.
+</ResponseField>
+
+**Example response**
+
+```json
+{
+  "provider_id": "polymarket",
+  "wallet": "0xAbCd1234ef567890",
+  "total_realized_pnl": 3800.00,
+  "total_unrealized_pnl": 310.50,
+  "total_volume": 72000.00,
+  "open_position_count": 7,
+  "win_rate": 0.64
+}
+```
+
+<Info>
+  `total_unrealized_pnl` is marked at the current best mid-price and will fluctuate with market activity. It is not a guarantee of proceeds if you were to close all positions today, since slippage and liquidity constraints apply at execution time.
+</Info>

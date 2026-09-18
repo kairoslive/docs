@@ -1,0 +1,252 @@
+---
+title: "Kairos Wallet Modes: Hosted, Self-Custody, and Allowances"
+sidebarTitle: "Wallets"
+description: "Compare hosted and self-custody wallet modes on Kairos. Learn about deposit wallets, on-chain ERC-20 allowances, EIP-712 signing, and CTF outcome tokens."
+---
+
+Before you can trade on any on-chain venue, you need a wallet. Kairos gives you two custody models: a **hosted** mode where Kairos manages signing keys on your behalf, and a **self-custody** mode where you sign every transaction with your own private key. Understanding the difference — and completing the right onboarding steps — determines how your funds are held and how orders are submitted.
+
+## Custody Models
+
+<Tabs>
+  <Tab title="Hosted Wallets">
+    In hosted mode, Kairos generates and securely stores a signing key for you. When you submit an order, Kairos signs the on-chain transaction or EIP-712 payload without requiring any action from you.
+
+    **Best for:** Automated strategies, server-side bots, and integrations where you don't want to manage a local keystore.
+
+    **Trade-off:** Your signing key lives on Kairos infrastructure. Kairos cannot access your collateral funds (which remain in your deposit wallet), but the signing authority is delegated to Kairos.
+  </Tab>
+  <Tab title="Self-Custody">
+    In self-custody mode, Kairos never sees your private key. For every order or on-chain transaction, Kairos builds an unsigned payload (EIP-712 typed data), you sign it locally with your wallet, and you return the signature to Kairos for broadcast.
+
+    **Best for:** Institutional traders, users who require non-custodial guarantees, and anyone integrating with hardware wallets or multi-sig setups.
+
+    **Trade-off:** Every action that touches the chain requires an extra round-trip: build intent → sign → submit.
+  </Tab>
+</Tabs>
+
+## On-Chain Approvals (Allowances)
+
+On-chain venues like Polymarket and Predict.fun use ERC-20 token contracts for collateral. Before you can trade, the venue's smart contracts need permission to move tokens from your wallet — this is called an **allowance** (or approval).
+
+Kairos manages allowances for you during the onboarding flow, but you can also read and set them manually:
+
+```bash
+# Read current allowances for a venue
+curl https://execution.kairos.trade/exchanges/polymarket/allowances \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```json
+{
+  "exchange": "polymarket",
+  "allowances": [
+    {
+      "token": "pUSD",
+      "token_address": "0xusdc...",
+      "spender": "0xclob...",
+      "current_allowance": "115792089237316195423570985008687907853...",
+      "required_allowance": "unlimited"
+    }
+  ]
+}
+```
+
+```bash
+# Set allowances (triggers an on-chain transaction)
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/allowances \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "token": "pUSD", "amount": "unlimited" }'
+```
+
+For self-custody wallets, you can use `POST /exchanges/{exchange_id}/prepare-wallet` to have Kairos sponsor gas and set all required allowances in one sponsored transaction.
+
+<Note>
+Off-chain venues like Kalshi do not require on-chain allowances. The allowance step only applies to Polymarket, Predict.fun, and Opinion.
+</Note>
+
+## Polymarket Deposit Wallet
+
+Polymarket uses a **Safe-based deposit wallet** architecture. Your signing key (EOA — Externally Owned Account) is separate from the vault that holds your funds. The Safe contract acts as the on-chain vault; the EOA's role is limited to authorizing trades.
+
+This architecture means:
+- Your USDC sits in the Safe vault, not in your EOA
+- Compromising the signing EOA does not grant direct access to the vault funds
+- CLOB orders are signed by the EOA but settle from the Safe
+
+### Deploying Your Deposit Wallet
+
+If you're onboarding to Polymarket for the first time, deploy your deposit wallet with:
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/deposit-wallet/onboard \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+This single call deploys the Safe contract, configures the CLOB trading approvals, and links the deposit wallet to your Kairos account.
+
+### Checking Balances
+
+```bash
+# EOA balances (USDC and pUSD on the signing wallet)
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/deposit-wallet/eoa-balances \
+  -H "Authorization: Bearer <your-api-key>"
+
+# Safe vault balances (USDC, USDC.e, and pUSD in the deposit wallet)
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/deposit-wallet/safe-balances \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+## Venue Onboarding Flows
+
+Each venue has its own one-time setup step. Complete these before submitting your first order:
+
+<Steps>
+  <Step title="Polymarket">
+    Call `POST /exchanges/polymarket/enable-trading` to provision CLOB credentials and set all required on-chain approvals in a single request.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/exchanges/polymarket/enable-trading \
+      -H "Authorization: Bearer <your-api-key>"
+    ```
+
+    If you're importing an existing Polymarket wallet, use `POST /exchanges/polymarket/enable-imported-trading` instead.
+  </Step>
+  <Step title="Kalshi">
+    Call `POST /exchanges/kalshi/enable-trading` with your Kalshi API credentials. Kairos stores them securely and uses them to route orders.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/exchanges/kalshi/enable-trading \
+      -H "Authorization: Bearer <your-api-key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "kalshi_api_key_id": "your-kalshi-key-id",
+        "kalshi_api_secret": "your-kalshi-secret"
+      }'
+    ```
+  </Step>
+  <Step title="Predict.fun">
+    Call `POST /exchanges/predictfun/enable-trading` to set the required on-chain approvals for Predict.fun.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/exchanges/predictfun/enable-trading \
+      -H "Authorization: Bearer <your-api-key>"
+    ```
+  </Step>
+  <Step title="Opinion">
+    Call `POST /exchanges/opinion/enable-trading` to provision credentials and set the USDT allowance.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/exchanges/opinion/enable-trading \
+      -H "Authorization: Bearer <your-api-key>"
+    ```
+  </Step>
+</Steps>
+
+## EIP-712 Self-Custody Flow
+
+For self-custody order submission, Kairos uses a two-step flow built on EIP-712 typed data signatures. This standard ensures your signature is domain-bound and human-readable in compatible wallets.
+
+<Steps>
+  <Step title="Build the Intent">
+    Call `POST /v2/orders/intent` with your order parameters. Kairos returns a typed data object ready for signing — your key never leaves your environment.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/orders/intent \
+      -H "Authorization: Bearer <your-api-key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "exchange": "polymarket",
+        "contract_id": "0xabc123...",
+        "side": "BUY",
+        "price": 0.65,
+        "size": 50,
+        "order_type": "limit"
+      }'
+    ```
+
+    Response:
+    ```json
+    {
+      "intent_id": "int_xyz789",
+      "typed_data": {
+        "domain": { "name": "Polymarket CLOB", "chainId": 137, "verifyingContract": "0x..." },
+        "types": { "Order": [ ... ] },
+        "message": { "side": "BUY", "price": "62000000", "size": "50000000", ... }
+      }
+    }
+    ```
+  </Step>
+  <Step title="Sign the Typed Data">
+    Sign the `typed_data` object using `eth_signTypedData_v4` with your wallet. Do not modify any fields — the signature is mathematically bound to the exact parameters.
+
+    ```javascript
+    // ethers.js v6
+    const { domain, types, message } = intent.typed_data;
+    // Remove EIP712Domain from types for ethers compatibility
+    delete types.EIP712Domain;
+    const signature = await signer.signTypedData(domain, types, message);
+    ```
+  </Step>
+  <Step title="Submit the Signed Order">
+    Call `POST /v2/orders/submit` with your `intent_id` and the hex-encoded signature. Kairos broadcasts the signed order to the venue.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/orders/submit \
+      -H "Authorization: Bearer <your-api-key>" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "intent_id": "int_xyz789",
+        "signature": "0xabcdef..."
+      }'
+    ```
+  </Step>
+</Steps>
+
+## CTF Outcome Tokens
+
+Polymarket (and Predict.fun) use the **Conditional Token Framework (CTF)** — a standard for ERC-1155 outcome tokens. When you buy a YES contract, you receive CTF outcome tokens that redeem for $1.00 if the market resolves YES.
+
+Kairos exposes CTF operations directly if you need to manage tokens at the contract level:
+
+| Operation | Endpoint | Description |
+|---|---|---|
+| **Split** | `POST /exchanges/{exchange_id}/ctf/split` | Deposit collateral and receive a full set of outcome tokens (one per outcome) |
+| **Merge** | `POST /exchanges/{exchange_id}/ctf/merge` | Return a complete set of outcome tokens and receive collateral back |
+| **Redeem** | `POST /exchanges/{exchange_id}/redeem` | After resolution, redeem winning tokens for collateral |
+
+```bash
+# Redeem winning tokens after a market resolves YES
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/redeem \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "market_id": "0xdef456...",
+    "outcome": "YES"
+  }'
+```
+
+## Hyperliquid Withdrawals and Transfers
+
+Hyperliquid requires signed typed data for withdrawals and spot↔perp transfers, similar to the self-custody order flow:
+
+```bash
+# Step 1: Build withdrawal typed data
+curl -X POST https://execution.kairos.trade/exchanges/hyperliquid/withdraw/prepare \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "amount": "100", "destination": "0xmywallet..." }'
+
+# Step 2: Sign the typed data and submit
+curl -X POST https://execution.kairos.trade/exchanges/hyperliquid/withdraw \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "typed_data_id": "wd_abc123", "signature": "0x..." }'
+```
+
+The same two-step pattern applies to spot↔perp transfers via `/exchanges/hyperliquid/transfer/prepare` and `/exchanges/hyperliquid/transfer`.
+
+<Warning>
+Hyperliquid withdrawals are irreversible once submitted on-chain. Verify the destination address and amount in the typed data before signing.
+</Warning>

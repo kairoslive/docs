@@ -1,0 +1,123 @@
+---
+title: "What Is Kairos? Prediction Market Trading Platform"
+sidebarTitle: "Introduction"
+description: "Kairos unifies prediction market and perpetuals trading across Polymarket, Kalshi, and Predict.fun through a single set of REST and WebSocket APIs."
+---
+
+Kairos is a unified trading platform that connects you to every major prediction market and perpetuals venue through a single, consistent API surface. Instead of integrating with Polymarket, Kalshi, Predict.fun, and Hyperliquid separately — each with its own authentication, data formats, and order flow — you use Kairos once and trade everywhere.
+
+## Supported Venues
+
+Kairos routes orders and streams data across the following venues:
+
+- **Polymarket** — the world's largest on-chain prediction market (USDC on Polygon)
+- **Kalshi** — regulated US prediction market (CFTC-designated contract market)
+- **Predict.fun** — prediction market with native combo/parlay support
+- **Opinion** — emerging prediction market venue
+- **Hyperliquid** — perpetuals DEX for leveraged positions on crypto and more
+
+## The Four APIs
+
+Kairos exposes four purpose-built APIs. Every API lives at its own base URL and is documented separately, but they share the same authentication scheme and data conventions.
+
+| API | Base URL | Auth Required | Endpoints | Description |
+|-----|----------|:---:|:---------:|-------------|
+| **Market Data API** | `md.kairos.trade` | No | 15 | Real-time and historical market data, candles, trades, and perpetual snapshots — free, no signup |
+| **Data API** | `data.kairos.trade` | Yes | 68 | Full data plane: search, sports, trader analytics, PnL, discovery, and enriched market metadata |
+| **Execution API** | `execution.kairos.trade` | Yes | 59 | Order entry and cancellation, smart routing, combos/parlays, onboarding, and self-custody EIP-712 signing |
+| **Agora Auction API** | `agora.kairos.trade` | Yes | 13 | Private institutional auction house with firm-quote RFQ and real-time WebSocket event streams |
+
+Together these APIs expose **155 endpoints** covering every stage of the trading lifecycle.
+
+## Key Capabilities
+
+<CardGroup cols={2}>
+  <Card title="Live Market Data" icon="chart-line" href="/api/market-data/overview">
+    Stream orderbooks, trades, candles, and perpetual snapshots across all venues — no API key required.
+  </Card>
+  <Card title="Smart Order Routing" icon="route" href="/api/execution/overview">
+    Submit orders to any venue through one endpoint. Kairos handles venue-specific signing, collateral, and settlement.
+  </Card>
+  <Card title="Combos & Parlays" icon="layer-group" href="/api/execution/overview">
+    Price and execute multi-leg combo positions on Polymarket via the RFQ gateway, and close or redeem them later.
+  </Card>
+  <Card title="Trader Analytics" icon="magnifying-glass-chart" href="/api/data/overview">
+    Inspect realized PnL timeseries, open positions, and trade history for any wallet address across venues.
+  </Card>
+  <Card title="Sports Markets" icon="trophy" href="/api/data/overview">
+    Access live, upcoming, and futures sports markets matched across Polymarket and Kalshi with enriched metadata.
+  </Card>
+  <Card title="Institutional Auctions" icon="gavel" href="/api/agora/overview">
+    Run private RFQ auctions with firm quotes, role-filtered views, and a durable WebSocket event timeline.
+  </Card>
+</CardGroup>
+
+## Market Data API
+
+The Market Data API (`md.kairos.trade`) is completely free — no account, no API key, no rate-limit headers to manage for casual use. It provides:
+
+- **Markets** — paginate active markets for any provider, fetch by ID, or resolve venue-specific identifiers
+- **Candles** — OHLCV series for a single contract or batched up to 200 contracts in one request
+- **Trades** — recent tape and aggregate volume/pressure metrics
+- **Marks** — latest mark price (last-trade price) for up to 200 contract/token pairs
+- **Resolutions** — batch resolution fractions and full lifecycle timelines
+- **Perpetuals** — live snapshots for Hyperliquid and other perp venues
+
+## Data API
+
+The Data API (`data.kairos.trade`) is the full Kairos data plane. Authenticated callers can access:
+
+- **Search** — full-text market search, autocomplete, URL resolution, and screener queries
+- **Discover** — paginated event-grouped market lists, trending movers, and expiring-soon feeds
+- **Sports** — cross-platform matched markets, live games, tournament brackets, and TxOdds fixtures
+- **Trader Analytics** — per-wallet PnL history, positions, and trade history (some endpoints free)
+- **PnL** — merged PnL across wallets and providers, live per-market hover data
+- **Candles & Trades** — higher-throughput batched candle and trade endpoints with broader filters
+
+## Execution API
+
+The Execution API (`execution.kairos.trade`) handles every order lifecycle event:
+
+- **Orders** — submit, list, fetch, cancel single or batch, cancel-all, fee quotes
+- **Routing** — price and execute cross-venue split orders across linked market pairs
+- **Combos** — quote, execute, cash out, and redeem Polymarket parlays
+- **Onboarding** — enable trading on each venue (Polymarket CLOB credentials, Kalshi API keys, Predict.fun approvals, Opinion)
+- **Self-custody** — EIP-712 intent/submit flow so your private key never leaves your client
+- **Hyperliquid** — typed-data withdraw and spot↔perp transfer helpers
+- **CTF** — split, merge, and redeem outcome token sets
+
+## Agora Auction API
+
+The Agora Auction API (`agora.kairos.trade`) is a private institutional venue for block-size trades:
+
+- Create and manage private auctions with capacity preflight checks
+- Invite makers to submit or revise firm, executable quotes
+- Stream the complete audit timeline over WebSocket
+- Role-filtered views ensure each participant sees only what they're entitled to
+
+## Machine-Readable Specs
+
+If you'd rather generate a client from an OpenAPI spec, download the YAML files directly:
+
+- [`agora.yaml`](https://app.kairos.trade/openapi/agora.yaml)
+- [`data-api.yaml`](https://app.kairos.trade/openapi/data-api.yaml)
+- [`execution.yaml`](https://app.kairos.trade/openapi/execution.yaml)
+- [`market-data-api.yaml`](https://app.kairos.trade/openapi/market-data-api.yaml)
+- [`kairos.json`](https://app.kairos.trade/openapi/kairos.json) — combined spec
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Make your first API call in under 5 minutes — no signup required.
+  </Card>
+  <Card title="Authentication" icon="key" href="/authentication">
+    Learn how to obtain an API key and authenticate requests.
+  </Card>
+  <Card title="Market Data API Reference" icon="book" href="/api/market-data/overview">
+    Explore all 15 Market Data endpoints.
+  </Card>
+  <Card title="Execution API Reference" icon="bolt" href="/api/execution/overview">
+    Explore all 59 Execution endpoints including order routing and combos.
+  </Card>
+</CardGroup>

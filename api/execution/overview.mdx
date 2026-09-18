@@ -1,0 +1,102 @@
+---
+title: "Kairos Order Execution API Reference Overview"
+sidebarTitle: "Overview"
+description: "The Kairos Execution API provides 59 endpoints for order entry, cancellation, cross-venue routing, combos, exchange management, and wallet onboarding."
+---
+
+The Kairos Order Execution API is the single entry point for submitting and managing trades across every prediction market venue Kairos supports. You send orders to one URL and Kairos routes them to Polymarket, Kalshi, Predict.fun, Opinion, or any other registered exchange — without managing separate exchange integrations yourself. The API also handles on-chain setup, fee quoting, cross-venue position routing, Polymarket combo (parlay) execution, and self-custody signing flows for traders who want to retain control of their private keys.
+
+## Base URL
+
+```
+https://execution.kairos.trade
+```
+
+All endpoints are HTTPS only. There is no versioning prefix on the core order paths; self-custody endpoints live under `/v2/`.
+
+## Authentication
+
+Every Execution API call (except the liveness probe at `GET /health`) requires your Kairos API key passed as a Bearer token:
+
+```http
+Authorization: Bearer <your-api-key>
+```
+
+Get your API key from [app.kairos.trade](https://app.kairos.trade). Keep it secret — it controls real order flow and on-chain transactions on your behalf.
+
+<Note>
+  Rate limiting is enforced per API key. If you receive a `429 Too Many Requests` response, back off using exponential retry with jitter. Do not hammer the endpoint — repeated 429s can result in temporary suspension.
+</Note>
+
+## OpenAPI Specification
+
+The machine-readable OpenAPI spec is available at:
+
+```
+https://app.kairos.trade/openapi/execution.yaml
+```
+
+Import this into Postman, Insomnia, or any OpenAPI-compatible client to get a full interactive reference with schema validation.
+
+## Hosted vs. Self-Custody Paths
+
+The Execution API offers two order submission modes:
+
+| Mode | Path prefix | How it works |
+|---|---|---|
+| **Hosted (v1)** | `/orders` | Kairos holds your exchange credentials and signs orders on your behalf. Simplest to integrate. |
+| **Self-custody (v2)** | `/v2/orders` | You sign orders with your own wallet key using EIP-712 typed data. Kairos never touches your private key. Two-step flow: build intent → submit signature. |
+
+Use v1 for server-side bots or rapid prototyping. Use v2 when you need non-custodial guarantees or are building a wallet-integrated UI.
+
+## Endpoint Groups
+
+The API's 59 endpoints are organized into nine functional groups:
+
+| Group | Endpoints | What it covers |
+|---|---|---|
+| **Orders** | 14 | Submit, list, retrieve, cancel orders; fee quotes; position exposure; self-custody v2 flow; Kalshi balance |
+| **Exchanges** | 7 | List venues, read capabilities, manage on-chain allowances, prepare wallets |
+| **Routing** | 6 | Cross-venue order routing across linked Polymarket + Kalshi markets |
+| **Combo** | 6 | Polymarket multi-leg combo (parlay) quoting, execution, cash-out, and redemption |
+| **Onboarding** | 7 | Enable trading per venue, import wallets, check Polymarket resolution |
+| **Hyperliquid** | 4 | Withdraw and spot↔perp transfer with EIP-712 two-step signing |
+| **Deposit Wallet** | 8 | Deploy and manage the Polymarket Safe deposit wallet for self-custody traders |
+| **CTF** | 3 | Split collateral into outcome tokens, merge them back, redeem winning tokens |
+| **Synthetic Books** | 4 | Create, inspect, and manage synthetic order book definitions |
+
+### Orders
+
+Submit new orders, list and filter them, retrieve a single order by ID, cancel individually or in batch, get fee quotes before trading, and check your live position exposure. Self-custody traders use `POST /v2/orders/intent` to build an unsigned EIP-712 payload and `POST /v2/orders/submit` to transmit their signed result.
+
+### Exchanges
+
+Discover which venues (`exchange_id` values such as `polymarket`, `kalshi`, `predictfun`, `opinion`) are available, inspect what each supports (order types, collateral tokens, self-custody capability), and manage the on-chain allowances your wallet needs to trade on-chain venues.
+
+### Routing
+
+Cross-venue routing lets you fill a single notional size across a pair of linked markets on Polymarket and Kalshi simultaneously. Use the quote endpoint to price the split before committing, then `POST /orders/route-buy` to execute.
+
+### Combo
+
+Combos are Polymarket parlays — multi-market positions where you win only if every leg resolves in your favor. The combo group covers pricing, execution via Polymarket's RFQ gateway, cash-out while the combo is live, and redemption after all legs resolve.
+
+### Onboarding
+
+One-time setup per venue. Call the appropriate `enable-trading` endpoint before placing your first order on each exchange. These endpoints provision CLOB API credentials, set ERC-20 allowances, and register your wallet with the venue's on-chain contracts.
+
+### Hyperliquid
+
+Withdraw funds from Hyperliquid or move between spot and perpetual sub-accounts using a two-step prepare-then-submit pattern that keeps signing in your wallet.
+
+### Deposit Wallet
+
+Deploy a Polymarket-compatible Gnosis Safe deposit wallet, sync its balances, read nonces, and relay signed batches without trusting Kairos with your key.
+
+### CTF
+
+Interact directly with Polymarket's Conditional Token Framework — split USDC into YES/NO token pairs, merge them back into collateral, or redeem winning tokens after a market resolves.
+
+### Synthetic Books
+
+Create and manage Synthetic Book definitions that aggregate liquidity across venues into a unified virtual order book.

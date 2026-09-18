@@ -1,0 +1,273 @@
+---
+title: "Order Types, Fields, and Lifecycle in Kairos Explained"
+sidebarTitle: "Orders"
+description: "How Kairos handles order submission, fills, and cancellation. Covers limit and market orders, EIP-712 self-custody signing, and fee quotes before trading."
+---
+
+Kairos provides a unified order entry layer that abstracts the differences between venue order models. You submit orders through a single Execution API, and Kairos handles the translation, routing, and signature requirements for each underlying venue. This page covers how orders are structured, how they move through their lifecycle, and how to cancel them when needed.
+
+## Order Types
+
+Kairos supports two fundamental order types across prediction market venues:
+
+<CardGroup cols={2}>
+  <Card title="Limit Orders" icon="bullseye-arrow">
+    You specify a maximum buy price or minimum sell price. The order rests on the order book until it matches or you cancel it. Most prediction market venues only support limit orders.
+  </Card>
+  <Card title="Market Orders" icon="bolt">
+    You accept the best available price immediately. Market orders fill against the existing book and do not rest. Availability depends on venue capabilities — check `supports_market_orders` before submitting.
+  </Card>
+</CardGroup>
+
+## Key Order Fields
+
+Every order you submit includes a standard set of fields. The table below describes each one:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `exchange` | string | ✅ | Venue to route to: `polymarket`, `kalshi`, `predictfun`, `opinion` |
+| `market_id` | string | ✅ | The market's canonical ID or venue-native ID |
+| `contract_id` | string | ✅ | The specific outcome contract/token to trade |
+| `side` | enum | ✅ | `BUY` or `SELL` |
+| `price` | decimal | ✅ (limit) | Limit price between 0.01 and 0.99, must conform to tick grid |
+| `size` | decimal | ✅ | Number of shares / contracts |
+| `order_type` | enum | ✅ | `limit` or `market` |
+| `time_in_force` | enum | | `GTC` (Good-Til-Cancelled), `IOC` (Immediate-or-Cancel), `FOK` (Fill-or-Kill) |
+| `client_order_id` | string | | Your own idempotency key — Kairos deduplicates on this |
+
+### Example Order Payload
+
+```json
+{
+  "exchange": "polymarket",
+  "market_id": "0xdef456...",
+  "contract_id": "0xabc123...",
+  "side": "BUY",
+  "price": 0.62,
+  "size": 100,
+  "order_type": "limit",
+  "time_in_force": "GTC",
+  "client_order_id": "my-order-001"
+}
+```
+
+Submit it with `POST /orders`:
+
+```bash
+curl -X POST https://execution.kairos.trade/orders \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "exchange": "polymarket",
+    "market_id": "0xdef456...",
+    "contract_id": "0xabc123...",
+    "side": "BUY",
+    "price": 0.62,
+    "size": 100,
+    "order_type": "limit",
+    "time_in_force": "GTC"
+  }'
+```
+
+## Order Lifecycle
+
+Once submitted, an order moves through the following states:
+
+<Steps>
+  <Step title="Open">
+    The order has been accepted by the venue and is resting on the order book, waiting for a counterparty at your price.
+  </Step>
+  <Step title="Partially Filled">
+    Some — but not all — of your requested size has been matched. The unfilled remainder continues to rest on the book (for GTC orders).
+  </Step>
+  <Step title="Filled">
+    The full order size has been matched. Your position is updated and collateral is debited/credited accordingly.
+  </Step>
+  <Step title="Cancelled">
+    The order was removed from the book — either by you explicitly, by a cancel-all call, or because it expired (IOC/FOK with no fill).
+  </Step>
+</Steps>
+
+### Checking Order Status
+
+Fetch a single order by its Kairos-assigned ID:
+
+```bash
+curl https://execution.kairos.trade/orders/ord_abc123xyz \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```json
+{
+  "order_id": "ord_abc123xyz",
+  "client_order_id": "my-order-001",
+  "exchange": "polymarket",
+  "side": "BUY",
+  "price": 0.62,
+  "size": 100,
+  "filled_size": 45,
+  "remaining_size": 55,
+  "status": "partially_filled",
+  "created_at": "2025-01-15T10:23:00Z",
+  "updated_at": "2025-01-15T10:24:12Z"
+}
+```
+
+List all your open orders with `GET /orders`.
+
+## Fee Quotes
+
+Before submitting an order, request a combined platform + venue fee quote so you know the exact cost:
+
+```bash
+curl "https://execution.kairos.trade/orders/fee-quote?exchange=polymarket&side=BUY&price=0.62&size=100" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```json
+{
+  "platform_fee": 0.001,
+  "exchange_fee": 0.002,
+  "total_fee": 0.003,
+  "fee_currency": "pUSD"
+}
+```
+
+<Tip>
+Always fetch a fee quote before displaying a trade confirmation UI to your users. Fees vary by venue and can differ between maker and taker.
+</Tip>
+
+## Hosted vs Self-Custody Execution
+
+Kairos offers two execution modes for on-chain venues (Polymarket, Predict.fun, Opinion):
+
+<Tabs>
+  <Tab title="Hosted (v1 endpoints)">
+    Kairos holds signing keys on your behalf. You call `POST /orders` and Kairos signs and submits the on-chain transaction for you. This is the simplest integration path.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/orders \
+      -H "Authorization: Bearer <your-api-key>" \
+      -H "Content-Type: application/json" \
+      -d '{ "exchange": "polymarket", ... }'
+    ```
+  </Tab>
+  <Tab title="Self-Custody (v2 endpoints)">
+    You retain control of your private key. Kairos builds an unsigned EIP-712 payload; you sign it with your wallet and return the signature. Kairos then submits it to the venue.
+
+    **Step 1 — Build the intent:**
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/orders/intent \
+      -H "Authorization: Bearer <your-api-key>" \
+      -H "Content-Type: application/json" \
+      -d '{ "exchange": "polymarket", "side": "BUY", "price": 0.62, "size": 100, ... }'
+    ```
+
+    **Step 2 — Sign and submit:**
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/orders/submit \
+      -H "Authorization: Bearer <your-api-key>" \
+      -H "Content-Type: application/json" \
+      -d '{ "intent_id": "int_xyz789", "signature": "0x..." }'
+    ```
+  </Tab>
+</Tabs>
+
+## EIP-712 Signing
+
+For self-custody orders, Kairos returns a structured EIP-712 typed data object from `/v2/orders/intent`. Sign it with your wallet using `eth_signTypedData_v4` and pass the resulting hex signature to `/v2/orders/submit`.
+
+```javascript
+// Using ethers.js
+const intent = await kairos.buildIntent({ exchange: "polymarket", ... });
+
+const signature = await signer._signTypedData(
+  intent.domain,
+  intent.types,
+  intent.message
+);
+
+await kairos.submitOrder({ intent_id: intent.intent_id, signature });
+```
+
+<Note>
+EIP-712 signing keeps your private key off Kairos servers entirely. The signature is mathematically bound to the exact order parameters — it cannot be modified after signing.
+</Note>
+
+## Cancelling Orders
+
+### Cancel a single order
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/ord_abc123xyz/cancel \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+### Cancel a specific set of orders atomically
+
+Use `POST /orders/cancel-batch` to cancel multiple order IDs in a single atomic operation at the routing layer:
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-batch \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "order_ids": ["ord_abc123", "ord_def456", "ord_ghi789"] }'
+```
+
+### Cancel all open orders on a venue
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-all \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "exchange": "polymarket" }'
+```
+
+<Warning>
+`cancel-all` cancels every open order you have on the specified exchange. There is no undo. Confirm the exchange value carefully before calling this endpoint.
+</Warning>
+
+## Cross-Venue Routing
+
+When the same market exists on multiple venues (e.g., matched on both Polymarket and Kalshi), Kairos can split your order across both legs automatically. This lets you fill larger sizes than any single venue's book can absorb.
+
+**Step 1 — Price the route:**
+
+```bash
+curl "https://execution.kairos.trade/orders/route-quote?link_id=<link_id>&side=BUY&size=500" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+The response shows the expected fill price and per-leg breakdown. If the route looks good, execute it:
+
+**Step 2 — Execute the routed buy:**
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/route-buy \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "link_id": "<link_id>", "side": "BUY", "size": 500 }'
+```
+
+<Tip>
+Use `GET /orders/routes` to list your open routed parent orders and track each leg's fill status.
+</Tip>
+
+## Synthetic Books
+
+Kairos can create a **Synthetic Book** — a virtual order book that combines liquidity across multiple related markets or venues. Synthetic books are useful for cross-venue arbitrage strategies and unified pricing views.
+
+Create or join a Synthetic Book definition with `POST /v1/synthetics`. Inspect an existing one with `GET /v1/synthetics/{synthetic_id}`. Leases expire and must be refreshed with `POST /v1/synthetics/subscriptions/{subscription_id}/refresh`.
+
+## Combos and Parlays
+
+For Polymarket, Kairos supports **combo orders** — multi-leg parlays where you take a position on multiple independent outcomes simultaneously. Get a quote without executing with `POST /combo/quote`, then execute with `POST /combo/execute`. Manage open positions with `GET /combo/positions`.
+
+## Current Position Exposure
+
+Check your live position exposure across all open orders and fills:
+
+```bash
+curl https://execution.kairos.trade/positions/exposure \
+  -H "Authorization: Bearer <your-api-key>"
+```

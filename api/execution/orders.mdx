@@ -1,0 +1,455 @@
+---
+title: "Execution API: Order Submission and Management"
+sidebarTitle: "Orders"
+description: "Submit, list, retrieve, and cancel prediction market orders across venues using the Kairos Execution API orders and positions endpoints."
+---
+
+The Orders group is the core of the Kairos Execution API. You submit a limit or market order once — against any supported venue — and Kairos normalizes the request, routes it to the exchange, and returns a unified order object. From there you can poll order status, retrieve fills, or cancel at any granularity from a single order up to your entire open book on an exchange.
+
+## Endpoints at a Glance
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/orders` | Submit a new order |
+| `GET` | `/orders` | List your orders |
+| `GET` | `/orders/{order_id}` | Get a single order |
+| `POST` | `/orders/{order_id}/cancel` | Cancel a single order |
+| `POST` | `/orders/cancel-batch` | Cancel a specific set of orders atomically |
+| `POST` | `/orders/cancel-all` | Cancel all open orders on an exchange |
+| `GET` | `/orders/fee-quote` | Get a fee quote before trading |
+| `GET` | `/positions/exposure` | Get live position exposure |
+| `POST` | `/v2/orders/intent` | Build unsigned EIP-712 payload (self-custody step 1) |
+| `POST` | `/v2/orders/submit` | Submit signed order (self-custody step 2) |
+| `GET` | `/health` | Shallow liveness probe (no auth required) |
+| `POST` | `/v2/onchain/intent` | Build unsigned on-chain transactions (self-custody step 1) |
+| `POST` | `/v2/onchain/submit` | Broadcast signed on-chain transactions (self-custody step 2) |
+| `GET` | `/exchanges/kalshi/balance` | Get your Kalshi account balance |
+
+---
+
+## POST /orders — Submit a New Order
+
+Send a new limit or market order to any registered venue. Kairos validates the request, converts it to the venue's native format, submits it, and returns a canonical order object with a Kairos-assigned `id`.
+
+### Request Body
+
+<ParamField body="exchange_id" type="string" required>
+  The venue to route to. Accepted values: `polymarket`, `kalshi`, `predictfun`, `opinion`.
+</ParamField>
+
+<ParamField body="market_id" type="string" required>
+  The venue-native market or token ID. For Polymarket this is the CLOB token ID (the outcome token address). For Kalshi this is the market ticker (e.g. `KXBTCD-25DEC3100`).
+</ParamField>
+
+<ParamField body="side" type="string" required>
+  Direction of the order. Must be `BUY` or `SELL`.
+</ParamField>
+
+<ParamField body="price" type="number" required>
+  Limit price expressed as a probability between `0.01` and `0.99` (i.e. cents on a $1 binary contract). Required for `limit` orders; omit for `market` orders.
+</ParamField>
+
+<ParamField body="size" type="number" required>
+  Number of shares (outcome tokens) to buy or sell. Each share pays $1.00 if the outcome wins.
+</ParamField>
+
+<ParamField body="order_type" type="string" required>
+  `limit` or `market`. Market orders fill immediately at best available price; any unfilled remainder is cancelled.
+</ParamField>
+
+<ParamField body="time_in_force" type="string">
+  How long the order stays on the book. Common values: `GTC` (good till cancelled, default), `IOC` (immediate-or-cancel), `FOK` (fill-or-kill). Not all venues support all TIF values.
+</ParamField>
+
+### Example — Submit a limit buy
+
+```bash
+curl -X POST https://execution.kairos.trade/orders \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "exchange_id": "polymarket",
+    "market_id": "0x1234abcd...",
+    "side": "BUY",
+    "price": 0.62,
+    "size": 100,
+    "order_type": "limit",
+    "time_in_force": "GTC"
+  }'
+```
+
+```python
+import requests
+
+resp = requests.post(
+    "https://execution.kairos.trade/orders",
+    headers={"Authorization": f"Bearer {API_KEY}"},
+    json={
+        "exchange_id": "polymarket",
+        "market_id": "0x1234abcd...",
+        "side": "BUY",
+        "price": 0.62,
+        "size": 100,
+        "order_type": "limit",
+        "time_in_force": "GTC",
+    },
+)
+order = resp.json()
+print(order["id"], order["status"])
+```
+
+### Response — Order object
+
+<ResponseField name="id" type="string">
+  Kairos-assigned internal order ID. Use this for all subsequent order operations.
+</ResponseField>
+
+<ResponseField name="exchange_order_id" type="string">
+  The venue's own order ID (e.g. Polymarket CLOB order hash).
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current order state: `open`, `partially_filled`, `filled`, `cancelled`, `rejected`.
+</ResponseField>
+
+<ResponseField name="fills" type="array">
+  Array of fill objects. Each fill contains `price`, `size`, `fee`, and `timestamp`.
+</ResponseField>
+
+<ResponseField name="filled_size" type="number">
+  Total shares matched so far.
+</ResponseField>
+
+<ResponseField name="remaining_size" type="number">
+  Shares still resting on the book.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp of order creation.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp of the most recent state change.
+</ResponseField>
+
+```json
+{
+  "id": "ord_01j9x4z...",
+  "exchange_order_id": "0xabc123...",
+  "exchange_id": "polymarket",
+  "market_id": "0x1234abcd...",
+  "side": "BUY",
+  "price": 0.62,
+  "size": 100,
+  "filled_size": 40,
+  "remaining_size": 60,
+  "status": "partially_filled",
+  "fills": [
+    { "price": 0.62, "size": 40, "fee": 0.08, "timestamp": "2025-01-15T14:23:01Z" }
+  ],
+  "created_at": "2025-01-15T14:23:00Z",
+  "updated_at": "2025-01-15T14:23:01Z"
+}
+```
+
+---
+
+## GET /orders — List Your Orders
+
+Retrieve a paginated list of your orders across all venues or filtered to a specific exchange and status.
+
+### Query Parameters
+
+<ParamField query="status" type="string">
+  Filter by order state: `open`, `partially_filled`, `filled`, `cancelled`. Omit to return all statuses.
+</ParamField>
+
+<ParamField query="exchange_id" type="string">
+  Restrict results to one venue (e.g. `kalshi`).
+</ParamField>
+
+<ParamField query="limit" type="integer">
+  Maximum orders to return per page. Defaults to `50`, maximum `200`.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Opaque pagination cursor from a previous response's `next_cursor` field.
+</ParamField>
+
+```bash
+# List the 20 most recent open orders on Kalshi
+curl "https://execution.kairos.trade/orders?status=open&exchange_id=kalshi&limit=20" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+---
+
+## GET /orders/{order_id} — Get a Single Order
+
+Fetch the full order object for one Kairos order ID. Use this to poll fill status after submission.
+
+```bash
+curl "https://execution.kairos.trade/orders/ord_01j9x4z..." \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+---
+
+## POST /orders/{order_id}/cancel — Cancel a Single Order
+
+Request cancellation of one open order. Returns the updated order object with `status: "cancelled"` if successful. Returns an error if the order is already filled or in a terminal state.
+
+```bash
+curl -X POST "https://execution.kairos.trade/orders/ord_01j9x4z.../cancel" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+---
+
+## POST /orders/cancel-batch — Cancel a Set of Orders Atomically
+
+Cancel a specific list of order IDs in a single request. The cancellations are sent to the venue atomically — either all are submitted for cancellation or none are. Use this to unwind a basket of related positions without race conditions.
+
+### Request Body
+
+<ParamField body="order_ids" type="array" required>
+  Array of Kairos order ID strings to cancel.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-batch \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "order_ids": ["ord_01j9x4z...", "ord_01j9x5a...", "ord_01j9x5b..."] }'
+```
+
+---
+
+## POST /orders/cancel-all — Cancel All Open Orders on an Exchange
+
+Cancel every open order you have on a given venue in one call. This is useful for emergency risk-off scenarios or when rolling over positions at end of day.
+
+### Request Body
+
+<ParamField body="exchange_id" type="string" required>
+  The venue whose open orders you want to cancel. E.g. `polymarket`.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-all \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "exchange_id": "polymarket" }'
+```
+
+<Warning>
+  This cancels **all** open and partially-filled orders on the specified exchange. There is no confirmation step. Use with care in production environments.
+</Warning>
+
+---
+
+## GET /orders/fee-quote — Get a Fee Quote
+
+Fetch the combined Kairos platform fee plus the underlying exchange fee for a prospective trade, before you commit. Use this to display accurate cost-to-trade to your users or to validate that your expected fill price net of fees still meets your profit threshold.
+
+### Query Parameters
+
+<ParamField query="exchange_id" type="string" required>
+  The target venue.
+</ParamField>
+
+<ParamField query="market_id" type="string" required>
+  The market or token ID.
+</ParamField>
+
+<ParamField query="side" type="string" required>
+  `BUY` or `SELL`.
+</ParamField>
+
+<ParamField query="size" type="number" required>
+  Number of shares to use for the fee calculation.
+</ParamField>
+
+```bash
+curl "https://execution.kairos.trade/orders/fee-quote?exchange_id=polymarket&market_id=0x1234abcd...&side=BUY&size=100" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "platform_fee_rate": 0.001,
+  "exchange_fee_rate": 0.0035,
+  "total_fee_rate": 0.0045,
+  "estimated_fee_usdc": 0.279
+}
+```
+
+---
+
+## GET /positions/exposure — Get Live Position Exposure
+
+Returns your current open position exposure across all venues. Use this to understand your aggregate risk before placing additional orders.
+
+```bash
+curl "https://execution.kairos.trade/positions/exposure" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "positions": [
+    {
+      "exchange_id": "polymarket",
+      "market_id": "0x1234abcd...",
+      "outcome": "YES",
+      "size": 60,
+      "average_price": 0.62,
+      "current_mark": 0.67,
+      "unrealized_pnl": 0.30
+    }
+  ]
+}
+```
+
+---
+
+## Self-Custody Order Flow (v2)
+
+If you want to sign orders with your own wallet private key — without sharing credentials with Kairos — use the two-step v2 path.
+
+<Steps>
+  <Step title="Build the unsigned intent">
+    Call `POST /v2/orders/intent` with the same order parameters you would pass to `POST /orders`. Kairos returns an unsigned EIP-712 typed-data payload and a short-lived `intent_id`.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/orders/intent \
+      -H "Authorization: Bearer $KAIROS_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "exchange_id": "polymarket",
+        "market_id": "0x1234abcd...",
+        "side": "BUY",
+        "price": 0.62,
+        "size": 100,
+        "order_type": "limit"
+      }'
+    ```
+
+    The response includes a `typed_data` object (EIP-712 domain + types + message) and an `intent_id`.
+  </Step>
+
+  <Step title="Sign the typed data">
+    Sign the returned `typed_data` with your wallet using `eth_signTypedData_v4`. In ethers.js:
+
+    ```javascript
+    const { domain, types, message } = intentResponse.typed_data;
+    // Remove EIP712Domain from types — ethers adds it automatically
+    delete types.EIP712Domain;
+    const signature = await signer._signTypedData(domain, types, message);
+    ```
+  </Step>
+
+  <Step title="Submit the signed order">
+    Call `POST /v2/orders/submit` with the `intent_id` and your `signature`. Kairos verifies the signature on-chain and forwards the order to the venue.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/orders/submit \
+      -H "Authorization: Bearer $KAIROS_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "intent_id": "int_01j9...",
+        "signature": "0xdeadbeef..."
+      }'
+    ```
+
+    You receive the same canonical order object as `POST /orders`.
+  </Step>
+</Steps>
+
+<Tip>
+  Intent IDs expire after a short window (typically 60 seconds). Build and submit in the same flow — don't cache intents for later use.
+</Tip>
+
+---
+
+## On-Chain Self-Custody Flow (v2 Onchain)
+
+For markets that settle fully on-chain, use the `/v2/onchain` endpoints to build and broadcast signed transactions without giving Kairos access to your private key.
+
+<Steps>
+  <Step title="Build the unsigned transaction payload">
+    Call `POST /v2/onchain/intent` with your order parameters. Kairos returns pinned unsigned on-chain transaction data and a short-lived `intent_id`.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/onchain/intent \
+      -H "Authorization: Bearer $KAIROS_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "exchange_id": "polymarket",
+        "market_id": "0x1234abcd...",
+        "side": "BUY",
+        "price": 0.62,
+        "size": 100,
+        "order_type": "limit"
+      }'
+    ```
+
+    The response contains the unsigned transaction data and an `intent_id`.
+  </Step>
+
+  <Step title="Sign the transaction">
+    Sign the returned transaction payload with your wallet's private key using your preferred Web3 library.
+  </Step>
+
+  <Step title="Broadcast the signed transaction">
+    Call `POST /v2/onchain/submit` with the `intent_id` and your signature. Kairos broadcasts the transaction to the chain.
+
+    ```bash
+    curl -X POST https://execution.kairos.trade/v2/onchain/submit \
+      -H "Authorization: Bearer $KAIROS_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "intent_id": "onchain_01j9...",
+        "signature": "0xdeadbeef..."
+      }'
+    ```
+  </Step>
+</Steps>
+
+<Note>
+  Use `/v2/onchain` for fully on-chain transactions (e.g. direct CTF interactions). Use `/v2/orders` for CLOB order signing via EIP-712. The two flows have separate intent namespaces.
+</Note>
+
+---
+
+## GET /health — Liveness Probe
+
+A lightweight health-check endpoint that returns HTTP 200 when the service is running. This endpoint does **not** require authentication and is safe to use for uptime monitoring.
+
+```bash
+curl https://execution.kairos.trade/health
+```
+
+```json
+{ "status": "ok" }
+```
+
+---
+
+## GET /exchanges/kalshi/balance — Kalshi Account Balance
+
+Returns the authenticated user's Kalshi account balance for the self-custody / offchain trading lane. Use this to check your available USD balance before placing Kalshi orders.
+
+```bash
+curl "https://execution.kairos.trade/exchanges/kalshi/balance" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "exchange_id": "kalshi",
+  "balance_usd": "1250.00",
+  "available_usd": "950.00",
+  "reserved_usd": "300.00"
+}
+```

@@ -1,0 +1,407 @@
+---
+title: "Agora Auctions API: Create, List, View, and Cancel"
+sidebarTitle: "Auctions"
+description: "Create private prediction market auctions, list visible auctions, inspect role-filtered views, retrieve audit timelines, and cancel with the Agora API."
+---
+
+The Agora auction endpoints give originators full control over the lifecycle of a private block-trade auction — from initial creation and capacity checks through to monitoring incoming quotes and cancellation. Every response is scoped to your authenticated role: originators see the complete picture; invited makers see only what's relevant to them.
+
+## Endpoints at a Glance
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/auctions` | Create and open a private auction |
+| `GET` | `/v1/auctions` | List auctions visible to you |
+| `POST` | `/v1/auctions/preflight` | Verify originator capacity without reserving it |
+| `GET` | `/v1/auctions/{auctionID}` | Get a role-filtered auction view |
+| `GET` | `/v1/auctions/{auctionID}/events` | Get your complete role-filtered audit timeline |
+| `POST` | `/v1/auctions/{auctionID}/cancel` | Cancel an open auction |
+| `GET` | `/v1/invitations` | Read your durable private invitation inbox |
+
+---
+
+## POST /v1/auctions
+
+Create and immediately open a private auction. Only the wallet addresses you list as invited makers will be able to see or quote on the auction. Agora notifies each invited maker via their invitation inbox and the WebSocket stream.
+
+<Note>
+  Run `POST /v1/auctions/preflight` with the same body before calling this endpoint if you want to validate your capacity without reserving it.
+</Note>
+
+**Request body**
+
+<ParamField body="instrument_id" type="string" required>
+  The Kairos canonical instrument identifier for the prediction market contract you want to trade (e.g., `"poly:0xabc123..."`).
+</ParamField>
+
+<ParamField body="side" type="string" required>
+  The originator's side. Must be `"BUY"` or `"SELL"`.
+</ParamField>
+
+<ParamField body="size" type="integer" required>
+  The number of contracts (shares) to trade. Must be a positive integer.
+</ParamField>
+
+<ParamField body="expiry" type="string" required>
+  ISO 8601 UTC timestamp at which the auction closes automatically if not settled. Example: `"2025-09-01T18:00:00Z"`.
+</ParamField>
+
+<ParamField body="invited_makers" type="array" required>
+  List of wallet addresses (strings) for the market makers you want to invite. Each address receives a notification in their invitation inbox and stream.
+</ParamField>
+
+<ParamField body="min_fill_size" type="integer">
+  Optional minimum acceptable fill size. Makers may quote partial sizes, but the originator will only consider quotes of at least this many contracts.
+</ParamField>
+
+<ParamField body="notes" type="string">
+  Optional free-text field visible to all invited makers. Use it to pass context about your requirements without revealing sensitive details.
+</ParamField>
+
+**Example request**
+
+```bash
+curl -X POST https://agora.kairos.trade/v1/auctions \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instrument_id": "poly:0xabc123def456",
+    "side": "BUY",
+    "size": 50000,
+    "expiry": "2025-09-01T18:00:00Z",
+    "invited_makers": [
+      "0xMakerWalletAddress1",
+      "0xMakerWalletAddress2"
+    ],
+    "min_fill_size": 10000,
+    "notes": "Looking for tight spread on a YES leg."
+  }'
+```
+
+**Response — auction object**
+
+```json
+{
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "status": "OPEN",
+  "instrument_id": "poly:0xabc123def456",
+  "side": "BUY",
+  "size": 50000,
+  "min_fill_size": 10000,
+  "expiry": "2025-09-01T18:00:00Z",
+  "originator": "0xOriginatorWalletAddress",
+  "invited_makers": [
+    "0xMakerWalletAddress1",
+    "0xMakerWalletAddress2"
+  ],
+  "quotes": [],
+  "notes": "Looking for tight spread on a YES leg.",
+  "created_at": "2025-08-28T12:00:00Z",
+  "updated_at": "2025-08-28T12:00:00Z"
+}
+```
+
+<ResponseField name="auction_id" type="string">
+  Globally unique identifier for this auction. Use it in all subsequent requests.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current auction state. One of `OPEN`, `CANCELLED`, or `SETTLED`.
+</ResponseField>
+
+<ResponseField name="instrument_id" type="string">
+  The Kairos canonical instrument identifier as provided at creation time.
+</ResponseField>
+
+<ResponseField name="side" type="string">
+  The originator's side: `BUY` or `SELL`.
+</ResponseField>
+
+<ResponseField name="size" type="integer">
+  Total contract size requested by the originator.
+</ResponseField>
+
+<ResponseField name="expiry" type="string">
+  ISO 8601 UTC timestamp at which the auction closes automatically.
+</ResponseField>
+
+<ResponseField name="originator" type="string">
+  Wallet address of the auction creator.
+</ResponseField>
+
+<ResponseField name="invited_makers" type="array">
+  List of wallet addresses invited to quote. Only visible to the originator.
+</ResponseField>
+
+<ResponseField name="quotes" type="array">
+  Array of quote objects submitted so far. Originators see all quotes; makers see only their own.
+</ResponseField>
+
+<ResponseField name="created_at" type="string">
+  ISO 8601 timestamp of auction creation.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp of the most recent state change.
+</ResponseField>
+
+---
+
+## GET /v1/auctions
+
+List every auction currently visible to the authenticated principal. Originators see auctions they created; invited makers see auctions they were invited to.
+
+**Example request**
+
+```bash
+curl https://agora.kairos.trade/v1/auctions \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response**
+
+```json
+{
+  "auctions": [
+    {
+      "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+      "status": "OPEN",
+      "instrument_id": "poly:0xabc123def456",
+      "side": "BUY",
+      "size": 50000,
+      "expiry": "2025-09-01T18:00:00Z",
+      "created_at": "2025-08-28T12:00:00Z",
+      "updated_at": "2025-08-28T12:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+---
+
+## POST /v1/auctions/preflight
+
+Verify that you have sufficient originator capacity to open an auction with a given instrument, side, and size — without actually creating the auction or reserving any capacity. Call this before `POST /v1/auctions` to catch capacity errors early.
+
+**Request body**
+
+Use the same fields as `POST /v1/auctions` (`instrument_id`, `side`, `size`). The `invited_makers` and `expiry` fields are not required for a preflight check.
+
+**Example request**
+
+```bash
+curl -X POST https://agora.kairos.trade/v1/auctions/preflight \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instrument_id": "poly:0xabc123def456",
+    "side": "BUY",
+    "size": 50000
+  }'
+```
+
+**Example response — capacity available**
+
+```json
+{
+  "eligible": true,
+  "available_capacity": 250000
+}
+```
+
+**Example response — capacity insufficient**
+
+```json
+{
+  "eligible": false,
+  "reason": "INSUFFICIENT_CAPACITY",
+  "available_capacity": 12000,
+  "requested": 50000
+}
+```
+
+<Warning>
+  A successful preflight does not lock or reserve capacity. Another auction may consume available capacity between your preflight call and your actual `POST /v1/auctions` call. Always handle capacity errors on the creation endpoint as well.
+</Warning>
+
+---
+
+## GET /v1/auctions/{auctionID}
+
+Fetch a single auction by its ID. The response payload is role-filtered: if you are the originator you receive the full object including all quotes and the complete invited-maker list; if you are an invited maker you see only your own submitted quote.
+
+**Path parameter**
+
+<ParamField path="auctionID" type="string" required>
+  The `auction_id` returned when the auction was created.
+</ParamField>
+
+**Example request**
+
+```bash
+curl https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response (originator view)**
+
+```json
+{
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "status": "OPEN",
+  "instrument_id": "poly:0xabc123def456",
+  "side": "BUY",
+  "size": 50000,
+  "expiry": "2025-09-01T18:00:00Z",
+  "originator": "0xOriginatorWalletAddress",
+  "invited_makers": [
+    "0xMakerWalletAddress1",
+    "0xMakerWalletAddress2"
+  ],
+  "quotes": [
+    {
+      "quote_id": "qt_01J9XMR4HK2PLWC5BDGEQT78NF",
+      "maker": "0xMakerWalletAddress1",
+      "price": "0.62",
+      "size": 50000,
+      "status": "ACTIVE",
+      "submitted_at": "2025-08-28T12:05:00Z"
+    }
+  ],
+  "created_at": "2025-08-28T12:00:00Z",
+  "updated_at": "2025-08-28T12:05:00Z"
+}
+```
+
+---
+
+## GET /v1/auctions/{auctionID}/events
+
+Retrieve the complete, role-filtered audit timeline for an auction. Every state transition — auction created, invitation sent, quote submitted, quote withdrawn, auction cancelled — is recorded as an immutable event. Originators see all events; makers see only events triggered by or directed at them.
+
+**Path parameter**
+
+<ParamField path="auctionID" type="string" required>
+  The `auction_id` of the auction whose timeline you want to inspect.
+</ParamField>
+
+**Example request**
+
+```bash
+curl https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE/events \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response**
+
+```json
+{
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "events": [
+    {
+      "event_id": "evt_01",
+      "type": "AUCTION_CREATED",
+      "actor": "0xOriginatorWalletAddress",
+      "occurred_at": "2025-08-28T12:00:00Z",
+      "payload": {}
+    },
+    {
+      "event_id": "evt_02",
+      "type": "INVITATION_SENT",
+      "actor": "system",
+      "occurred_at": "2025-08-28T12:00:01Z",
+      "payload": {
+        "maker": "0xMakerWalletAddress1"
+      }
+    },
+    {
+      "event_id": "evt_03",
+      "type": "QUOTE_SUBMITTED",
+      "actor": "0xMakerWalletAddress1",
+      "occurred_at": "2025-08-28T12:05:00Z",
+      "payload": {
+        "quote_id": "qt_01J9XMR4HK2PLWC5BDGEQT78NF",
+        "price": "0.62",
+        "size": 50000
+      }
+    }
+  ]
+}
+```
+
+<Tip>
+  Use the events timeline for post-trade compliance reporting. The immutable log provides a complete record of who saw what and when.
+</Tip>
+
+---
+
+## POST /v1/auctions/{auctionID}/cancel
+
+Cancel an open auction. All invited makers are notified immediately via the WebSocket stream and their invitation inboxes. Cancellation is permanent — you cannot reopen a cancelled auction.
+
+**Path parameter**
+
+<ParamField path="auctionID" type="string" required>
+  The `auction_id` of the open auction you want to cancel.
+</ParamField>
+
+**Example request**
+
+```bash
+curl -X POST \
+  https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE/cancel \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response**
+
+```json
+{
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "status": "CANCELLED",
+  "cancelled_at": "2025-08-28T13:00:00Z"
+}
+```
+
+<Warning>
+  Only the originator can cancel an auction. Attempting to cancel an auction you did not create returns `HTTP 403 Forbidden`. Attempting to cancel an already-cancelled or settled auction returns `HTTP 409 Conflict`.
+</Warning>
+
+---
+
+## GET /v1/invitations
+
+Read your durable private invitation inbox. Agora persists every auction invitation sent to your wallet address here, so you can catch up on missed invitations even if you were offline when they arrived. Invitations remain in the inbox regardless of auction status.
+
+**Example request**
+
+```bash
+curl https://agora.kairos.trade/v1/invitations \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response**
+
+```json
+{
+  "invitations": [
+    {
+      "invitation_id": "inv_01J9XKQZ9FMTPW8NVRDTH46AA",
+      "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+      "instrument_id": "poly:0xabc123def456",
+      "originator": "0xOriginatorWalletAddress",
+      "side": "BUY",
+      "size": 50000,
+      "expiry": "2025-09-01T18:00:00Z",
+      "auction_status": "OPEN",
+      "invited_at": "2025-08-28T12:00:01Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+<Note>
+  The invitation inbox is **append-only and durable**. Even after an auction expires, is cancelled, or settles, its invitation entry remains visible here so you can audit your historical participation.
+</Note>

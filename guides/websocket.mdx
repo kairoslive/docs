@@ -1,0 +1,339 @@
+---
+title: "Real-Time Data with Kairos WebSocket Streams and Events"
+sidebarTitle: "WebSocket"
+description: "Subscribe to live orderbook updates, trade tape, and price feeds over WebSocket for any prediction market or perpetuals instrument on Kairos."
+---
+
+Polling REST endpoints for prices works fine at low frequency, but when you need sub-second latency — for market-making, live dashboards, or monitoring large positions — WebSocket streams are the right tool. Kairos provides two WebSocket surfaces: the **public Market Data WebSocket** for orderbooks, trades, and price feeds, and the **private Agora event stream** (`/v1/stream`) for institutional auction notifications.
+
+<Info>
+  The public Market Data WebSocket is free and requires no API key. The Agora private stream requires an `Authorization` header or token on connection. Get your key at [app.kairos.trade](https://app.kairos.trade).
+</Info>
+
+---
+
+## Available streams
+
+<CardGroup cols={2}>
+  <Card title="Orderbook" icon="book-open">
+    Level-2 orderbook snapshots and incremental updates for any prediction market.
+  </Card>
+  <Card title="Trade Tape" icon="receipt">
+    Every fill as it happens — price, size, side, and timestamp.
+  </Card>
+  <Card title="Price Feed" icon="chart-line">
+    Continuous best-bid/best-ask and last-trade price updates.
+  </Card>
+  <Card title="Agora Events" icon="bell">
+    Private auction lifecycle events: invitations, quotes, settlements, and cancellations.
+  </Card>
+</CardGroup>
+
+---
+
+## Connect to the Market Data WebSocket
+
+The Market Data WebSocket endpoint is served over `wss://`. After connecting, send a JSON subscription message to begin receiving events.
+
+### JavaScript example
+
+```javascript
+const ws = new WebSocket("wss://md.kairos.trade/v1/ws");
+
+ws.addEventListener("open", () => {
+  console.log("Connected to Kairos Market Data WebSocket");
+
+  // Subscribe to price feed and trade tape for a Polymarket market
+  ws.send(JSON.stringify({
+    type: "subscribe",
+    channels: ["trades", "price"],
+    provider: "polymarket",
+    market_id: "0xabc123",
+    outcome: "YES",
+  }));
+});
+
+ws.addEventListener("message", (event) => {
+  const msg = JSON.parse(event.data);
+
+  switch (msg.type) {
+    case "trade":
+      console.log(`Trade: ${msg.side} ${msg.size} @ ${msg.price}`);
+      break;
+    case "price_update":
+      console.log(`Price: bid=${msg.best_bid} ask=${msg.best_ask}`);
+      break;
+    case "orderbook_snapshot":
+      console.log("Orderbook snapshot received:", msg.bids.length, "bids");
+      break;
+    case "orderbook_delta":
+      // Apply incremental updates to your local book
+      applyDelta(msg.bids, msg.asks);
+      break;
+    default:
+      console.log("Unknown message type:", msg.type);
+  }
+});
+
+ws.addEventListener("close", (event) => {
+  console.log("Connection closed:", event.code, event.reason);
+  // Trigger reconnection (see reconnection section below)
+});
+
+ws.addEventListener("error", (err) => {
+  console.error("WebSocket error:", err);
+});
+```
+
+### Python example
+
+```python
+import asyncio
+import json
+import websockets
+
+async def stream_market(market_id: str, outcome: str = "YES"):
+    uri = "wss://md.kairos.trade/v1/ws"
+
+    async with websockets.connect(uri) as ws:
+        # Subscribe to trades and price updates
+        await ws.send(json.dumps({
+            "type": "subscribe",
+            "channels": ["trades", "price"],
+            "provider": "polymarket",
+            "market_id": market_id,
+            "outcome": outcome,
+        }))
+        print(f"Subscribed to {market_id} {outcome}")
+
+        async for raw in ws:
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+
+            if msg_type == "trade":
+                print(f"  Trade  {msg['side']:4s}  {msg['size']:>8.2f} @ {msg['price']:.4f}")
+            elif msg_type == "price_update":
+                print(f"  Price  bid={msg['best_bid']:.4f}  ask={msg['best_ask']:.4f}")
+            elif msg_type == "orderbook_snapshot":
+                print(f"  Book snapshot — {len(msg['bids'])} bids, {len(msg['asks'])} asks")
+
+asyncio.run(stream_market("0xabc123"))
+```
+
+---
+
+## Subscription message format
+
+Every subscription message follows this shape:
+
+```json
+{
+  "type": "subscribe",
+  "channels": ["trades", "price", "orderbook"],
+  "provider": "polymarket",
+  "market_id": "0xabc123",
+  "outcome": "YES"
+}
+```
+
+<Accordion title="Subscription fields">
+  <ParamField body="type" type="string" required>
+    Always `"subscribe"` to start a subscription or `"unsubscribe"` to stop.
+  </ParamField>
+  <ParamField body="channels" type="string[]" required>
+    One or more channels: `"trades"`, `"price"`, `"orderbook"`.
+  </ParamField>
+  <ParamField body="provider" type="string" required>
+    Venue identifier: `"polymarket"`, `"kalshi"`, or `"predictfun"`.
+  </ParamField>
+  <ParamField body="market_id" type="string" required>
+    The venue-specific market or contract ID.
+  </ParamField>
+  <ParamField body="outcome" type="string">
+    Outcome token to subscribe to — e.g. `"YES"` or `"NO"`. Required for binary markets.
+  </ParamField>
+</Accordion>
+
+To subscribe to multiple markets, send one subscription message per market. You can hold many concurrent subscriptions on a single connection.
+
+---
+
+## Message types
+
+### `trade`
+
+Emitted on every fill. Use this to build a real-time tape or compute VWAP.
+
+```json
+{
+  "type": "trade",
+  "provider": "polymarket",
+  "market_id": "0xabc123",
+  "outcome": "YES",
+  "price": 0.63,
+  "size": 200,
+  "side": "buy",
+  "timestamp": "2025-01-15T14:23:07.412Z"
+}
+```
+
+### `price_update`
+
+Emitted whenever the best bid, best ask, or last-trade price changes.
+
+```json
+{
+  "type": "price_update",
+  "provider": "polymarket",
+  "market_id": "0xabc123",
+  "outcome": "YES",
+  "best_bid": 0.61,
+  "best_ask": 0.63,
+  "last_trade_price": 0.63,
+  "timestamp": "2025-01-15T14:23:07.415Z"
+}
+```
+
+### `orderbook_snapshot`
+
+Sent once on subscription, giving you the full current state of the book.
+
+```json
+{
+  "type": "orderbook_snapshot",
+  "provider": "polymarket",
+  "market_id": "0xabc123",
+  "outcome": "YES",
+  "bids": [
+    {"price": 0.61, "size": 500},
+    {"price": 0.60, "size": 1200}
+  ],
+  "asks": [
+    {"price": 0.63, "size": 400},
+    {"price": 0.64, "size": 800}
+  ],
+  "timestamp": "2025-01-15T14:23:05.000Z"
+}
+```
+
+### `orderbook_delta`
+
+Sent on every book change after the initial snapshot. Apply deltas to your local copy. A `size` of `0` means the level was removed.
+
+```json
+{
+  "type": "orderbook_delta",
+  "provider": "polymarket",
+  "market_id": "0xabc123",
+  "outcome": "YES",
+  "bids": [{"price": 0.61, "size": 350}],
+  "asks": [],
+  "timestamp": "2025-01-15T14:23:08.102Z"
+}
+```
+
+---
+
+## Agora private event stream
+
+The Agora auction house emits real-time events over a private WebSocket at `GET /v1/stream`. Connect with your API key to receive auction invitations, quote submissions, status changes, and settlement confirmations.
+
+### Authenticate the connection
+
+Pass your API key as a query parameter or in the `Authorization` header on the initial HTTP upgrade request.
+
+```javascript
+const ws = new WebSocket(
+  "wss://agora.kairos.trade/v1/stream?token=" + encodeURIComponent(apiKey)
+);
+
+ws.addEventListener("open", () => {
+  console.log("Agora private stream connected");
+});
+
+ws.addEventListener("message", (event) => {
+  const msg = JSON.parse(event.data);
+  console.log("Agora event:", msg.event_type, msg);
+});
+```
+
+```python
+import asyncio
+import json
+import websockets
+
+async def agora_stream(api_key: str):
+    uri = f"wss://agora.kairos.trade/v1/stream?token={api_key}"
+    async with websockets.connect(uri) as ws:
+        print("Agora stream connected")
+        async for raw in ws:
+            event = json.loads(raw)
+            print(f"Event: {event['event_type']} — auction {event.get('auction_id')}")
+
+asyncio.run(agora_stream(api_key))
+```
+
+**Agora event types:**
+
+| Event | Who receives it |
+|---|---|
+| `auction.invited` | Market maker — you have been invited to quote |
+| `auction.quote_received` | Originator — a maker submitted a quote |
+| `auction.quote_withdrawn` | Originator — a maker withdrew their quote |
+| `auction.settled` | All participants — auction executed |
+| `auction.cancelled` | All participants — originator cancelled |
+
+---
+
+## Reconnection best practices
+
+WebSocket connections drop — network hiccups, server deploys, and idle timeouts all cause disconnects. Follow these practices to maintain continuous streams:
+
+<Steps>
+  <Step title="Detect disconnection">
+    Listen on the `close` and `error` events. Record the timestamp of the last message you received so you can detect stale connections.
+  </Step>
+  <Step title="Exponential backoff">
+    On disconnect, wait before reconnecting. Start at 1 second and double on each failure, capped at 30 seconds. Reset the delay after a successful connection lasting more than 60 seconds.
+
+    ```javascript
+    let delay = 1000;
+    const MAX_DELAY = 30000;
+
+    function reconnect() {
+      setTimeout(() => {
+        console.log(`Reconnecting (delay=${delay}ms)...`);
+        connect(); // your connect function
+      }, delay);
+      delay = Math.min(delay * 2, MAX_DELAY);
+    }
+    ```
+  </Step>
+  <Step title="Resubscribe on reconnect">
+    After a new connection opens, re-send all your subscription messages. The server does not persist subscription state across connections.
+  </Step>
+  <Step title="Reconcile state">
+    After reconnecting, fetch a REST snapshot to fill any gap in the event stream before applying fresh deltas.
+
+    ```python
+    # Re-sync orderbook after reconnect
+    resp = httpx.get(
+        "https://md.kairos.trade/v1/markets/polymarket/0xabc123"
+    )
+    local_book = resp.json()["orderbook"]
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  Do not reconnect without backoff. Rapid reconnections during an outage will exhaust rate limits and result in a temporary ban.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Market Data" icon="chart-bar" href="/guides/market-data">
+    REST endpoints for prices, candles, and trade history.
+  </Card>
+  <Card title="Auctions" icon="gavel" href="/guides/auctions">
+    Create and manage private block trade auctions on Agora.
+  </Card>
+</CardGroup>

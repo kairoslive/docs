@@ -1,0 +1,340 @@
+---
+title: "Execution API: Polymarket Combo and Parlay Endpoints"
+sidebarTitle: "Combos"
+description: "Price, execute, cash out, and redeem Polymarket combo (parlay) multi-leg positions using the Kairos Execution API, from RFQ quote through final redemption."
+---
+
+Polymarket combos — also called parlays — let you stake on multiple independent markets at once. Your position pays out only if every leg resolves in your favor, but in exchange you get significantly better combined odds than betting each market separately. The Kairos Combo endpoints wrap Polymarket's RFQ (request-for-quote) gateway, handling the multi-market pricing, execution, lifecycle management, and redemption in a consistent API that matches the rest of the Execution API's conventions.
+
+## How Combos Work
+
+When you create a combo, you specify an array of markets and the outcome you expect in each one. Polymarket's liquidity providers respond with a combined price via RFQ. If you accept, you receive a single combo position token. This token pays $1.00 (in pUSD) only if every leg resolves to the outcome you chose. You can sell your position back to pUSD at any time using the cash-out endpoints, or redeem it for $1.00 per share after all legs resolve in your favor.
+
+## Endpoints at a Glance
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/combo/quote` | Price a combo without executing |
+| `POST` | `/combo/execute` | Buy the combo via RFQ gateway |
+| `GET` | `/combo/positions` | List your Polymarket combo positions |
+| `POST` | `/combo/cash-out-quote` | Price a combo cash-out without executing |
+| `POST` | `/combo/cash-out` | Sell an open combo position back to pUSD |
+| `POST` | `/combo/redeem` | Redeem a resolved, winning combo |
+
+---
+
+## POST /combo/quote — Price a Combo
+
+Get a firm quote for a Polymarket combo without committing to buy it. The response includes a per-leg breakdown and a combined price. Quotes are short-lived — use them for display or confirmation flows, then call `/combo/execute` immediately.
+
+### Request Body
+
+<ParamField body="legs" type="array" required>
+  An array of leg objects. Each leg object has:
+
+  <Expandable title="Leg object fields">
+    <ParamField body="market_id" type="string" required>
+      The Polymarket CLOB token ID for this leg's outcome. This is the token address for the specific outcome (YES or NO) you want to buy.
+    </ParamField>
+
+    <ParamField body="outcome" type="string" required>
+      The outcome to bet on: `YES` or `NO`.
+    </ParamField>
+
+    <ParamField body="size" type="number" required>
+      Number of combo shares. All legs must have the same `size`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/combo/quote \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "legs": [
+      { "market_id": "0x1111...", "outcome": "YES", "size": 50 },
+      { "market_id": "0x2222...", "outcome": "YES", "size": 50 },
+      { "market_id": "0x3333...", "outcome": "NO",  "size": 50 }
+    ]
+  }'
+```
+
+```python
+import requests
+
+payload = {
+    "legs": [
+        {"market_id": "0x1111...", "outcome": "YES", "size": 50},
+        {"market_id": "0x2222...", "outcome": "YES", "size": 50},
+        {"market_id": "0x3333...", "outcome": "NO",  "size": 50},
+    ]
+}
+
+resp = requests.post(
+    "https://execution.kairos.trade/combo/quote",
+    headers={"Authorization": f"Bearer {API_KEY}"},
+    json=payload,
+)
+quote = resp.json()
+print(f"Combined price: {quote['combined_price']}")
+print(f"Cost: {quote['total_cost_usdc']} USDC")
+```
+
+### Response
+
+<ResponseField name="quote_id" type="string">
+  Short-lived quote identifier. Pass this to `/combo/execute` to accept the quote.
+</ResponseField>
+
+<ResponseField name="combined_price" type="number">
+  The all-in probability (price) for the full parlay winning. This is approximately the product of each leg's individual probability.
+</ResponseField>
+
+<ResponseField name="total_cost_usdc" type="number">
+  Total USDC cost to purchase `size` shares of the combo.
+</ResponseField>
+
+<ResponseField name="legs" type="array">
+  Per-leg breakdown including `market_id`, `outcome`, `individual_price`, and `size`.
+</ResponseField>
+
+<ResponseField name="expires_at" type="string">
+  ISO 8601 timestamp when this quote expires. Submit execution before this time.
+</ResponseField>
+
+```json
+{
+  "quote_id": "q_01j9comb...",
+  "combined_price": 0.087,
+  "total_cost_usdc": 4.35,
+  "potential_payout_usdc": 50.00,
+  "legs": [
+    { "market_id": "0x1111...", "outcome": "YES", "individual_price": 0.62, "size": 50 },
+    { "market_id": "0x2222...", "outcome": "YES", "individual_price": 0.55, "size": 50 },
+    { "market_id": "0x3333...", "outcome": "NO",  "individual_price": 0.41, "size": 50 }
+  ],
+  "expires_at": "2025-01-15T14:32:00Z"
+}
+```
+
+<Tip>
+  The `combined_price` (0.087 in the example above) reflects the parlay effect — multiply each leg's probability together and you get the theoretical fair value. Deviations from this product represent RFQ provider spread.
+</Tip>
+
+---
+
+## POST /combo/execute — Buy a Combo
+
+Accept a quote and execute the combo purchase through Polymarket's RFQ gateway. You can either pass a `quote_id` from a prior `/combo/quote` call, or submit a fresh set of legs to get a quote and execute atomically.
+
+### Request Body
+
+<ParamField body="quote_id" type="string">
+  A valid, unexpired `quote_id` from `POST /combo/quote`. Recommended — ensures you execute at the price you previewed.
+</ParamField>
+
+<ParamField body="legs" type="array">
+  Alternatively, provide legs directly and Kairos will request a fresh quote and execute in one step. Same format as `/combo/quote`.
+</ParamField>
+
+<ParamField body="max_price" type="number">
+  Maximum combined price you are willing to accept. The execution is rejected if the live quote exceeds this value. Useful as a slippage guard when executing without a prior `quote_id`.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/combo/execute \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "quote_id": "q_01j9comb...",
+    "max_price": 0.095
+  }'
+```
+
+### Response
+
+```json
+{
+  "combo_position_id": "cp_01j9...",
+  "status": "filled",
+  "combined_price": 0.087,
+  "size": 50,
+  "total_cost_usdc": 4.35,
+  "potential_payout_usdc": 50.00,
+  "legs": [
+    { "market_id": "0x1111...", "outcome": "YES" },
+    { "market_id": "0x2222...", "outcome": "YES" },
+    { "market_id": "0x3333...", "outcome": "NO" }
+  ],
+  "created_at": "2025-01-15T14:31:45Z"
+}
+```
+
+---
+
+## GET /combo/positions — List Your Combo Positions
+
+Returns all of your Polymarket combo positions, including open (live), closed (cashed out or expired), and resolved (redeemable or already redeemed).
+
+```bash
+curl "https://execution.kairos.trade/combo/positions" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```json
+{
+  "positions": [
+    {
+      "combo_position_id": "cp_01j9...",
+      "status": "open",
+      "size": 50,
+      "entry_price": 0.087,
+      "current_price": 0.11,
+      "unrealized_pnl": 1.15,
+      "legs": [
+        { "market_id": "0x1111...", "outcome": "YES", "current_price": 0.68, "resolved": false },
+        { "market_id": "0x2222...", "outcome": "YES", "current_price": 0.61, "resolved": false },
+        { "market_id": "0x3333...", "outcome": "NO",  "current_price": 0.38, "resolved": false }
+      ],
+      "created_at": "2025-01-15T14:31:45Z"
+    }
+  ]
+}
+```
+
+---
+
+## POST /combo/cash-out-quote — Price a Cash-Out
+
+Get an RFQ quote for selling your combo position back to pUSD without executing. Use this to show your user the current exit value and expected slippage before they confirm the cash-out.
+
+### Request Body
+
+<ParamField body="combo_position_id" type="string" required>
+  The position ID from `GET /combo/positions` or `POST /combo/execute`.
+</ParamField>
+
+<ParamField body="size" type="number">
+  Number of combo shares to sell. Defaults to your full position if omitted.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/combo/cash-out-quote \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "combo_position_id": "cp_01j9..." }'
+```
+
+```json
+{
+  "quote_id": "coq_01j9...",
+  "combo_position_id": "cp_01j9...",
+  "size": 50,
+  "cash_out_price": 0.108,
+  "cash_out_value_usdc": 5.40,
+  "entry_price": 0.087,
+  "unrealized_pnl": 1.05,
+  "expires_at": "2025-01-15T15:05:30Z"
+}
+```
+
+---
+
+## POST /combo/cash-out — Sell an Open Combo Position
+
+Execute the cash-out, selling your open combo back to pUSD at the RFQ price. Pass a `quote_id` from `POST /combo/cash-out-quote` for price certainty, or provide the position ID directly to get a fresh quote and execute atomically.
+
+### Request Body
+
+<ParamField body="combo_position_id" type="string" required>
+  The combo position to close.
+</ParamField>
+
+<ParamField body="quote_id" type="string">
+  A valid cash-out quote ID. Recommended for price certainty.
+</ParamField>
+
+<ParamField body="min_price" type="number">
+  Minimum cash-out price you will accept. Acts as a slippage floor.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/combo/cash-out \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "combo_position_id": "cp_01j9...",
+    "quote_id": "coq_01j9...",
+    "min_price": 0.10
+  }'
+```
+
+```json
+{
+  "status": "filled",
+  "combo_position_id": "cp_01j9...",
+  "cash_out_price": 0.108,
+  "cash_out_value_usdc": 5.40,
+  "realized_pnl": 1.05
+}
+```
+
+---
+
+## POST /combo/redeem — Redeem a Winning Combo
+
+After all legs of a winning combo have resolved, call this endpoint to claim your $1.00-per-share payout back to your pUSD balance. This endpoint is only valid once all legs are resolved and your outcome on each leg was correct.
+
+### Request Body
+
+<ParamField body="combo_position_id" type="string" required>
+  The resolved combo position to redeem.
+</ParamField>
+
+```bash
+curl -X POST https://execution.kairos.trade/combo/redeem \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "combo_position_id": "cp_01j9..." }'
+```
+
+```json
+{
+  "status": "redeemed",
+  "combo_position_id": "cp_01j9...",
+  "size": 50,
+  "payout_usdc": 50.00,
+  "tx_hash": "0xwinredem..."
+}
+```
+
+<Note>
+  You can only redeem after **all** legs have resolved in your favor. If any leg resolves against you, the combo expires worthless and there is nothing to redeem — but you can check the position status in `GET /combo/positions` to confirm.
+</Note>
+
+---
+
+## Combo Lifecycle Summary
+
+<Steps>
+  <Step title="Quote">
+    Call `POST /combo/quote` with your legs array to get a `quote_id` and see the combined price and potential payout.
+  </Step>
+
+  <Step title="Execute">
+    Call `POST /combo/execute` with the `quote_id`. You now hold a combo position.
+  </Step>
+
+  <Step title="Monitor">
+    Use `GET /combo/positions` to watch the current market value and track which legs have resolved.
+  </Step>
+
+  <Step title="Exit (optional)">
+    If you want to exit early, call `POST /combo/cash-out-quote` then `POST /combo/cash-out`.
+  </Step>
+
+  <Step title="Redeem (if you win)">
+    Once all legs resolve in your favor, call `POST /combo/redeem` to collect $1.00 per share.
+  </Step>
+</Steps>

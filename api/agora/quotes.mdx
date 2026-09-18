@@ -1,0 +1,381 @@
+---
+title: "Agora Quote Management API — Makers Reference Guide"
+sidebarTitle: "Quotes"
+description: "Submit firm executable quotes, revise them, withdraw them, and verify quote capacity for a Kairos Agora private auction as an invited market maker."
+---
+
+As an invited market maker, your primary interaction with an Agora auction is through quote management. You submit a single firm, executable price and size, revise it at will while the auction is open, and withdraw it if you no longer want to participate. A companion preflight endpoint lets you validate your capacity at a specific price before committing. Pair these REST endpoints with the authenticated WebSocket stream to react to auction state changes in real time.
+
+## Quote Lifecycle
+
+```
+Invited  ──▶  SUBMITTED  ──▶  revised (same endpoint, replaces prior)
+                   │
+                   ├──▶  WITHDRAWN  (DELETE endpoint)
+                   │
+                   └──▶  ACCEPTED   (originator settles off-platform)
+```
+
+A maker may submit, revise, and withdraw any number of times while the auction remains `OPEN`. Once the originator accepts a quote or cancels the auction, no further changes are possible.
+
+## Endpoints at a Glance
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/auctions/{auctionID}/quotes` | Submit or revise a firm executable quote |
+| `DELETE` | `/v1/auctions/{auctionID}/quotes` | Withdraw your active quote |
+| `POST` | `/v1/auctions/{auctionID}/quotes/preflight` | Verify price-specific quote capacity |
+| `GET` | `/v1/stream` | Authenticated WebSocket event stream |
+
+---
+
+## POST /v1/auctions/{auctionID}/quotes
+
+Submit a new quote or revise your existing quote on an open auction. Each maker may hold at most one active quote per auction at any time. Calling this endpoint when you already have an active quote **replaces** the previous quote atomically — the old quote is withdrawn and the new one becomes active in a single operation.
+
+<Note>
+  You must be on the `invited_makers` list for the auction to submit a quote. Calling this endpoint on an auction you were not invited to returns `HTTP 403 Forbidden`.
+</Note>
+
+**Path parameter**
+
+<ParamField path="auctionID" type="string" required>
+  The `auction_id` of the open auction you want to quote on.
+</ParamField>
+
+**Request body**
+
+<ParamField body="price" type="string" required>
+  Your firm bid or offer price expressed as a decimal between `"0.01"` and `"0.99"` (inclusive). Prediction market contracts settle at 0 or 1, so prices represent implied probability. Example: `"0.62"` means you are quoting at 62 cents per share.
+</ParamField>
+
+<ParamField body="size" type="integer" required>
+  The number of contracts (shares) you are willing to trade at the quoted price. Must be a positive integer. If the auction has a `min_fill_size`, your `size` must meet or exceed it.
+</ParamField>
+
+**Example request — first submission**
+
+```bash
+curl -X POST \
+  https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE/quotes \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "price": "0.62",
+    "size": 50000
+  }'
+```
+
+**Example response**
+
+```json
+{
+  "quote_id": "qt_01J9XMR4HK2PLWC5BDGEQT78NF",
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "maker": "0xMakerWalletAddress1",
+  "price": "0.62",
+  "size": 50000,
+  "status": "ACTIVE",
+  "submitted_at": "2025-08-28T12:05:00Z",
+  "updated_at": "2025-08-28T12:05:00Z"
+}
+```
+
+<ResponseField name="quote_id" type="string">
+  Unique identifier for this quote. A new `quote_id` is issued on each submission or revision.
+</ResponseField>
+
+<ResponseField name="auction_id" type="string">
+  The auction this quote belongs to.
+</ResponseField>
+
+<ResponseField name="maker" type="string">
+  Wallet address of the quoting market maker.
+</ResponseField>
+
+<ResponseField name="price" type="string">
+  The firm decimal price per contract submitted by the maker.
+</ResponseField>
+
+<ResponseField name="size" type="integer">
+  The number of contracts offered at the quoted price.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current quote state. One of `ACTIVE`, `WITHDRAWN`, or `ACCEPTED`.
+</ResponseField>
+
+<ResponseField name="submitted_at" type="string">
+  ISO 8601 timestamp of the original submission.
+</ResponseField>
+
+<ResponseField name="updated_at" type="string">
+  ISO 8601 timestamp of the most recent revision.
+</ResponseField>
+
+**Example request — revising an existing quote**
+
+Call the same endpoint with your updated price or size. The previous quote is atomically replaced.
+
+```bash
+curl -X POST \
+  https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE/quotes \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "price": "0.64",
+    "size": 50000
+  }'
+```
+
+The response returns the same shape as above with a new `quote_id`, updated `price`, and a fresh `updated_at` timestamp.
+
+---
+
+## DELETE /v1/auctions/{auctionID}/quotes
+
+Withdraw your active quote from an open auction. After withdrawal the originator can no longer see or act on your price. You can re-enter by calling `POST /v1/auctions/{auctionID}/quotes` again before the auction expires.
+
+**Path parameter**
+
+<ParamField path="auctionID" type="string" required>
+  The `auction_id` of the auction whose quote you want to withdraw.
+</ParamField>
+
+**Example request**
+
+```bash
+curl -X DELETE \
+  https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE/quotes \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response**
+
+```json
+{
+  "quote_id": "qt_01J9XMR4HK2PLWC5BDGEQT78NF",
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "status": "WITHDRAWN",
+  "withdrawn_at": "2025-08-28T12:30:00Z"
+}
+```
+
+<Warning>
+  Attempting to withdraw a quote on an auction that has already been settled or cancelled returns `HTTP 409 Conflict`. Attempting to withdraw when you have no active quote returns `HTTP 404 Not Found`.
+</Warning>
+
+---
+
+## POST /v1/auctions/{auctionID}/quotes/preflight
+
+Verify that you have sufficient capacity to quote a specific price and size on a given auction — without actually submitting the quote or reserving any capacity. Use this endpoint to catch capacity shortfalls before sending a firm commitment.
+
+**Path parameter**
+
+<ParamField path="auctionID" type="string" required>
+  The `auction_id` of the auction you want to preflight.
+</ParamField>
+
+**Request body**
+
+<ParamField body="price" type="string" required>
+  The price you plan to quote, as a decimal string (e.g., `"0.62"`).
+</ParamField>
+
+<ParamField body="size" type="integer" required>
+  The size you plan to quote.
+</ParamField>
+
+**Example request**
+
+```bash
+curl -X POST \
+  https://agora.kairos.trade/v1/auctions/auc_01J9XKQZ3B7FMPW8NVRDTH46GE/quotes/preflight \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "price": "0.62",
+    "size": 50000
+  }'
+```
+
+**Example response — eligible**
+
+```json
+{
+  "eligible": true,
+  "available_capacity": 120000
+}
+```
+
+**Example response — not eligible**
+
+```json
+{
+  "eligible": false,
+  "reason": "INSUFFICIENT_CAPACITY",
+  "available_capacity": 8000,
+  "requested": 50000
+}
+```
+
+<Tip>
+  Run the preflight immediately after receiving an invitation — before the auction fills up — so you know whether you can participate before you've committed to a price.
+</Tip>
+
+---
+
+## GET /v1/stream — WebSocket Event Stream
+
+The stream endpoint upgrades your HTTP connection to a WebSocket and pushes real-time auction events to you. All events are role-filtered: originators receive every event on their auctions; makers receive only events relevant to their invitations and quotes.
+
+<Note>
+  The stream is **authenticated**. You must send your API key in the `Authorization` header during the HTTP upgrade handshake. Unauthenticated upgrade requests are rejected with `HTTP 401`.
+</Note>
+
+### Connecting
+
+<Tabs>
+  <Tab title="JavaScript (Browser / Node)">
+    ```javascript
+    const WebSocket = require("ws"); // or use native browser WebSocket
+
+    const ws = new WebSocket("wss://agora.kairos.trade/v1/stream", {
+      headers: {
+        Authorization: `Bearer ${process.env.KAIROS_API_KEY}`,
+      },
+    });
+
+    ws.on("open", () => {
+      console.log("Agora stream connected");
+    });
+
+    ws.on("message", (data) => {
+      const event = JSON.parse(data);
+      console.log("Event received:", event.type, event);
+
+      switch (event.type) {
+        case "AUCTION_CREATED":
+          // A new auction you're invited to has opened
+          break;
+        case "QUOTE_SUBMITTED":
+          // A maker has submitted or revised a quote (originator only)
+          break;
+        case "QUOTE_WITHDRAWN":
+          // A maker has withdrawn their quote (originator only)
+          break;
+        case "AUCTION_CANCELLED":
+          // The originator has cancelled the auction
+          break;
+        case "AUCTION_SETTLED":
+          // The auction has settled
+          break;
+      }
+    });
+
+    ws.on("close", (code, reason) => {
+      console.log(`Stream closed: ${code} ${reason}`);
+      // Implement exponential backoff reconnect here
+    });
+
+    ws.on("error", (err) => {
+      console.error("Stream error:", err);
+    });
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import asyncio
+    import json
+    import os
+    import websockets
+
+    KAIROS_API_KEY = os.environ["KAIROS_API_KEY"]
+
+    async def listen_to_stream():
+        uri = "wss://agora.kairos.trade/v1/stream"
+        headers = {"Authorization": f"Bearer {KAIROS_API_KEY}"}
+
+        async with websockets.connect(uri, extra_headers=headers) as ws:
+            print("Agora stream connected")
+            async for message in ws:
+                event = json.loads(message)
+                print(f"Event: {event['type']}", event)
+
+    asyncio.run(listen_to_stream())
+    ```
+  </Tab>
+  <Tab title="curl">
+    ```bash
+    # curl can initiate a WebSocket upgrade for quick testing
+    curl --no-buffer \
+      -H "Authorization: Bearer $KAIROS_API_KEY" \
+      -H "Connection: Upgrade" \
+      -H "Upgrade: websocket" \
+      -H "Sec-WebSocket-Version: 13" \
+      -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \
+      https://agora.kairos.trade/v1/stream
+    ```
+  </Tab>
+</Tabs>
+
+### Event Payload Shape
+
+Every message from the stream is a JSON object with the following top-level fields:
+
+```json
+{
+  "event_id": "evt_01J9XNQ5GH3TMWZ8BKRDHE89PL",
+  "type": "QUOTE_SUBMITTED",
+  "auction_id": "auc_01J9XKQZ3B7FMPW8NVRDTH46GE",
+  "occurred_at": "2025-08-28T12:05:00Z",
+  "payload": {
+    "quote_id": "qt_01J9XMR4HK2PLWC5BDGEQT78NF",
+    "maker": "0xMakerWalletAddress1",
+    "price": "0.62",
+    "size": 50000
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event_id` | `string` | Unique, monotonically increasing event identifier. Use this to deduplicate after a reconnect. |
+| `type` | `string` | Event type (see table below). |
+| `auction_id` | `string` | The auction this event belongs to. |
+| `occurred_at` | `string` | ISO 8601 UTC timestamp. |
+| `payload` | `object` | Type-specific data — see individual event types. |
+
+### Event Types
+
+| Type | Visible To | Description |
+|------|-----------|-------------|
+| `AUCTION_CREATED` | Invited makers | A new auction you are invited to has opened. |
+| `QUOTE_SUBMITTED` | Originator | An invited maker submitted or revised a quote. |
+| `QUOTE_WITHDRAWN` | Originator | An invited maker withdrew their quote. |
+| `AUCTION_CANCELLED` | All participants | The originator cancelled the auction. |
+| `AUCTION_SETTLED` | All participants | The auction has been settled. |
+| `INVITATION_SENT` | Invited maker | You have been invited to a new auction (mirrors the inbox). |
+
+### Reconnection and Deduplication
+
+The stream does not replay missed events automatically. After a reconnect, call `GET /v1/auctions/{auctionID}/events` to fetch the full audit timeline and then re-subscribe to the stream. Use the `event_id` field to detect and discard any duplicate events that arrive in the window between your REST catch-up and the stream resuming.
+
+```javascript
+let lastEventId = null;
+
+ws.on("message", (data) => {
+  const event = JSON.parse(data);
+
+  // Skip events we've already processed
+  if (lastEventId && event.event_id <= lastEventId) return;
+  lastEventId = event.event_id;
+
+  handleEvent(event);
+});
+```
+
+<Tip>
+  Persist `lastEventId` to durable storage (a database, Redis, etc.) so that your deduplication logic survives process restarts as well as connection drops.
+</Tip>

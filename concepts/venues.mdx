@@ -1,0 +1,177 @@
+---
+title: "Trading Venues on Kairos: Polymarket, Kalshi, and More"
+sidebarTitle: "Venues"
+description: "Kairos connects to Polymarket, Kalshi, Predict.fun, Opinion, and Hyperliquid. Compare collateral types and how to list available venues via the API."
+---
+
+A **venue** (also called a **provider**) is an exchange that Kairos connects to on your behalf. Instead of managing separate accounts, API keys, and wallets for each exchange, you authenticate once with Kairos and route orders to any supported venue through a single unified API. Each venue has its own collateral type, order model, and onboarding flow.
+
+## Supported Venues
+
+| Venue | `provider_id` | Type | Collateral | Model |
+|---|---|---|---|---|
+| Polymarket | `polymarket` | Prediction | pUSD (USDC-backed) | On-chain CLOB |
+| Kalshi | `kalshi` | Prediction | USD | Off-chain regulated |
+| Predict.fun | `predictfun` | Prediction | USDC | On-chain CLOB |
+| Opinion | `opinion` | Prediction | USDT | On-chain |
+| Hyperliquid | `hyperliquid` | Perpetuals | USDC | On-chain perps DEX |
+
+<Note>
+`provider_id` and `exchange_id` refer to the same concept — the venue identifier. The Data API uses `provider_id` and the Execution API uses `exchange_id`. Both accept the same lowercase string values shown above.
+</Note>
+
+## Venue Profiles
+
+<Accordion title="Polymarket">
+Polymarket is an on-chain prediction market built on Polygon. It uses a Central Limit Order Book (CLOB) operated by a permissioned operator, with outcome tokens settled via the Conditional Token Framework (CTF) smart contracts.
+
+**Collateral:** pUSD — a 1:1 USDC-backed token minted by Polymarket's contracts.
+
+**Settlement:** On-chain. Winning tokens redeem to 1 USDC per share. Losing tokens expire worthless.
+
+**Wallet model:** Kairos supports both hosted wallets and self-custody via EIP-712 signed orders. For self-custody, Polymarket uses a **Safe-based deposit wallet** that separates your signing EOA from the vault holding funds.
+
+**Onboarding:** Call `POST /exchanges/polymarket/enable-trading` to provision CLOB credentials and set on-chain approvals in one step.
+</Accordion>
+
+<Accordion title="Kalshi">
+Kalshi is a CFTC-regulated prediction market exchange operating in the United States. It runs a traditional centralized order book settled in USD.
+
+**Collateral:** USD. Funds are held off-chain in your Kalshi account.
+
+**Settlement:** Off-chain. Winning positions are credited to your USD balance.
+
+**Wallet model:** Credential-based. You connect your existing Kalshi account by passing your Kalshi API key to Kairos. No on-chain interaction required.
+
+**Onboarding:** Call `POST /exchanges/kalshi/enable-trading` to link your Kalshi credentials. Kairos stores them securely and uses them to route orders on your behalf.
+</Accordion>
+
+<Accordion title="Predict.fun">
+Predict.fun is a blockchain-based prediction market that runs an on-chain CLOB similar to Polymarket's architecture.
+
+**Collateral:** USDC (native on the settlement chain).
+
+**Settlement:** On-chain.
+
+**Onboarding:** Call `POST /exchanges/predictfun/enable-trading` to set the required on-chain approvals. Inspect your account profile at any time with `GET /exchanges/predictfun/account`.
+</Accordion>
+
+<Accordion title="Opinion">
+Opinion is an on-chain prediction market venue that uses USDT as its collateral token.
+
+**Collateral:** USDT.
+
+**Settlement:** On-chain.
+
+**Onboarding:** Call `POST /exchanges/opinion/enable-trading` to provision credentials and set the USDT allowance.
+</Accordion>
+
+<Accordion title="Hyperliquid">
+Hyperliquid is a high-performance on-chain perpetuals DEX. Unlike the prediction market venues above, Hyperliquid exposes futures and perpetual instruments rather than binary outcome contracts.
+
+**Collateral:** USDC (deposited to Hyperliquid's L1).
+
+**Settlement:** On-chain perps with funding rates.
+
+**Special operations:** Hyperliquid requires typed EIP-712 data for withdrawals and spot↔perp transfers — both are two-step flows (prepare then submit) available under `/exchanges/hyperliquid/`.
+</Accordion>
+
+## Listing Venues Programmatically
+
+### Execution API — registered exchanges
+
+Use `GET /exchanges` to list every venue registered in the Kairos deployment you're connected to:
+
+```bash
+curl https://execution.kairos.trade/exchanges \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```json
+{
+  "exchanges": [
+    { "exchange_id": "polymarket", "display_name": "Polymarket", "enabled": true },
+    { "exchange_id": "kalshi",     "display_name": "Kalshi",     "enabled": true },
+    { "exchange_id": "predictfun", "display_name": "Predict.fun","enabled": true },
+    { "exchange_id": "opinion",    "display_name": "Opinion",    "enabled": true },
+    { "exchange_id": "hyperliquid","display_name": "Hyperliquid","enabled": true }
+  ]
+}
+```
+
+### Data API — provider configurations
+
+Use `GET /providers/configs` to fetch each provider's full configuration object, including supported features and metadata. This endpoint is free and requires no API key:
+
+```bash
+curl https://data.kairos.trade/providers/configs
+```
+
+```json
+{
+  "providers": [
+    {
+      "provider_id": "polymarket",
+      "display_name": "Polymarket",
+      "collateral": "pUSD",
+      "chain": "polygon",
+      "supports_limit_orders": true,
+      "supports_market_orders": false
+    }
+  ]
+}
+```
+
+Fetch a single provider's config by ID with `GET /providers/configs/{provider_id}`:
+
+```bash
+curl https://data.kairos.trade/providers/configs/kalshi
+```
+
+### Checking your API access
+
+`GET /providers/api-access` returns only the providers available to your specific API key — useful for confirming which venues you've onboarded to:
+
+```bash
+curl https://data.kairos.trade/providers/api-access \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+## Venue Capabilities
+
+Every venue exposes a capabilities object that describes what operations it supports. Fetch it with `GET /exchanges/{exchange_id}/capabilities`:
+
+```bash
+curl https://execution.kairos.trade/exchanges/polymarket/capabilities \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+Capabilities include flags such as:
+
+- `supports_limit_orders` — whether the venue accepts limit orders
+- `supports_market_orders` — whether market orders are available
+- `supports_self_custody` — whether EIP-712 self-custody flow is supported
+- `requires_allowance` — whether on-chain token approvals are needed before trading
+- `supports_combo` — whether parlay/combo orders are available
+
+<Tip>
+Always check capabilities before building order-submission logic for a new venue. Sending a market order to a venue that only supports limit orders returns a `400` error.
+</Tip>
+
+## Perpetual Venues
+
+For perpetuals specifically, use the Data API's dedicated perpetuals endpoints — these are free and require no authentication:
+
+```bash
+# List perpetual venues and their capabilities
+curl https://data.kairos.trade/perpetuals/venues
+
+# Discover available perpetual instruments
+curl https://data.kairos.trade/perpetuals/instruments
+```
+
+The Market Data API also provides live snapshots for perpetual instruments:
+
+```bash
+curl "https://md.kairos.trade/v1/perpetuals/hyperliquid/BTC-PERP/snapshot"
+```

@@ -1,0 +1,422 @@
+---
+title: "Binary Protobuf Encoding for Kairos WebSocket Streams"
+sidebarTitle: "Protobuf"
+description: "The Kairos market data WebSocket supports binary protobuf encoding for lower latency and bandwidth. Learn how to decode messages using the proto schema."
+---
+
+The Kairos market data WebSocket supports Protocol Buffers (protobuf) as an alternative to JSON encoding. When you enable protobuf, the server sends binary WebSocket frames instead of UTF-8 text frames. Each frame is smaller and faster to deserialize than its JSON equivalent — a meaningful advantage for high-frequency strategies, market-making systems, or any application subscribing to many markets simultaneously.
+
+## Why Use Protobuf?
+
+| | JSON | Protobuf |
+|---|---|---|
+| **Encoding** | UTF-8 text | Binary (field tags + varints) |
+| **Typical message size** | 300–800 bytes per orderbook delta | 80–200 bytes per orderbook delta |
+| **Parse time** | Slower (string scanning) | Faster (direct memory layout) |
+| **Schema required** | No | Yes — `.proto` definition needed |
+| **Human readable** | Yes | No (requires decode step) |
+| **Use when** | Prototyping, low volume | Production, high-throughput, latency-sensitive |
+
+The bandwidth reduction is roughly 60–75% for orderbook deltas and trade messages. For a system subscribing to 100 active markets, switching from JSON to protobuf can reduce inbound throughput from ~50 Mbps to ~12 Mbps.
+
+## Enabling Protobuf Encoding
+
+Set `"encoding": "protobuf"` in your subscribe message. The server acknowledges the encoding change and switches all subsequent frames for those subscriptions to binary:
+
+```json
+{
+  "action": "subscribe",
+  "channels": ["orderbook", "trades", "price_tick"],
+  "markets": ["polymarket:0x1234567890abcdef1234567890abcdef12345678"],
+  "encoding": "protobuf"
+}
+```
+
+The acknowledgement is still sent as JSON text:
+
+```json
+{
+  "type": "subscribed",
+  "channels": ["orderbook", "trades", "price_tick"],
+  "encoding": "protobuf"
+}
+```
+
+All subsequent push messages for those channels arrive as binary WebSocket frames that you decode with the Kairos proto schema.
+
+<Note>
+  You can mix encodings within a single connection. Subscribe to some channels with `"encoding": "json"` and others with `"encoding": "protobuf"`. The server tags each binary frame with the message type in the wrapper so you always know what to decode.
+</Note>
+
+<Warning>
+  Binary frames must be decoded with the protobuf schema. Passing a binary frame to `JSON.parse()` or `json.loads()` will produce garbage or an error — always check whether an incoming frame is text or binary before dispatching it to a decoder.
+</Warning>
+
+## Message Wrapper Structure
+
+Every binary frame is a serialized `KairosMessage` wrapper. Decode this first to get the message type and the nested payload:
+
+```proto
+syntax = "proto3";
+package kairos.md.v1;
+
+message KairosMessage {
+  MessageType type        = 1;
+  string      market_id   = 2;
+  int64       timestamp_ms = 3;  // Unix milliseconds
+  uint64      sequence     = 4;  // Monotonic sequence per market
+
+  oneof payload {
+    OrderbookSnapshot orderbook_snapshot = 10;
+    OrderbookDelta    orderbook_delta    = 11;
+    Trade             trade              = 12;
+    PriceTick         price_tick         = 13;
+  }
+}
+
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED        = 0;
+  MESSAGE_TYPE_ORDERBOOK_SNAPSHOT = 1;
+  MESSAGE_TYPE_ORDERBOOK_DELTA    = 2;
+  MESSAGE_TYPE_TRADE              = 3;
+  MESSAGE_TYPE_PRICE_TICK         = 4;
+}
+```
+
+The `type` field tells you which `oneof` branch is populated without needing to try all decoders.
+
+## Key Message Types
+
+### `OrderbookSnapshot`
+
+Sent once when you first subscribe (or after a gap recovery). Contains the full book for one outcome or both sides depending on the market type.
+
+```proto
+message PriceLevel {
+  string price = 1;  // Decimal string, e.g. "0.62"
+  string size  = 2;  // Decimal string, e.g. "150.00"
+}
+
+message OutcomeBook {
+  repeated PriceLevel bids = 1;
+  repeated PriceLevel asks = 2;
+}
+
+message OrderbookSnapshot {
+  map<string, OutcomeBook> outcomes = 1;
+  // Keys are outcome names, e.g. "yes", "no", or "trump", "harris"
+}
+```
+
+### `OrderbookDelta`
+
+Sent for every incremental change to the book. A `size` of `"0.00"` means the level was removed.
+
+```proto
+message BookChange {
+  string outcome = 1;  // e.g. "yes"
+  string side    = 2;  // "bid" or "ask"
+  string price   = 3;
+  string size    = 4;  // "0.00" = remove this level
+}
+
+message OrderbookDelta {
+  repeated BookChange changes = 1;
+}
+```
+
+### `Trade`
+
+Emitted for every confirmed fill.
+
+```proto
+message Trade {
+  string trade_id   = 1;
+  string outcome    = 2;  // e.g. "yes"
+  string price      = 3;
+  string size       = 4;
+  string taker_side = 5;  // "buy" or "sell"
+}
+```
+
+### `PriceTick`
+
+Lightweight best-bid/ask update, emitted whenever the top of book changes.
+
+```proto
+message PriceTick {
+  map<string, string> best_bid   = 1;  // outcome -> price
+  map<string, string> best_ask   = 2;  // outcome -> price
+  map<string, string> last_trade = 3;  // outcome -> last trade price
+}
+```
+
+## Getting the Schema Files
+
+The canonical proto definitions are embedded in the OpenAPI specs published at:
+
+| File | URL |
+|---|---|
+| `market-data-api.yaml` | [https://app.kairos.trade/openapi/market-data-api.yaml](https://app.kairos.trade/openapi/market-data-api.yaml) |
+| `agora.yaml` | [https://app.kairos.trade/openapi/agora.yaml](https://app.kairos.trade/openapi/agora.yaml) |
+| `data-api.yaml` | [https://app.kairos.trade/openapi/data-api.yaml](https://app.kairos.trade/openapi/data-api.yaml) |
+| `execution.yaml` | [https://app.kairos.trade/openapi/execution.yaml](https://app.kairos.trade/openapi/execution.yaml) |
+| `kairos.json` | [https://app.kairos.trade/openapi/kairos.json](https://app.kairos.trade/openapi/kairos.json) |
+
+The combined `kairos.json` spec includes the WebSocket binary schema extensions. If you are generating client code, point your protobuf compiler at `market-data-api.yaml` which contains the WebSocket-specific message definitions.
+
+<Tip>
+  You can also use the schema inline. The proto definitions shown on this page accurately reflect the current wire format — copy them into a `kairos_md.proto` file and compile directly.
+</Tip>
+
+## Decoding in Python
+
+Install the `protobuf` package:
+
+```bash
+pip install protobuf websockets
+```
+
+Compile the proto schema to Python:
+
+```bash
+protoc --python_out=. kairos_md.proto
+```
+
+Then decode binary frames in your WebSocket handler:
+
+```python
+import asyncio
+import json
+import websockets
+from kairos_md_pb2 import KairosMessage, MessageType
+
+WS_URL = "wss://md.kairos.trade/v1/ws"
+MARKETS = ["polymarket:0x1234567890abcdef1234567890abcdef12345678"]
+
+
+async def main() -> None:
+    async with websockets.connect(WS_URL) as ws:
+        # Subscribe with protobuf encoding
+        await ws.send(json.dumps({
+            "action": "subscribe",
+            "channels": ["orderbook", "trades", "price_tick"],
+            "markets": MARKETS,
+            "encoding": "protobuf",
+        }))
+
+        async for frame in ws:
+            # Text frames are control messages (subscribed, error, pong)
+            if isinstance(frame, str):
+                msg = json.loads(frame)
+                print("Control:", msg)
+                continue
+
+            # Binary frames are protobuf-encoded KairosMessage payloads
+            envelope = KairosMessage()
+            envelope.ParseFromString(frame)
+
+            if envelope.type == MessageType.MESSAGE_TYPE_ORDERBOOK_SNAPSHOT:
+                snap = envelope.orderbook_snapshot
+                for outcome, book in snap.outcomes.items():
+                    best_bid = book.bids[0].price if book.bids else "—"
+                    best_ask = book.asks[0].price if book.asks else "—"
+                    print(
+                        f"Snapshot [{outcome}] {envelope.market_id}: "
+                        f"bid={best_bid} ask={best_ask}"
+                    )
+
+            elif envelope.type == MessageType.MESSAGE_TYPE_ORDERBOOK_DELTA:
+                delta = envelope.orderbook_delta
+                print(
+                    f"Delta {envelope.market_id} seq={envelope.sequence}: "
+                    f"{len(delta.changes)} change(s)"
+                )
+
+            elif envelope.type == MessageType.MESSAGE_TYPE_TRADE:
+                t = envelope.trade
+                print(
+                    f"Trade {envelope.market_id}: "
+                    f"{t.size} @ {t.price} ({t.outcome} {t.taker_side})"
+                )
+
+            elif envelope.type == MessageType.MESSAGE_TYPE_PRICE_TICK:
+                tick = envelope.price_tick
+                yes_bid = tick.best_bid.get("yes", "—")
+                yes_ask = tick.best_ask.get("yes", "—")
+                print(f"Tick {envelope.market_id}: bid={yes_bid} ask={yes_ask}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Decoding in JavaScript
+
+Install `protobufjs` and the `ws` package for Node.js:
+
+```bash
+npm install protobufjs ws
+```
+
+Load the schema from a `.proto` file and decode frames:
+
+```javascript
+import { readFileSync } from "fs";
+import WebSocket from "ws";
+import protobuf from "protobufjs";
+
+const WS_URL = "wss://md.kairos.trade/v1/ws";
+const MARKETS = ["polymarket:0x1234567890abcdef1234567890abcdef12345678"];
+
+async function main() {
+  // Load and parse the proto schema
+  const root = await protobuf.load("kairos_md.proto");
+  const KairosMessage = root.lookupType("kairos.md.v1.KairosMessage");
+  const MessageType = root.lookupEnum("kairos.md.v1.MessageType").values;
+
+  const ws = new WebSocket(WS_URL);
+
+  ws.on("open", () => {
+    console.log("Connected");
+    ws.send(
+      JSON.stringify({
+        action: "subscribe",
+        channels: ["orderbook", "trades", "price_tick"],
+        markets: MARKETS,
+        encoding: "protobuf",
+      })
+    );
+  });
+
+  ws.on("message", (data, isBinary) => {
+    // Text frames are control messages (JSON)
+    if (!isBinary) {
+      const msg = JSON.parse(data.toString());
+      console.log("Control:", msg);
+      return;
+    }
+
+    // Binary frames: decode as KairosMessage
+    const envelope = KairosMessage.decode(new Uint8Array(data));
+
+    switch (envelope.type) {
+      case MessageType.MESSAGE_TYPE_ORDERBOOK_SNAPSHOT: {
+        const snap = envelope.orderbookSnapshot;
+        for (const [outcome, book] of Object.entries(snap.outcomes)) {
+          const bestBid = book.bids[0]?.price ?? "—";
+          const bestAsk = book.asks[0]?.price ?? "—";
+          console.log(
+            `Snapshot [${outcome}] ${envelope.marketId}: bid=${bestBid} ask=${bestAsk}`
+          );
+        }
+        break;
+      }
+
+      case MessageType.MESSAGE_TYPE_ORDERBOOK_DELTA: {
+        const delta = envelope.orderbookDelta;
+        console.log(
+          `Delta ${envelope.marketId} seq=${envelope.sequence}: ${delta.changes.length} change(s)`
+        );
+        break;
+      }
+
+      case MessageType.MESSAGE_TYPE_TRADE: {
+        const t = envelope.trade;
+        console.log(
+          `Trade ${envelope.marketId}: ${t.size} @ ${t.price} (${t.outcome} ${t.takerSide})`
+        );
+        break;
+      }
+
+      case MessageType.MESSAGE_TYPE_PRICE_TICK: {
+        const tick = envelope.priceTick;
+        const yesBid = tick.bestBid["yes"] ?? "—";
+        const yesAsk = tick.bestAsk["yes"] ?? "—";
+        console.log(`Tick ${envelope.marketId}: bid=${yesBid} ask=${yesAsk}`);
+        break;
+      }
+
+      default:
+        console.log("Unknown message type:", envelope.type);
+    }
+  });
+
+  ws.on("close", (code, reason) => {
+    console.warn(`Closed: ${code} ${reason}`);
+  });
+}
+
+main().catch(console.error);
+```
+
+## Handling Binary Frames Across Languages
+
+<Accordion title="Go">
+  Use the official `google.golang.org/protobuf` module. Run `protoc --go_out=. kairos_md.proto` to generate Go structs. In your WebSocket handler, check the frame type: `websocket.BinaryMessage` frames are protobuf, `websocket.TextMessage` frames are JSON control messages.
+
+  ```go
+  _, data, err := conn.ReadMessage()
+  if err != nil { /* handle */ }
+
+  var envelope mdv1.KairosMessage
+  if err := proto.Unmarshal(data, &envelope); err != nil { /* handle */ }
+  ```
+</Accordion>
+
+<Accordion title="Rust">
+  Use the `prost` crate for code generation and the `tokio-tungstenite` crate for WebSocket. Binary frames arrive as `Message::Binary(bytes)` — pass the bytes to `KairosMessage::decode(&bytes[..])`.
+</Accordion>
+
+<Accordion title="C++">
+  Generate code with `protoc --cpp_out=.`. In your WebSocket callback, check the `opcode` on the incoming frame. Binary frames (opcode `0x2`) are protobuf payloads; text frames (opcode `0x1`) are JSON control messages.
+</Accordion>
+
+<Accordion title="Browser (TypeScript)">
+  Browser WebSocket `MessageEvent.data` is a `Blob` when the frame is binary. Set `ws.binaryType = "arraybuffer"` before connecting to receive an `ArrayBuffer` directly. Wrap it in `Uint8Array` and pass to `KairosMessage.decode(...)` from `protobufjs`.
+
+  ```typescript
+  ws.binaryType = "arraybuffer";
+
+  ws.addEventListener("message", (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      const envelope = KairosMessage.decode(new Uint8Array(event.data));
+      // handle envelope...
+    } else {
+      const msg = JSON.parse(event.data as string);
+      // handle control message...
+    }
+  });
+  ```
+</Accordion>
+
+## Tips for Production Use
+
+<Tip>
+  **Always check the `sequence` field.** If you receive a delta with a sequence number that is not `previous_sequence + 1`, you have a gap. Discard your local book, resubscribe to the `orderbook` channel, and wait for the next full snapshot before applying further deltas.
+</Tip>
+
+<Tip>
+  **Cache your compiled descriptor.** Compiling a proto schema is a one-time startup cost. Store the compiled `Root` (protobufjs) or descriptor pool (Python) at the module level so it is not recompiled on every message.
+</Tip>
+
+<Tip>
+  **Pre-allocate decode buffers.** In low-level languages (C++, Rust, Go), reuse a decode buffer across messages to avoid heap allocations on the hot path.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Market Data WebSocket" icon="chart-line" href="/websocket/market-data">
+    Review available channels, subscription format, and reconnect strategy.
+  </Card>
+  <Card title="WebSocket Overview" icon="tower-broadcast" href="/websocket/overview">
+    Compare the market data stream with the Agora event stream.
+  </Card>
+  <Card title="Market Data REST API" icon="book" href="/api/market-data/overview">
+    Use REST for historical candles, batch price fetches, and market metadata.
+  </Card>
+  <Card title="OpenAPI Specs" icon="file-code" href="https://app.kairos.trade/openapi/market-data-api.yaml">
+    Download the machine-readable spec to generate your own client.
+  </Card>
+</CardGroup>

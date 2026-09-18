@@ -1,0 +1,156 @@
+---
+title: "Prediction Markets in Kairos: Outcomes and Contracts"
+sidebarTitle: "Markets"
+description: "Learn how Kairos structures prediction markets: the hierarchy of markets, outcomes, contracts, canonical IDs, and lifecycle states across venues."
+---
+
+Kairos organizes every tradeable question into a three-level hierarchy: a **market** poses a question, **outcomes** enumerate the possible answers, and **contracts** are the on-chain or off-chain tokens you actually buy and sell. Understanding this structure helps you query the right endpoints and interpret the data you receive.
+
+## Markets, Outcomes, and Contracts
+
+A **market** is a question with a defined resolution rule — for example, "Will the Fed cut rates in Q3?" Every market belongs to exactly one venue (Polymarket, Kalshi, Predict.fun, etc.) and has a lifecycle that ends when the question resolves.
+
+An **outcome** is one possible answer to that question. Binary markets have two outcomes (`YES` and `NO`). Multi-outcome markets have three or more (e.g., `DEM`, `REP`, `IND` for a party-share market).
+
+A **contract** is the tradeable instrument tied to one outcome. It has its own order book, price feed, and OHLCV candle series. Contracts are what you reference when placing orders or fetching candles.
+
+| Level | What it represents | Example |
+|---|---|---|
+| **Market** | The question + resolution rules | "Fed rate cut in Q3?" |
+| **Outcome** | One possible answer | `YES`, `NO` |
+| **Contract** | The tradeable token for that outcome | `0xabc…` (Polymarket token ID) |
+
+<Note>
+On Polymarket, contracts map to ERC-1155 CTF outcome tokens. On Kalshi, contracts map to ticker-based series. Kairos normalizes both into the same structure so your code works across venues.
+</Note>
+
+## Canonical IDs and Cross-Venue Normalization
+
+Each venue uses its own identifier scheme. Polymarket uses hex token addresses; Kalshi uses human-readable tickers like `KXBTCD-25JUN-T60000`. Kairos assigns a **canonical market ID** to every contract so you can reference markets consistently regardless of venue.
+
+Use `POST /v1/market-identifiers/resolve` on the Market Data API to translate any venue-native ID into a canonical Kairos ID:
+
+```bash
+curl -X POST https://md.kairos.trade/v1/market-identifiers/resolve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "polymarket",
+    "identifiers": ["0xabc123..."]
+  }'
+```
+
+```json
+{
+  "resolved": [
+    {
+      "input": "0xabc123...",
+      "canonical_id": "kairos:pm:0xabc123...",
+      "market_id": "0xdef456...",
+      "provider": "polymarket"
+    }
+  ]
+}
+```
+
+## Market Metadata Fields
+
+Every market exposes a standard set of metadata fields. Fetch them with `GET /markets/metadata` on the Data API or `GET /v1/markets/{provider}/{market_id}` on the Market Data API:
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Human-readable market title |
+| `category` | string | Top-level topic (e.g., `politics`, `crypto`, `sports`) |
+| `status` | enum | `active`, `paused`, `resolved`, `cancelled` |
+| `rules` | string | Plain-language resolution rules |
+| `contract_spec` | object | Outcome definitions, collateral type, min/max price |
+| `image_url` | string | Market thumbnail image |
+| `end_date` | ISO 8601 | Scheduled resolution timestamp |
+| `provider_id` | string | Which venue hosts this market |
+
+## Market Lifecycle
+
+Markets move through a predictable set of states from creation to settlement:
+
+<Steps>
+  <Step title="Active">
+    The market is open for trading. The order book accepts new orders, and prices move with supply and demand.
+  </Step>
+  <Step title="Paused">
+    Trading is temporarily suspended. This can happen before a major event, during a venue incident, or while the resolution source is being verified.
+  </Step>
+  <Step title="Resolved">
+    The outcome is final. Winning contract holders can redeem their tokens for the full $1.00 payout. Losing contracts expire worthless.
+  </Step>
+  <Step title="Cancelled">
+    The market was voided before resolution — for example, the underlying event never occurred. Kairos routes redemption calls accordingly.
+  </Step>
+</Steps>
+
+## Tick Size and Price Grid
+
+Prediction market contracts trade between $0.00 and $1.00, representing implied probability. Not every price is valid — each market defines a **tick size** that constrains the price grid. A tick size of `0.01` means prices must be multiples of one cent (0.01, 0.02, … 0.99).
+
+Fetch the current tick grid for any contract with the Data API:
+
+```bash
+curl "https://data.kairos.trade/markets/tick-size?provider=polymarket&contract_id=0xabc123..." \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+```json
+{
+  "tick_size": 0.01,
+  "min_price": 0.01,
+  "max_price": 0.99
+}
+```
+
+<Tip>
+Always fetch tick size before submitting a limit order. Orders at off-grid prices are rejected by the venue.
+</Tip>
+
+## Market Categories
+
+Kairos surfaces markets in several broad categories, each with its own subcategory taxonomy:
+
+<CardGroup cols={2}>
+  <Card title="Politics" icon="landmark">
+    Elections, legislation, government appointments, and geopolitical events across global jurisdictions.
+  </Card>
+  <Card title="Crypto" icon="bitcoin">
+    Price prediction markets for BTC, ETH, SOL, and other assets — including up-or-down markets at 5m, 15m, and 1h intervals.
+  </Card>
+  <Card title="Sports" icon="trophy">
+    Game winners, totals, and futures across NFL, NBA, MLB, NHL, soccer, esports, and more — matched across Polymarket and Kalshi.
+  </Card>
+  <Card title="Finance" icon="chart-line">
+    Equities, forex, commodities, and macro indicators including Fed rate decisions and economic data releases.
+  </Card>
+</CardGroup>
+
+## Crypto Prediction Markets
+
+Kairos provides a dedicated endpoint for short-horizon crypto up-or-down prediction markets. These markets ask whether an asset's price will be higher or lower than a reference level at a specific future timestamp.
+
+```bash
+curl "https://data.kairos.trade/markets/crypto?asset=BTC&window=1h" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+Use `GET /markets/crypto/ptb` to fetch the current **Price-to-Beat** (PTB) value — the strike price an asset must exceed for the UP contract to resolve YES.
+
+## Sports Markets
+
+Sports markets are matched across Polymarket and Kalshi, giving you a unified view of the same game across both venues. Use `GET /sports/live-events` to find active games with cross-provider prices, and `GET /sports/game-markets` to browse all market families (spreads, totals, moneylines) for a specific game.
+
+## Key Endpoints Reference
+
+| Goal | API | Endpoint |
+|---|---|---|
+| List active markets for a venue | Market Data | `GET /v1/markets` |
+| Fetch market details | Data | `POST /markets/details` |
+| Get full metadata + rules | Data | `GET /markets/metadata` |
+| Batch metadata for many contracts | Data | `POST /markets/metadata/batch` |
+| Get all outcomes for a market | Data | `GET /markets/outcomes` |
+| Resolve a venue URL to a canonical ID | Market Data | `POST /v1/market-identifiers/resolve` |
+| Get tick size / price grid | Data | `GET /markets/tick-size` |

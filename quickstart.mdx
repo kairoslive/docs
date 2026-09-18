@@ -1,0 +1,287 @@
+---
+title: "Kairos Quickstart: Live Markets and Your First Order"
+sidebarTitle: "Quickstart"
+description: "Make your first Kairos API call in under 5 minutes. The Market Data API requires no signup — fetch live prediction market data immediately."
+---
+
+Kairos gives you two tiers of access: a completely free, unauthenticated Market Data API you can call right now, and authenticated Data and Execution APIs that unlock trading, analytics, and auctions. This guide walks you through both — from your first unauthenticated request all the way to placing your first order.
+
+<Steps>
+  <Step title="Fetch live markets — no signup needed">
+    The Market Data API (`md.kairos.trade`) requires no API key. Call it directly from your terminal, browser, or code. The example below fetches the five most recent active Polymarket markets.
+
+    <Tabs>
+      <Tab title="curl">
+        ```bash
+        curl "https://md.kairos.trade/v1/markets?provider=polymarket&limit=5"
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        import requests
+
+        response = requests.get(
+            "https://md.kairos.trade/v1/markets",
+            params={"provider": "polymarket", "limit": 5},
+        )
+        response.raise_for_status()
+        markets = response.json()
+        print(markets)
+        ```
+      </Tab>
+      <Tab title="JavaScript">
+        ```javascript
+        const response = await fetch(
+          "https://md.kairos.trade/v1/markets?provider=polymarket&limit=5"
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const markets = await response.json();
+        console.log(markets);
+        ```
+      </Tab>
+    </Tabs>
+
+    You should receive a paginated list of active markets that looks like this:
+
+    ```json
+    {
+      "markets": [
+        {
+          "id": "0x1234abcd...",
+          "provider": "polymarket",
+          "question": "Will the Fed cut rates in September?",
+          "status": "active",
+          "outcomes": ["Yes", "No"],
+          "prices": { "Yes": 0.62, "No": 0.38 },
+          "volume24h": 142500.00,
+          "endDate": "2025-09-30T23:59:59Z"
+        }
+      ],
+      "nextCursor": "eyJpZCI6Ij...",
+      "total": 1240
+    }
+    ```
+
+    <Tip>
+      Pass `provider=kalshi` or `provider=predictfun` to switch venues. Use the `nextCursor` value as the `cursor` query parameter to page through results.
+    </Tip>
+  </Step>
+
+  <Step title="Get your API key">
+    The Data API and Execution API require authentication. To get a key:
+
+    1. Go to [app.kairos.trade](https://app.kairos.trade) and create a free account.
+    2. Navigate to **Settings → API Keys**.
+    3. Click **Create API Key**, give it a name, and select the scopes you need.
+    4. Copy the key immediately — it is only shown once.
+
+    <Warning>
+      Store your API key in an environment variable or secrets manager. Never hardcode it in source files or commit it to version control.
+    </Warning>
+
+    For all authenticated requests, pass the key in the `Authorization` header:
+
+    ```
+    Authorization: Bearer <your-api-key>
+    ```
+  </Step>
+
+  <Step title="Make an authenticated Data API call">
+    With your API key in hand, verify access by listing the provider configurations available to your key. This is a lightweight, read-only call that confirms your credentials are working.
+
+    <Tabs>
+      <Tab title="curl">
+        ```bash
+        curl "https://data.kairos.trade/providers/configs" \
+          -H "Authorization: Bearer $KAIROS_API_KEY"
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        import os
+        import requests
+
+        api_key = os.environ["KAIROS_API_KEY"]
+
+        response = requests.get(
+            "https://data.kairos.trade/providers/configs",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        response.raise_for_status()
+        configs = response.json()
+        print(configs)
+        ```
+      </Tab>
+      <Tab title="JavaScript">
+        ```javascript
+        const apiKey = process.env.KAIROS_API_KEY;
+
+        const response = await fetch("https://data.kairos.trade/providers/configs", {
+          headers: { Authorization: `Bearer ${apiKey}` },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const configs = await response.json();
+        console.log(configs);
+        ```
+      </Tab>
+    </Tabs>
+
+    A successful response lists the venues your key can reach:
+
+    ```json
+    {
+      "providers": [
+        {
+          "id": "polymarket",
+          "displayName": "Polymarket",
+          "status": "active",
+          "supportedOrderTypes": ["limit", "market", "gtc", "fok"],
+          "collateral": "USDC"
+        },
+        {
+          "id": "kalshi",
+          "displayName": "Kalshi",
+          "status": "active",
+          "supportedOrderTypes": ["limit", "market"],
+          "collateral": "USD"
+        }
+      ]
+    }
+    ```
+  </Step>
+
+  <Step title="Submit your first order">
+    Before you can trade, you need to enable trading on at least one venue. This is a one-time onboarding step that provisions your credentials and sets on-chain approvals.
+
+    <Tabs>
+      <Tab title="curl">
+        ```bash
+        # Step 1: Enable trading on Polymarket (one-time setup)
+        curl -X POST "https://execution.kairos.trade/exchanges/polymarket/enable-trading" \
+          -H "Authorization: Bearer $KAIROS_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{}'
+
+        # Step 2: Submit a limit order
+        curl -X POST "https://execution.kairos.trade/orders" \
+          -H "Authorization: Bearer $KAIROS_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "provider": "polymarket",
+            "marketId": "0x1234abcd...",
+            "outcome": "Yes",
+            "side": "buy",
+            "type": "limit",
+            "price": 0.60,
+            "size": 10.00
+          }'
+        ```
+      </Tab>
+      <Tab title="Python">
+        ```python
+        import os
+        import requests
+
+        api_key = os.environ["KAIROS_API_KEY"]
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        base = "https://execution.kairos.trade"
+
+        # Step 1: Enable trading on Polymarket (one-time)
+        requests.post(f"{base}/exchanges/polymarket/enable-trading",
+                      headers=headers, json={}).raise_for_status()
+
+        # Step 2: Submit a limit order
+        order = {
+            "provider": "polymarket",
+            "marketId": "0x1234abcd...",
+            "outcome": "Yes",
+            "side": "buy",
+            "type": "limit",
+            "price": 0.60,
+            "size": 10.00,
+        }
+        response = requests.post(f"{base}/orders", headers=headers, json=order)
+        response.raise_for_status()
+        print(response.json())
+        ```
+      </Tab>
+      <Tab title="JavaScript">
+        ```javascript
+        const apiKey = process.env.KAIROS_API_KEY;
+        const headers = {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        };
+        const base = "https://execution.kairos.trade";
+
+        // Step 1: Enable trading on Polymarket (one-time)
+        await fetch(`${base}/exchanges/polymarket/enable-trading`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({}),
+        });
+
+        // Step 2: Submit a limit order
+        const response = await fetch(`${base}/orders`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            provider: "polymarket",
+            marketId: "0x1234abcd...",
+            outcome: "Yes",
+            side: "buy",
+            type: "limit",
+            price: 0.60,
+            size: 10.00,
+          }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const order = await response.json();
+        console.log(order);
+        ```
+      </Tab>
+    </Tabs>
+
+    A successful order submission returns the internal order ID and its initial status:
+
+    ```json
+    {
+      "orderId": "ord_01J8KX9...",
+      "provider": "polymarket",
+      "status": "open",
+      "marketId": "0x1234abcd...",
+      "outcome": "Yes",
+      "side": "buy",
+      "type": "limit",
+      "price": 0.60,
+      "size": 10.00,
+      "filledSize": 0.00,
+      "createdAt": "2025-01-15T10:23:45Z"
+    }
+    ```
+
+    <Note>
+      Use the returned `orderId` to check status with `GET /orders/{order_id}` or cancel with `POST /orders/{order_id}/cancel`.
+    </Note>
+  </Step>
+</Steps>
+
+## What's next?
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="key" href="/authentication">
+    Learn about API key scopes, rate limits, and how to handle auth errors.
+  </Card>
+  <Card title="Market Data API" icon="chart-line" href="/api/market-data/overview">
+    Explore all 15 free endpoints for markets, candles, trades, and perpetuals.
+  </Card>
+  <Card title="Order Routing" icon="route" href="/api/execution/overview">
+    Price and execute cross-venue split orders with smart routing.
+  </Card>
+  <Card title="Combos & Parlays" icon="layer-group" href="/api/execution/overview">
+    Build and execute multi-leg combo positions via the RFQ gateway.
+  </Card>
+</CardGroup>

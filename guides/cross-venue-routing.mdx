@@ -1,0 +1,349 @@
+---
+title: "Route Orders Across Venues with Kairos Cross-Venue Routing"
+sidebarTitle: "Cross-Venue Routing"
+description: "Fill large prediction market positions by routing orders across linked markets on Polymarket and Kalshi simultaneously using Kairos route execution."
+---
+
+Cross-venue routing lets you buy or sell a large prediction market position by splitting the order across matched markets on Polymarket and Kalshi at the same time. Instead of exhausting a thin book on one venue or moving the price against yourself, Kairos splits your size across both legs simultaneously — giving you a better average fill price and deeper effective liquidity.
+
+<Info>
+  All routing endpoints require an `Authorization: Bearer <your-api-key>` header. Base URL: `https://execution.kairos.trade`.
+</Info>
+
+---
+
+## How cross-venue routing works
+
+When Kairos identifies that a market on Polymarket and a market on Kalshi are tracking the same event, it creates a **market link** — a verified mapping between the two venues. When you route through a link, Kairos:
+
+1. Computes an optimal split between the two legs based on available liquidity and prices.
+2. Submits orders on both venues simultaneously.
+3. Tracks a **parent routed order** with two **leg orders** underneath.
+4. Lets you close the full position in one call.
+
+---
+
+## Step 1 — Create a market link
+
+Before routing, you need a market link connecting the two venues. Use `POST /orders/market-links` to create or preview one.
+
+```bash
+curl -X POST "https://execution.kairos.trade/orders/market-links" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "polymarket_market_id": "0xabc123",
+    "kalshi_market_id": "FED-25JAN-T0.5",
+    "preview": false
+  }'
+```
+
+```python
+import httpx
+
+resp = httpx.post(
+    "https://execution.kairos.trade/orders/market-links",
+    json={
+        "polymarket_market_id": "0xabc123",
+        "kalshi_market_id": "FED-25JAN-T0.5",
+        "preview": False,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+link = resp.json()
+link_id = link["link_id"]
+print(f"Market link created: {link_id}")
+```
+
+**Example response:**
+
+```json
+{
+  "link_id": "lnk_4fPq7rHsKzM1",
+  "polymarket_market_id": "0xabc123",
+  "kalshi_market_id": "FED-25JAN-T0.5",
+  "polymarket_outcome": "YES",
+  "kalshi_outcome": "YES",
+  "status": "approved",
+  "created_at": "2025-01-15T10:00:00Z"
+}
+```
+
+<Tip>
+  Pass `"preview": true` to validate the link and see the matched outcomes without persisting it. Use this to confirm the mapping is correct before committing.
+</Tip>
+
+<Note>
+  Many popular matched markets already have pre-approved links. Use `GET /orders/route-quote` with existing `link_id` values to check — you may not need to create a new one.
+</Note>
+
+---
+
+## Step 2 — Get a route quote
+
+Before committing to a routed trade, fetch a price quote across both legs. This shows you the expected split, prices on each venue, and total cost.
+
+```bash
+curl "https://execution.kairos.trade/orders/route-quote?link_id=lnk_4fPq7rHsKzM1&side=buy&size=5000" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```python
+resp = httpx.get(
+    "https://execution.kairos.trade/orders/route-quote",
+    params={
+        "link_id": "lnk_4fPq7rHsKzM1",
+        "side": "buy",
+        "size": 5000,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+quote = resp.json()
+print(quote)
+```
+
+**Example response:**
+
+```json
+{
+  "link_id": "lnk_4fPq7rHsKzM1",
+  "side": "buy",
+  "total_size": 5000,
+  "legs": [
+    {
+      "venue": "polymarket",
+      "size": 3200,
+      "avg_price": 0.615,
+      "cost_usdc": 1968.00
+    },
+    {
+      "venue": "kalshi",
+      "size": 1800,
+      "avg_price": 0.618,
+      "cost_usdc": 1112.40
+    }
+  ],
+  "blended_avg_price": 0.616,
+  "total_cost_usdc": 3080.40,
+  "total_fees_usdc": 10.78,
+  "quote_expires_at": "2025-01-15T14:24:05Z"
+}
+```
+
+Review the `blended_avg_price` and `total_cost_usdc` before deciding to execute.
+
+---
+
+## Step 3 — Check the fee model
+
+View the per-leg fee structure for a market link before trading:
+
+```bash
+curl "https://execution.kairos.trade/orders/route-fees?link_id=lnk_4fPq7rHsKzM1" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+**Example response:**
+
+```json
+{
+  "link_id": "lnk_4fPq7rHsKzM1",
+  "legs": [
+    {
+      "venue": "polymarket",
+      "platform_fee_rate": 0.0025,
+      "exchange_fee_rate": 0.001,
+      "total_fee_rate": 0.0035
+    },
+    {
+      "venue": "kalshi",
+      "platform_fee_rate": 0.0025,
+      "exchange_fee_rate": 0.002,
+      "total_fee_rate": 0.0045
+    }
+  ]
+}
+```
+
+---
+
+## Step 4 — Execute the route
+
+When you're ready to trade, call `POST /orders/route-buy`. Kairos executes both legs simultaneously.
+
+```bash
+curl -X POST "https://execution.kairos.trade/orders/route-buy" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "link_id": "lnk_4fPq7rHsKzM1",
+    "side": "buy",
+    "size": 5000,
+    "max_slippage": 0.005
+  }'
+```
+
+```python
+resp = httpx.post(
+    "https://execution.kairos.trade/orders/route-buy",
+    json={
+        "link_id": "lnk_4fPq7rHsKzM1",
+        "side": "buy",
+        "size": 5000,
+        "max_slippage": 0.005,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+route_order = resp.json()
+route_id = route_order["route_id"]
+print(f"Route order placed: {route_id}")
+```
+
+**Example response:**
+
+```json
+{
+  "route_id": "rte_9qHf3kDsEmV2",
+  "link_id": "lnk_4fPq7rHsKzM1",
+  "status": "executing",
+  "side": "buy",
+  "total_size": 5000,
+  "legs": [
+    {
+      "venue": "polymarket",
+      "order_id": "ord_2xKj9mQpLvT4",
+      "size": 3200,
+      "status": "open"
+    },
+    {
+      "venue": "kalshi",
+      "order_id": "ord_5nRa1bWcXzY8",
+      "size": 1800,
+      "status": "open"
+    }
+  ],
+  "created_at": "2025-01-15T14:23:05Z"
+}
+```
+
+<Warning>
+  The `max_slippage` field (expressed as a decimal, e.g. `0.005` = 0.5%) protects you from adverse fills if prices move between quote and execution. If either leg would exceed the slippage limit, the route order is rejected.
+</Warning>
+
+---
+
+## Step 5 — List your routed orders
+
+Retrieve all your routed parent orders and their individual legs:
+
+```bash
+curl "https://execution.kairos.trade/orders/routes" \
+  -H "Authorization: Bearer $KAIROS_API_KEY"
+```
+
+```python
+resp = httpx.get(
+    "https://execution.kairos.trade/orders/routes",
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+routes = resp.json()["routes"]
+for r in routes:
+    print(r["route_id"], r["status"], r["total_size"])
+```
+
+---
+
+## Step 6 — Close a routed position
+
+To unwind your cross-venue position, call `POST /orders/route-close`. Kairos submits sell orders across both legs simultaneously, mirroring the same split logic used on entry.
+
+```bash
+curl -X POST "https://execution.kairos.trade/orders/route-close" \
+  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "route_id": "rte_9qHf3kDsEmV2",
+    "size": 5000
+  }'
+```
+
+```python
+resp = httpx.post(
+    "https://execution.kairos.trade/orders/route-close",
+    json={
+        "route_id": "rte_9qHf3kDsEmV2",
+        "size": 5000,
+    },
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+print(resp.json())
+```
+
+**Example response:**
+
+```json
+{
+  "route_id": "rte_9qHf3kDsEmV2",
+  "close_route_id": "rte_1mKd4jFpNwZ6",
+  "status": "executing",
+  "legs": [
+    {
+      "venue": "polymarket",
+      "order_id": "ord_8hKp2qNvLzR5",
+      "size": 3200,
+      "status": "open"
+    },
+    {
+      "venue": "kalshi",
+      "order_id": "ord_6mJe1wBxCyT3",
+      "size": 1800,
+      "status": "open"
+    }
+  ]
+}
+```
+
+---
+
+## Full workflow at a glance
+
+```python
+import httpx
+
+BASE = "https://execution.kairos.trade"
+HEADERS = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+# 1. Create market link
+link = httpx.post(f"{BASE}/orders/market-links", json={
+    "polymarket_market_id": "0xabc123",
+    "kalshi_market_id": "FED-25JAN-T0.5",
+}, headers=HEADERS).json()
+link_id = link["link_id"]
+
+# 2. Get quote
+quote = httpx.get(f"{BASE}/orders/route-quote", params={
+    "link_id": link_id, "side": "buy", "size": 5000,
+}, headers=HEADERS).json()
+print(f"Blended price: {quote['blended_avg_price']}")
+
+# 3. Execute
+route = httpx.post(f"{BASE}/orders/route-buy", json={
+    "link_id": link_id, "side": "buy", "size": 5000, "max_slippage": 0.005,
+}, headers=HEADERS).json()
+route_id = route["route_id"]
+
+# 4. Later: close position
+close = httpx.post(f"{BASE}/orders/route-close", json={
+    "route_id": route_id, "size": 5000,
+}, headers=HEADERS).json()
+print(f"Close route: {close['close_route_id']}")
+```
+
+<CardGroup cols={2}>
+  <Card title="Trading" icon="arrow-right-arrow-left" href="/guides/trading">
+    Single-venue order entry and lifecycle management.
+  </Card>
+  <Card title="Combos & Parlays" icon="layer-group" href="/guides/combos">
+    Multi-market combo positions on Polymarket.
+  </Card>
+</CardGroup>

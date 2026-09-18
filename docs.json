@@ -1,0 +1,108 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Kairos",
+  "theme": "luma",
+  "favicon": "https://media.brand.dev/03366fe1-69e7-4f87-98e6-fc0b1ae207a7.webp",
+  "colors": {
+    "primary": "#807dfe",
+    "light": "#060610",
+    "dark": "#848488"
+  },
+  "navbar": {
+    "primary": {
+      "type": "button",
+      "label": "Launch App",
+      "href": "https://app.kairos.trade"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "authentication"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/markets",
+              "concepts/venues",
+              "concepts/orders",
+              "concepts/wallets"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/trading",
+              "guides/market-data",
+              "guides/websocket",
+              "guides/auctions",
+              "guides/cross-venue-routing",
+              "guides/combos"
+            ]
+          },
+          {
+            "group": "WebSocket",
+            "pages": [
+              "websocket/overview",
+              "websocket/market-data",
+              "websocket/protobuf"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Market Data API",
+            "pages": [
+              "api/market-data/overview",
+              "api/market-data/markets",
+              "api/market-data/candles",
+              "api/market-data/trades",
+              "api/market-data/perpetuals"
+            ]
+          },
+          {
+            "group": "Data API",
+            "pages": [
+              "api/data/overview",
+              "api/data/markets",
+              "api/data/search",
+              "api/data/sports",
+              "api/data/trader-analytics",
+              "api/data/pnl"
+            ]
+          },
+          {
+            "group": "Execution API",
+            "pages": [
+              "api/execution/overview",
+              "api/execution/orders",
+              "api/execution/exchanges",
+              "api/execution/routing",
+              "api/execution/combos",
+              "api/execution/onboarding"
+            ]
+          },
+          {
+            "group": "Agora Auction API",
+            "pages": [
+              "api/agora/overview",
+              "api/agora/auctions",
+              "api/agora/quotes"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
