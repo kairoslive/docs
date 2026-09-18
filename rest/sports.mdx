@@ -1,0 +1,653 @@
+---
+title: "Sports"
+description: "Live sports events, markets, cross-provider matching, brackets, and reference metadata"
+---
+
+Live and upcoming sports events, per-event markets, cross-platform matching, brackets, and reference data. Reach for this page when you are building a scoreboard, a game page, a parlay builder, or a cross-venue price comparison.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+All paths on this page are relative to that host.
+
+## Authentication
+
+Most routes here accept an API key (`X-Client-Id` + `X-Api-Key` + `X-Api-Secret`), a session JWT, or the internal admin secret. On those routes a session-JWT caller must additionally be invited — an uninvited user gets `403 Invite required`; API-key and admin-secret callers skip that check.
+
+Three routes require no credentials at all:
+
+- `GET /sports/matching-markets`
+- `GET /sports/trending-matched`
+- `GET /sports/kalshi-filters`
+
+<Note>
+**Gotcha:** the curl examples for those three carry **no** auth headers. Sending credentials is not required, and the endpoint sections below mark them as public. Every other example on this page reads credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+</Note>
+
+**Rate limits.** `/sports/tournament-bracket` is 10 requests/minute (the `heavy` group) and `/sports/game-markets` is 60/minute (the `sports` group). Every other route on this page has no explicit decorator and falls under the service-wide default of 100/minute. Limits are keyed by authenticated user id where available, otherwise by client IP, and the group defaults are adjustable at runtime by an operator.
+
+## Live events
+
+```
+GET /sports/live-events
+```
+
+Currently-active games with real-time scores, an additive urgency score, and cross-provider matched markets. Call it to drive a live scoreboard.
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=10, s-maxage=10`.
+
+Predict.fun fixtures are included only when the provider **indexing gate** lists `predictfun` as enabled. The gate is re-checked on every request (including cache hits). If the gate lookup fails, Predict.fun is **excluded** (fail closed) — Polymarket/Kalshi live rows still return.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `include_markets` | boolean | No | `false` | Include the full markets list (not just the primary market) per event |
+
+```bash
+curl "https://data.kairos.trade/sports/live-events?include_markets=true" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Falls back to a live provider lookup when the per-game market cache is cold**, and, when no matched entry carries a Kalshi side, synthesizes one from a team-name lookup.
+
+### Response
+
+The response shape is described by the field table below rather than by a JSON example.
+
+| Field | Type | Description |
+|---|---|---|
+| `events[].urgencyScore` | integer | Additive heuristic: +100 live, +60 overtime, +40 late period (margin ≤5), +20 (margin ≤3), +10 (state updated ≤10s ago), −50 if stale |
+| `events[].stale` | boolean | True when the cached game state is older than 120s |
+| `events[].primaryMarket` | object \| null | Normalized primary market — `question`, `outcomePrices`, `volumeNum`, `liquidityNum`, `bestBid`/`bestAsk`/`spread`, etc. |
+| `events[].markets` | array | Full normalized market list; present only when `include_markets=true` |
+| `events[].ts` | string | ISO 8601 timestamp of the underlying game state, not a Unix epoch |
+| `matchingMarkets` | object | Keyed by `events[].matchingSlug` — one entry per event that resolved a matching slug, not per event |
+
+Every event row also carries `gameId`, `sport`, `homeTeam`, `awayTeam`, `homeScore`, `awayScore`, `status`, `period`, `elapsed`, `live`, `ended`, `slug`, `matchingSlug`, and `marketsCount`.
+
+`events` is ordered by `urgencyScore` descending, then by `ts` descending.
+
+<Note>
+**Gotcha:** `matchingMarkets` entries are backfilled to `{"providers": []}` for any event that resolved a matching slug but has no cross-provider data. A present key does **not** imply a match was found — check `providers`. When the Predict.fun gate is off, `predictfun` entries are stripped from every `providers` list.
+</Note>
+
+## Event markets
+
+```
+GET /sports/event-markets
+```
+
+All markets for a single sports event, resolved by `game_id` or by `slug` (which is first resolved to a `gameId`).
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=10, s-maxage=10`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `game_id` | string | No* | — | Gamma/sports game ID, looked up directly |
+| `slug` | string | No* | — | Market slug used to discover the event's `gameId` when `game_id` is absent |
+
+\* At least one should be supplied — both are optional, unvalidated strings at the request layer.
+
+```bash
+curl "https://data.kairos.trade/sports/event-markets?slug=ucl-din-vf-2026-08-18" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Returns `200` with `{"gameId": "<value or \"unknown\">", "markets": []}` when nothing resolves — it never 404s.**
+
+### Response
+
+Array of normalized markets, same shape as `events[].primaryMarket` on `/sports/live-events` (`id`, `question`, `conditionId`, `tokenId`, `outcomePrices`, `outcomes`, `volumeNum`, `liquidityNum`, `acceptingOrders`, `sportsMarketType`, `provider`, ...).
+
+## Game markets
+
+```
+GET /sports/game-markets?slug={eventSlug}
+```
+
+The full market catalog for one game, grouped for game pages and parlay builders. The response combines Polymarket's base event and linked child events (such as corners, halves, and player props) with matched Predict.fun markets when available.
+
+**Auth:** API key or session JWT. **Rate limit:** 60 requests/minute. **Cache-Control:** `public, max-age=30`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `slug` | string | Yes | — | 1–200 characters. Polymarket game event slug, such as the `eventSlug` returned by sports discovery routes |
+
+Use the game-level event slug, not an individual market ID. A missing Polymarket event returns `200`: team and sport metadata are `null`, and sections with no matched supplemental markets are empty.
+
+```bash
+curl "https://data.kairos.trade/sports/game-markets?slug=ucl-din-vf-2026-08-18" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "slug": "ucl-din-vf-2026-08-18",
+  "teamA": "Dinamo Zagreb",
+  "teamB": "Viktoria Plzen",
+  "teamALogo": "https://...",
+  "teamBLogo": "https://...",
+  "sport": "ucl",
+  "sections": {
+    "gameLines": [
+      {
+        "key": "moneyline",
+        "title": "Moneyline",
+        "section": "gameLines",
+        "layout": "pills",
+        "provider": "polymarket",
+        "mergeKey": "moneyline",
+        "volume": 15420.5,
+        "legs": [
+          {
+            "label": "Dinamo Zagreb",
+            "marketId": "poly-home-win",
+            "price": 0.54,
+            "side": "yes",
+            "outcomeKey": "team:dinamo zagreb",
+            "comboEligible": true,
+            "yesPositionId": "0x...",
+            "noPositionId": "0x..."
+          }
+        ]
+      },
+      {
+        "key": "predictfun:pf-home-win",
+        "title": "Will Dinamo Zagreb win on 2026-08-18?",
+        "section": "gameLines",
+        "layout": "pills",
+        "provider": "predictfun",
+        "mergeKey": "moneyline",
+        "volume": 820,
+        "legs": [
+          {
+            "label": "Yes",
+            "marketId": "pf-home-win",
+            "price": 0.52,
+            "side": "yes",
+            "outcomeKey": "team:dinamo zagreb",
+            "comboEligible": false,
+            "yesPositionId": null,
+            "noPositionId": null
+          }
+        ]
+      }
+    ],
+    "halves": [],
+    "playerProps": [],
+    "moreMarkets": [],
+    "exactScore": [],
+    "corners": []
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `sections` | object | Always contains `gameLines`, `halves`, `playerProps`, `moreMarkets`, `exactScore`, and `corners` arrays |
+| `sections.<name>[].layout` | `pills` \| `ladder` | `pills` families have a flat `legs` array; spreads and totals use `rungs`, each with a numeric `line` and `legs` |
+| `sections.<name>[].provider` | string | Venue for every market in the family, currently `polymarket` or `predictfun` |
+| `mergeKey` / `outcomeKey` | string | Opaque server-assigned cross-venue identity. Group `pills` families by `mergeKey`, then legs by `outcomeKey`; do not infer identity from titles |
+| `legs[].side` | `yes` \| `no` | Contract side represented by the leg. The same `marketId` can back both sides; for example, a total's Under is commonly the `no` side |
+| `legs[].comboEligible` | boolean | `true` means the leg has Polymarket combo position IDs; `false` means it cannot be used in an atomic combo |
+| `legs[].yesPositionId` / `noPositionId` | string \| null | Combo position IDs. Select the ID matching `side` |
+
+<Note>
+**Gotcha:** using the YES position ID for a `no` leg buys the opposite outcome. Always pick the position ID that matches `legs[].side`.
+</Note>
+
+`comboEligible` and both position-ID fields can be **absent** when the combo catalog is unavailable. Absence means eligibility is unknown, not false. Predict.fun legs explicitly return `comboEligible: false` because atomic combos — single positions built from several legs — are Polymarket-only.
+
+Predict.fun enrichment is best-effort: its lookup or pricing failure does not remove the Polymarket catalog. The supplement reads at most 300 markets and live-backfills at most 60 missing quotes per request.
+
+<Note>
+**Gotcha:** an open market without a usable quote remains in the response with `price: 0`. Treat that as unavailable pricing, not an executable 0% price.
+</Note>
+
+## Matching markets
+
+```
+GET /sports/matching-markets
+```
+
+Cross-platform price matches for a set of game slugs — the same market on different providers, for side-by-side comparison.
+
+**Auth:** none — public. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=30, s-maxage=60`, or `max-age=3` / `max-age=5` when `live=true`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `slugs` | string | Yes | — | Non-empty, comma-separated. Game slugs to look up. Zero-length entries (`a,,b`) are dropped; whitespace-only entries are **not** trimmed and are looked up verbatim |
+| `live` | string | No | — | Literal `"true"` or `"false"`. Refresh the Kalshi side from the live discover cache before returning |
+
+```bash
+curl "https://data.kairos.trade/sports/matching-markets?slugs=nba-lal-bos-2026-01-15&live=true"
+```
+
+No auth headers — this route is public.
+
+<Note>
+**Gotcha:** `live` is compared as a raw string, not parsed as a boolean — anything other than `"true"` is treated as false. `live=1` and `live=TRUE` do nothing.
+</Note>
+
+**Slugs with no cache entry, or an unparseable cached value, are silently omitted** from the response object rather than returned as null. When `live=true`, a correction is applied if a stale Kalshi price appears to be on the wrong side of a binary flip.
+
+### Response
+
+```json
+{
+  "nba-lal-bos-2026-01-15": {
+    "title": "Lakers vs Celtics",
+    "tokenId": "10897234...",
+    "providers": [
+      { "provider": "polymarket", "marketId": "nba-lal-bos-2026-01-15", "price": 0.62 },
+      { "provider": "kalshi", "marketId": "KXNBAGAME-26JAN15LALBOS-LAL", "price": 0.6, "eventTicker": "KXNBAGAME-26JAN15LALBOS" }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `<slug>.providers[].price` | number | 0–1 scale probability/price |
+| `<slug>.providers[].eventTicker` | string | Kalshi event ticker; present only on the `kalshi` entry |
+
+Returns `{}` if `slugs` parses to no non-empty entries.
+
+## Trending matched
+
+```
+GET /sports/trending-matched
+```
+
+Top sports markets available on both Polymarket and Kalshi, ranked by live Kalshi volume.
+
+**Auth:** none — public. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=30, s-maxage=60`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `5` | 1–20. Max results |
+
+```bash
+curl "https://data.kairos.trade/sports/trending-matched?limit=5"
+```
+
+No auth headers — this route is public.
+
+Scans the matching cache for games with **both** a Polymarket and a Kalshi side, drops anything dated before yesterday (UTC), enriches Kalshi volume from the live discover cache (`volume_1h` falling back to total), and sorts descending.
+
+### Response
+
+```json
+{
+  "matches": [
+    {
+      "slug": "nba-lal-bos-2026-01-15",
+      "title": "Lakers vs Celtics",
+      "image": null,
+      "icon": null,
+      "volume1h": 48213.5,
+      "polymarket": { "marketId": "nba-lal-bos-2026-01-15", "tokenId": "10897234...", "price": 0.62 },
+      "kalshi": { "marketId": "KXNBAGAME-26JAN15LALBOS-LAL", "eventTicker": "KXNBAGAME-26JAN15LALBOS", "price": 0.6 }
+    }
+  ],
+  "count": 1
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `matches[].image` / `icon` | string \| null | Always `null` — not populated by this endpoint. Do not use them as an image source |
+| `count` | integer | Number of items in `matches`, after truncation to `limit` |
+
+Returns `{"matches": [], "count": 0}` immediately if the matching cache is empty.
+
+## Upcoming events
+
+```
+GET /sports/upcoming-events
+```
+
+Not-yet-live sports events within a lookahead window, with matched cross-provider markets attached.
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=30, s-maxage=60`, or `public, max-age=10, s-maxage=30` when a stale cached body is served while it refreshes in the background.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `windowHours` | integer | No | `24` | 1–720. Look-ahead window for game start times |
+| `category` | string | No | — | Catalog category id. Expands to every league in that category; takes priority over `league`/`series` |
+| `league` | string | No | — | Any string, lower-cased. Single league filter, used only when `category` is absent or doesn't resolve. Not validated against the catalog — an unknown slug simply resolves nothing |
+| `series` | string | No | — | Comma-separated slugs. Used only when neither `category` nor `league` applies; entries are trimmed and lower-cased, blanks dropped |
+| `limitPerSeries` | integer | No | `12` | 1–200. Max events fetched per resolved series |
+
+```bash
+curl "https://data.kairos.trade/sports/upcoming-events?windowHours=24&league=ucl&limitPerSeries=12" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+With none of `category`/`league`/`series` supplied, the query covers **every** league in the sports catalog.
+
+**Cached with stale-while-revalidate semantics**: fresh responses are served synchronously, stale responses are served immediately with a background refresh, and a cold miss is built synchronously — returning `502 {"detail": "All upstream fetches failed"}` if every upstream fetch fails. A partial upstream failure still returns `200` with whatever resolved.
+
+### Response
+
+The response shape is described by the field table below rather than by a JSON example.
+
+| Field | Type | Description |
+|---|---|---|
+| `events[].startTime` | string | Normalized `gameStartTime` (falls back to the event's `endDate` when missing). ISO 8601 with an explicit offset, e.g. `2026-05-25T18:10:00+00:00` — not a `Z` suffix, and not a Unix epoch |
+| `events[].drawPrice` / `teamBPrice` | number \| null | Present only for soccer 3-way events |
+| `matchingMarkets` | object | Same matching-entry shape as `/sports/matching-markets` |
+
+Every event row also carries `eventId`, `title`, `sport`, `league`, `teamA`, `teamB`, `image`, `primaryMarket`, `marketsCount`, and `eventSlug`. `events` is sorted by `startTime` ascending.
+
+Returns `200` with `{"events": [], "matchingMarkets": {}}` when the filters resolve to no leagues (for example `series=,,`), and on a genuine no-data result.
+
+## Metadata
+
+```
+GET /sports/metadata
+```
+
+Every synced team and league — logos, abbreviations, aliases, colors — for frontend lookups.
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=3600, s-maxage=3600`.
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/metadata" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Queried live on every request** — only the HTTP `Cache-Control` header caches responses, at the edge.
+
+### Response
+
+```json
+{
+  "teams": [
+    { "id": "142", "name": "Boston Celtics", "league": "NBA", "logoUrl": null, "abbreviation": "BOS", "alias": "Celtics", "color": "#007A33" }
+  ],
+  "leagues": [
+    { "id": "8", "sport": "basketball", "imageUrl": null }
+  ]
+}
+```
+
+## Catalog
+
+```
+GET /sports/catalog
+```
+
+The structured sports catalog — categories and their leagues, enriched with resolved Polymarket series IDs. Use it to populate league pickers and to discover the `league` values the other routes accept.
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=3600, s-maxage=3600`.
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/catalog" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "categories": [
+    {
+      "id": "basketball",
+      "label": "Basketball",
+      "leagues": [
+        { "slug": "nba", "label": "NBA", "tagId": 100639, "seriesId": 123 }
+      ]
+    }
+  ]
+}
+```
+
+<Note>
+**Gotcha:** `tagId` is a hardcoded constant (100639) shared by every league — it is not league-specific, so it cannot be used to tell leagues apart.
+</Note>
+
+`seriesId` is resolved via a cached lookup and may be `null` if unresolved.
+
+## Kalshi live games
+
+```
+GET /sports/kalshi-live-games
+```
+
+Every currently-live Kalshi sports milestone (hockey, basketball, baseball, football/UFL, soccer, esports), with moneyline/spread/total market blocks attached.
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=240`.
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/kalshi-live-games" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+Building each game's market blocks from Kalshi's authenticated API is comparatively slow on a cold cache — caching keeps steady-state requests fast.
+
+### Response
+
+```json
+{
+  "games": [ { "...": "self-contained Kalshi game card payload" } ]
+}
+```
+
+## Kalshi filters
+
+```
+GET /sports/kalshi-filters
+```
+
+The Kalshi sports taxonomy — Sport → Competition → Scope — backing category-filter UI.
+
+**Auth:** none — public. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=21600` (6 hours, in-process and Redis).
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/kalshi-filters"
+```
+
+No auth headers — this route is public.
+
+### Response
+
+The upstream Kalshi payload is passed through **verbatim**, with no normalization:
+
+```json
+{
+  "filters_by_sports": {
+    "All sports": { "competitions": {}, "scopes": [] },
+    "Baseball": { "competitions": { "MLB": { "scopes": [] } }, "scopes": [] }
+  },
+  "sport_ordering": ["All sports", "Basketball"]
+}
+```
+
+A response missing `filters_by_sports`, or a non-200 from upstream, is treated as a fetch failure and surfaces as a `500` on a cold cache.
+
+## Futures
+
+```
+GET /sports/futures
+```
+
+Sports futures — championship and award outright markets — grouped by event, across Polymarket and Predict.fun.
+
+**Auth:** API key or session JWT. **Rate limit:** 100/minute. **Cache-Control:** `public, max-age=60, s-maxage=300`.
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/futures" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Stale-while-revalidate:** any cached body is served immediately, with a single background rebuild kicked off once it is past the soft TTL. Only a cold cache builds synchronously, and concurrent cold builds share one in-flight build.
+
+### Response
+
+```json
+{
+  "futures": [
+    {
+      "eventId": "123456",
+      "title": "2026 NBA Champion",
+      "image": null,
+      "sport": "basketball",
+      "league": "nba",
+      "provider": "polymarket",
+      "volume": 8412330,
+      "marketsCount": 2,
+      "outcomes": [
+        {
+          "label": "Boston Celtics",
+          "price": 0.21,
+          "marketId": "will-the-celtics-win-the-2026-nba-finals",
+          "tokenId": "10897234...",
+          "conditionId": "0x..."
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `futures[].provider` | string | `polymarket` or `predictfun` |
+| `futures[].volume` | number | Summed market volume across the event's contenders, rounded to a whole number |
+| `futures[].marketsCount` | integer | Number of contenders **before** the per-event cap is applied to `outcomes` |
+| `outcomes[].price` | number \| null | Yes-side price on the **0–1** scale (Polymarket `outcomePrices`, Predict.fun best-bid/best-ask mid rounded to 4 dp). `null` when the contender is unpriced |
+| `outcomes[].tokenId` / `conditionId` | string \| null | Present when the underlying market carries them |
+
+`outcomes` is sorted favorites-first with unpriced contenders last, and is capped per event; events are returned richest-first by contender count. Per-game props and game lines are filtered out, and the unrecognised-sport bucket is additionally capped.
+
+## Tournament bracket
+
+```
+GET /sports/tournament-bracket
+```
+
+A structured tournament bracket for a league, enriched with live Polymarket/Kalshi/Predict.fun prices per tie.
+
+**Auth:** API key or session JWT. **Rate limit:** 10 requests/minute. **Cache-Control:** `public, max-age=60, stale-while-revalidate=3600`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `league` | string | Yes | — | Not validated at the request layer. League slug (e.g. `ucl`, `nba`, `ncaab`) |
+| `format` | string | No | `symmetric` | Not validated at the request layer; `symmetric` \| `left-to-right` \| `groups-then-knockout` are the meaningful values. Bracket layout |
+
+```bash
+curl "https://data.kairos.trade/sports/tournament-bracket?league=ucl&format=symmetric" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**An unrecognised `league` returns `200`**, not `404` — the body is `{"leftRounds": [], "rightRounds": [], "final": null, "winner": null}`. An unrecognised `format` is not rejected either; anything other than `left-to-right` renders the symmetric layout, and only the literal `symmetric` selects two-legged tie merging.
+
+`format=left-to-right` returns all rounds in `leftRounds` with `rightRounds` empty. `format=groups-then-knockout` adds a `groups` array with standings tables. `thirdPlace` is present only for football-data competitions that have a third-place fixture.
+
+`league` and `format` are both part of the cache key, so a novel pair pays a full synchronous build.
+
+### Response
+
+```json
+{
+  "leftRounds": [ { "name": "Quarter-finals", "shortName": "QF", "matches": [ { "...": "..." } ] } ],
+  "rightRounds": [ ],
+  "final": { "id": "final-tbd", "teams": [null, null], "status": "scheduled", "subtitle": "Final" },
+  "winner": null
+}
+```
+
+<Warning>
+**Gotcha:** `winner` is always `null` — this endpoint never resolves a champion. Read the final tie from `final` instead.
+</Warning>
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`, with two exceptions: `429` uses an `error` key, and `422` uses FastAPI's standard validation body. The Code column below holds the exact message string the service returns; `—` means the response carries no fixed string.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 401 | `Authentication required (JWT token / API key / admin secret)` | No credentials on an auth-gated route | Send an API key, a session JWT, or the admin secret. The three public routes need none. |
+| 401 | `X-Api-Key and X-Api-Secret required with X-Client-Id` | `X-Client-Id` sent without `X-Api-Key` **and** `X-Api-Secret` | Send all three headers together. |
+| 401 | `Invalid API credentials` | API key/secret don't match a credential | Check the key and secret; retrying unchanged returns the same error. |
+| 403 | `IP not whitelisted` | Caller IP is not on the credential's IP whitelist | Call from a whitelisted address, or have the credential's whitelist updated. |
+| 403 | `Invite required` | Session JWT belongs to a user who hasn't been invited | Use an API key or the admin secret — both skip the invite check. |
+| 422 | — | FastAPI parameter validation — missing or empty `slugs`, missing `league`, missing or over-long `slug` on `/sports/game-markets`, non-integer or out-of-range `limit`/`windowHours`/`limitPerSeries` | Fix the parameter and resend — deterministic; retrying unchanged returns the same error. The FastAPI validation body names the offending field. |
+| 429 | `Rate limit exceeded: 100 per 1 minute` | Rate limit exceeded | Back off and retry; `Retry-After` and `X-RateLimit-*` say how long. A 429 does not consume quota. |
+| 429 | `API key data rate limit exceeded` | Per-credential data-API ceiling exceeded (only when the API credential carries a `data` rate-limit override) | Slow down on that credential, or have its `data` override raised. |
+| 500 | `An internal error occurred. Please try again later.` | Any unhandled error — e.g. Redis or ClickHouse unavailable on `/sports/metadata`, `/sports/catalog`, or `/sports/futures`, or a cold-cache upstream failure on `/sports/kalshi-live-games` or `/sports/kalshi-filters` | Retry once the backing store or upstream recovers; report to support with the response body if it persists. |
+| 502 | `All upstream fetches failed` | `/sports/upcoming-events` only — every upstream event source failed while building a cold cache entry | Retry; a partial upstream recovery returns `200` with whatever resolved. |
+
+### No route on this page returns 404
+
+Empty or unresolvable input degrades to a `200`. Do not branch on `404` — branch on the empty body:
+
+- `/sports/event-markets` → `{"gameId": "<value or \"unknown\">", "markets": []}`
+- `/sports/matching-markets` → `{}` when none of the requested slugs are cached
+- `/sports/trending-matched` → `{"matches": [], "count": 0}`
+- `/sports/upcoming-events` → `{"events": [], "matchingMarkets": {}}`
+- `/sports/tournament-bracket` → `{"leftRounds": [], "rightRounds": [], "final": null, "winner": null}` for an unknown league
+- `/sports/game-markets` → the catalog with `null` team/sport metadata and empty sections when the Polymarket event is missing
+
+Best-effort enrichment never fails a request: Predict.fun supplementation on `/sports/game-markets`, the Predict.fun gate on `/sports/live-events`, the combo-eligibility annotation, and background cache refreshes are all fail-open and degrade the payload rather than erroring.
+
+`GET /sports/poly-kalshi-pairings` and `GET /sports/combo-markets` are documented on the [matched markets](/rest/matched-markets) page.

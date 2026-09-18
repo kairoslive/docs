@@ -1,0 +1,286 @@
+---
+title: "Positions & PnL"
+description: "Orders, executions, positions, equity curve, PnL summary, and the real-time events stream"
+---
+
+These endpoints expose what the engine has *done*: the orders it submitted,
+the trigger evaluations it logged, the positions it holds, and the resulting
+PnL — plus a live event stream so a client doesn't have to poll for any of it.
+Reach for [Real-time events](#real-time-events) first; the REST endpoints are
+the snapshot and audit surface behind it.
+
+All endpoints require `Authorization: Bearer <jwt>`.
+
+| You want to know | Use |
+|---|---|
+| What orders were submitted, and how they filled | [List orders](#list-orders) |
+| Why a strategy did or did not fire | [List executions](#list-executions) |
+| What you currently hold | [List positions](#list-positions) |
+| How a fund's equity moved over time | [Equity curve](#equity-curve) |
+| Rolled-up PnL across every fund | [PnL summary](#pnl-summary) |
+| Any of the above without polling | [Real-time events](#real-time-events) |
+
+## List orders
+
+```
+GET /api/v1/orders
+```
+
+Every order Krisis has tracked for the caller — one row per submission.
+
+### Example
+
+```bash
+curl https://krisis.kairos.trade/api/v1/orders \
+  -H "Authorization: Bearer $JWT"
+```
+
+### Response
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | uuid | Tracking-row id |
+| `strategy_id` | uuid \| null | Originating strategy; `null` for manually recorded fills |
+| `order_id` | uuid | Venue order id |
+| `exchange_id` | string | `"kalshi"` or `"polymarket"` |
+| `status` | string | Lifecycle status — see below |
+| `cost_reserved` | number | Capital reserved against the fund |
+| `filled_quantity` | number \| null | Contracts filled |
+| `avg_fill_price` | number \| null | Average fill price |
+| `remaining_quantity` | number \| null | Contracts still working |
+| `total_fees` | number \| null | Fees charged |
+| `error_message` | string \| null | Failure detail |
+| `cancel_reason` | string \| null | Set for cancelled orders |
+| `market_id` | string | Market identifier |
+| `side` | string \| null | `"buy"` or `"sell"` |
+| `order_type` | string \| null | `"market"` or `"limit"` |
+| `outcome` | string \| null | Polymarket outcome |
+| `token_id` | string \| null | Polymarket CLOB token id |
+| `created_at` | string | ISO 8601 |
+| `updated_at` | string | ISO 8601 |
+
+### Order status
+
+`status` moves through `pending` → `open` → `partially_filled` → `filled`,
+or a terminal `cancelled` / `rejected` / `expired` / `failed`.
+
+The `cost_reserved` amount is held against the linked fund and released on a
+terminal order state — see [Funds](/krisis/funds-credentials#funds).
+
+## List executions
+
+```
+GET /api/v1/executions
+```
+
+An execution is one **trigger evaluation** — every time a strategy's
+condition was checked and the engine decided to act or skip. Use it to audit
+why a strategy did or did not fire.
+
+### Response
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | uuid | Execution id |
+| `strategy_id` | uuid | Strategy evaluated |
+| `triggered_at` | string | ISO 8601 |
+| `trigger_price` | number \| null | Price at evaluation |
+| `evaluation_ms` | number \| null | Evaluation time |
+| `action_taken` | boolean | Whether an order was submitted |
+| `skip_reason` | string \| null | Why no order — see below |
+| `order_id` | uuid \| null | Order submitted, when `action_taken` is `true` |
+
+### `skip_reason` values
+
+| `skip_reason` | When it happens | What to do |
+|---|---|---|
+| `cooldown` | The strategy fired too recently | Nothing — it will re-evaluate |
+| `no_fund` | The referenced fund is missing or inactive | Re-link or reactivate the fund |
+| `insufficient_balance` | The fund has no headroom for the order's cost | Raise `balance_limit` or free reservations |
+| `no_credentials` | No active credential for the strategy's `exchange_id` | Add one — see [Funds & Credentials](/krisis/funds-credentials#credentials) |
+| `invalid_action_config` | The strategy's `action_config` is missing or unusable | Fix it — see [action_config](/krisis/strategies#action_config) |
+
+<Warning>
+**Gotcha: an armed strategy that never trades is not an error anywhere.** It
+records executions with `action_taken: false` and a `skip_reason`, and no
+request ever fails. If a strategy looks healthy but is silent, read this
+endpoint.
+</Warning>
+
+## List positions
+
+```
+GET /api/v1/positions
+```
+
+Every position — open and closed — held by the caller.
+
+### Response
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | uuid | Position id |
+| `fund_id` | uuid \| null | Linked fund |
+| `market_id` | string | Market identifier |
+| `side` | string | `"buy"` or `"sell"` |
+| `quantity` | number | Contracts held |
+| `avg_entry_price` | number | Average entry price |
+| `realized_pnl` | number | Realized PnL |
+| `unrealized_pnl` | number | Mark-to-market PnL on the open quantity |
+| `is_open` | boolean | Whether the position is still open |
+| `exchange_id` | string \| null | `"kalshi"` / `"polymarket"` |
+| `outcome` | string \| null | Polymarket outcome |
+| `token_id` | string \| null | Polymarket CLOB token id |
+| `created_at` | string | ISO 8601 |
+| `updated_at` | string | ISO 8601 |
+
+Closed positions are returned too — filter on `is_open`.
+
+### Positions for one fund
+
+```
+GET /api/v1/positions/{fund_id}
+```
+
+Same shape, filtered to a single fund. `404` if the fund is not yours.
+
+## Equity curve
+
+```
+GET /api/v1/equity/{fund_id}
+```
+
+Historical equity snapshots for a fund, newest first.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `100` | Max snapshots; `1`–`1000` |
+
+### Response
+
+Array of snapshots.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | uuid | Snapshot id |
+| `fund_id` | uuid | Fund id |
+| `balance` | number | Cash balance at the snapshot |
+| `unrealized_pnl` | number | Open-position PnL at the snapshot |
+| `total_equity` | number | `balance + unrealized_pnl` |
+| `timestamp` | string | ISO 8601 |
+
+## PnL summary
+
+```
+GET /api/v1/pnl
+```
+
+A rolled-up PnL view across all of the caller's funds.
+
+### Example
+
+```bash
+curl https://krisis.kairos.trade/api/v1/pnl \
+  -H "Authorization: Bearer $JWT"
+```
+
+### Response
+
+```json
+{
+  "total_realized_pnl": 842.10,
+  "total_unrealized_pnl": -56.30,
+  "total_equity": 5785.80,
+  "funds": [
+    {
+      "fund_id": "…",
+      "name": "BTC desk",
+      "balance_limit": 5000,
+      "balance_used": 1200,
+      "realized_pnl": 842.10,
+      "unrealized_pnl": -56.30,
+      "open_positions": 2
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `total_realized_pnl` | number | Realized PnL, all funds |
+| `total_unrealized_pnl` | number | Unrealized PnL, all funds |
+| `total_equity` | number | Combined equity |
+| `funds` | array | Per-fund breakdown |
+
+Each entry in `funds`:
+
+| Field | Type | Description |
+|---|---|---|
+| `fund_id` | uuid | Fund id |
+| `name` | string | Fund name |
+| `balance_limit` | number | Spending cap |
+| `balance_used` | number | Reserved / committed |
+| `realized_pnl` | number | Realized PnL for the fund |
+| `unrealized_pnl` | number | Unrealized PnL for the fund |
+| `open_positions` | integer | Count of open positions |
+
+## Real-time events
+
+```
+GET /api/v1/events
+```
+
+Server-Sent Events stream of the caller's own strategy activity — orders,
+positions, and strategies change without polling. Krisis filters the stream
+server-side so a connection only ever receives its own `user_id`'s events.
+
+### Example
+
+```bash
+curl -N https://krisis.kairos.trade/api/v1/events \
+  -H "Authorization: Bearer $JWT"
+```
+
+### Event types
+
+Several event types are multiplexed on one stream, discriminated by the SSE
+`event:` field:
+
+| Event | Payload | What to do with it |
+|---|---|---|
+| `trigger` | Trigger event object (below) | A strategy fired, or was evaluated and skipped |
+| `strategy_updated` | A conditional-order summary object — the same shape as a row from [List conditional orders](/krisis/conditional-orders#list-conditional-orders) | Row-level delta. Upsert it by `strategy_id`; no refetch needed |
+| `strategy_removed` | `{ "strategy_id": "<uuid>" }` | Row-level delete — drop that strategy from your local view |
+| `data_changed` | `{ "kind": "strategy" \| "position" \| "order" }` | Invalidation ping — refetch the named list; no row id is included |
+| `resync` | `{ "lagged": <integer> }` | This connection fell behind the broadcast buffer and some events were dropped — refetch everything |
+
+<Note>
+**Gotcha: deltas and invalidation pings overlap.** A single mutation may emit
+both a `strategy_updated` / `strategy_removed` **and** a
+`data_changed { kind: "strategy" }`. A client consuming the deltas should
+treat the matching `data_changed` as a no-op rather than a second edit.
+</Note>
+
+A `trigger` event:
+
+| Field | Type | Description |
+|---|---|---|
+| `strategy_id` | uuid | Strategy that fired |
+| `strategy_name` | string | Display name |
+| `market_id` | string | Market identifier |
+| `action_type` | string | Action taken, e.g. `"market_buy"` |
+| `trigger_price` | number | Price at evaluation |
+| `action_taken` | boolean | Whether an order was submitted |
+| `skip_reason` | string \| null | Why no order — see [List executions](#list-executions) |
+| `order_id` | uuid \| null | Order submitted, when `action_taken` is `true` |
+| `timestamp` | string | ISO 8601 |
+
+### Connection handling
+
+| Situation | What to do |
+|---|---|
+| No keep-alive comment for well over 15 seconds | The stream sends one roughly every 15 s — treat a longer gap as a dead connection and reconnect |
+| `401` or `403` on open | A missing or expired JWT fails the stream at open rather than mid-stream. Get a fresh token; reconnecting with the same one just fails again, so back off instead of retrying tightly |
+| `resync` event received | Refetch everything — some events were dropped |

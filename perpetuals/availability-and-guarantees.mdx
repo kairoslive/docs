@@ -1,0 +1,223 @@
+---
+title: "Availability and guarantees"
+description: "Live beta capabilities, integration contract, and failure guarantees"
+---
+
+> **⚠ Live in production, flag-gated, no SLA**
+>
+> The perpetual surface is behind a rollout flag, on in production and staging
+> today. Where it is off, every REST route returns `404` and the WebSocket
+> refuses a `perps_book` subscription — treat both as "not enabled here",
+> not as an outage.
+>
+> Beta contracts can change before general availability and **do not carry a
+> production SLA**.
+>
+> "Beta" is the maturity of the feature. It is not a promise that every
+> environment has the rollout flag enabled at the same time.
+
+What is deployed today, what the pipeline validates before you see a byte, how
+it fails, and what is explicitly out of scope. Read this before you decide how
+much to trust a frame.
+
+The beta is one implementation, not a collection of mock contracts. Venue
+discovery enrolls instruments, the streamer maintains live books, the canonical
+v2 protobuf is published through NATS, a compacted checkpoint is written for
+recovery, and the WebSocket gateway validates and fans out that same v2
+payload.
+
+## Live beta status
+
+Every item in this table is deployed as part of the beta:
+
+| Capability | Status | Contract |
+|---|---|---|
+| Venue and instrument discovery | Beta | Hyperliquid Perps, Polymarket Perps, and Kalshi Margin |
+| Automatic catalog enrollment | Beta | Refreshed every five minutes; new live instruments are discovered without waiting for a client subscription |
+| Live venue-backed order books | Beta | Direct, two-sided perpetual prices |
+| Canonical public book shape | Beta | `kairos.v2.BookSnapshot` |
+| Live broker stream | Beta | `md.v2.perpetual.book.snapshot.<venue>.<instrument>` |
+| Recovery checkpoint | Beta | Latest snapshot on `md.v2.perpetual.checkpoint.book.<venue>.<instrument>` |
+| Public WebSocket delivery | Beta | `perps_book` subscription; frame tag `0x40`, wire version `0x02` |
+| Initial WebSocket state | Beta | The gateway warms its cache from latest-per-subject checkpoints, then replays the latest validated snapshot on subscribe |
+| Exact values and identity | Beta | Canonical decimals plus a complete `InstrumentRef` on every snapshot |
+| Ownership, connection, and ordering fence | Beta | Monotonic `source_epoch` and per-instrument `sequence` |
+| Read-only REST snapshots | Beta | Composite venue snapshots remain available for polling integrations |
+
+The beta endpoint is:
+
+```text
+wss://stream.kairos.trade
+Sec-WebSocket-Protocol: kairos.marketdata.public.v1
+```
+
+Staging serves the same contract at `wss://staging-stream.kairos.trade` for
+integration testing.
+
+## Supported book venues
+
+| Subscribe `provider` | Canonical venue in v2 subjects | Instrument ID example | Native quantity |
+|---|---|---|---|
+| `hyperliquid_perps` | `hyperliquid` | `hl-mainnet-btc-usdt` | `base_asset` |
+| `polymarket_perps` | `polymarket_perps` | `poly-perps-mainnet-6` | `contracts` |
+| `kalshi_margin` | `kalshi_margin` | `kalshi-margin-mainnet-kxbtcperp` | `contracts` |
+
+Use the canonical `instrument_id` returned by `GET /perpetuals/instruments`. Do
+not send a display symbol such as `BTC` when the catalog returns a different
+ID.
+
+<Note>
+**The REST snapshot is addressed the other way round — by the venue-native
+id.** `BTC` there, `hl-mainnet-btc-usdt` here. See
+[Overview](/perpetuals/overview#identifier-asymmetry-rest-vs-websocket).
+</Note>
+
+## Coverage is not the whole venue
+
+Enrollment decides which books are warm, and it is not uniform:
+
+| Venue | Enrolled |
+|---|---|
+| Polymarket Perps | Full published catalog |
+| Kalshi Margin | Full published catalog |
+| Hyperliquid | A capped subset — 200 instruments by default, ranked by *notional* open interest (open interest × mark price) |
+
+Hyperliquid is capped because the adapter opens one socket per instrument and
+the venue limits connections per IP. Delisted assets are skipped, and two
+symbols that differ only by case collapse to one canonical id and occupy one
+slot.
+
+<Note>
+**A venue can be listed here and still be dark in your environment.**
+Enrollment sits behind a runtime rollout flag plus a per-provider enable
+flag. An instrument that is not enrolled has no live book and no checkpoint —
+and a subscription to it **succeeds and stays silent**.
+</Note>
+
+## What the book stream guarantees
+
+A delivered WebSocket snapshot has passed all of these checks:
+
+- the NATS subject, provider enum, and `InstrumentRef.instrument_id` agree
+- required instrument, asset-role, environment, integration, and source fields
+  are populated
+- prices and quantities are positive canonical `ExactDecimal` values
+- bids are strictly descending, asks are strictly ascending, and the best bid
+  is strictly below the best ask — a locked book is refused along with a
+  crossed one
+- at least one side has a level; a fully empty book is refused
+- `source_epoch`, `sequence`, and `received_time_ns` are nonzero, and
+  `event_time_ns` is either absent or nonzero
+- the feed declares `BOOK_FEED_MODE_SNAPSHOT_ONLY`
+- `aggregation` is `price`, `book_view_id` and `transport_sequence_domain` are
+  non-empty, and `max_depth` is at least the number of levels carried
+- `instrument_type` is `INSTRUMENT_TYPE_PERPETUAL` and the source context is
+  `SOURCE_MODE_DIRECT`
+- stale or duplicate sequence values are dropped within a source epoch, and an
+  older epoch is dropped outright
+
+The beta emits snapshots only. It does not dual-publish a v1 perpetual book and
+a v2 perpetual book. Prediction-market v1 channels are unaffected.
+
+## Failure behavior
+
+The pipeline fails closed:
+
+- an instrument absent from the canonical catalog is not published
+- catalog responses are revalidated and refreshed, including after new
+  auto-enrolled listings appear
+- a missing ownership epoch, empty or crossed book, invalid decimal, identity
+  mismatch, or malformed protobuf is dropped before public fan-out
+- checkpoint stream initialization is required when the beta is enabled; the
+  producer does not silently run without its recovery boundary
+- an owner or upstream-connection change advances the source epoch and starts a
+  new sequence lineage; a sequence regression inside one epoch is rejected
+
+> **⚠ Every one of these rejections is silent**
+>
+> There is no error frame for bad data. The frame is simply not fanned out.
+>
+> The only WebSocket errors a perpetual client sees are control-request
+> rejections, listed in
+> [Streaming and recovery](/perpetuals/streaming-and-recovery#subscribe-errors).
+>
+> Acknowledgment proves that the request is **valid**. It is not a freshness
+> guarantee, and — because the gateway does not check the instrument id against
+> the catalog — it is not proof that the instrument exists either. If a
+> subscription is acknowledged before the first snapshot is cached, the client
+> waits for the next live snapshot.
+
+## REST snapshot staleness fences
+
+The read-only snapshot also fails closed rather than serving old data. A
+composite that violates any of these returns `502 upstream` instead of a
+partially stale body:
+
+| Component | Maximum age | Maximum clock skew ahead |
+|---|---|---|
+| Snapshot fetch and book receive time | 30 s | 5 s |
+| Book event time and market-state event time | 60 s | 5 s |
+| Individual price observations | 24 h | 5 s |
+| Candle interval start | 2 h | 60 s |
+| Funding effective time | 24 h | 5 s for `final`, 24 h for `estimate` |
+| Funding calculated time | 5 min | 5 s |
+
+The composite fetch itself has a 12-second deadline across all upstream venue
+calls, and concurrent requests for the same `(venue, instrument, depth)` share
+one in-flight fetch.
+
+<Note>
+**A `502` from the snapshot can mean "the data was stale", not "the venue is
+down".** Retry with backoff rather than assuming an outage.
+</Note>
+
+## Recovery boundary
+
+The checkpoint subject stores the newest complete `BookSnapshot` for each venue
+and instrument. Internal consumers use it as the state boundary after a restart
+or sequence gap. Public WebSocket clients receive full replacement snapshots,
+so their recovery rule is simpler:
+
+1. Treat every `0x40 0x02` frame as a complete replacement.
+2. Track `(source_epoch, sequence)` per instrument.
+3. Accept a larger epoch and reset the local sequence.
+4. Within one epoch, accept only a strictly larger sequence.
+5. Reconnect if the stream becomes stale according to your own product limit.
+
+<Warning>
+**Do not merge books across venues, epochs, or `book_view_id` values.**
+</Warning>
+
+## Outside the public market-data beta
+
+Private balances, positions, orders, fills, authenticated venue feeds, and
+order entry are not part of this public market-data beta. Their design pages
+describe intended semantics, not callable endpoints — the canonical schema
+carries no message type for any of them. Retention, regional latency targets,
+rate limits for a generally available product, and an SLA will be published
+separately.
+
+Also defined in the schema but never published:
+
+- perpetual book deltas
+- public trades
+- trade and quote candles
+- market-state updates
+- funding-rate updates
+- public liquidations
+
+> **The book snapshot is the only v2 perpetual message on the wire.**
+> Everything else public reaches you through the
+> [REST snapshot](/perpetuals/overview#live-snapshot).
+
+> **There is no perpetual history API.** Every REST field is proxied live from
+> the venue at request time, and being enabled in production does not mean
+> Kairos stores a perpetual history you can backfill from. There is no
+> endpoint that serves one, for any venue. Treat the snapshot as a
+> point-in-time read and keep your own history.
+
+> **Market data can be delayed, unavailable, or differ from the price used by a
+> venue risk engine.** It is not an execution, margin, liquidation, or
+> investment guarantee.
+
+Next: [Streaming and recovery](/perpetuals/streaming-and-recovery).

@@ -1,0 +1,441 @@
+---
+title: "Portfolio & Balances"
+description: "Unified wallet balances, per-chain cash, and the portfolio summary that powers the dashboard total"
+---
+
+This page documents the **balance and portfolio** procedures: the unified wallet view (`wallet.getPortfolio`), the lower-level per-chain balances (`balances.getWalletBalances`), the per-venue spendable-cash view (`balances.getAllBalances`), and the PnL/stats summary (`portfolio.getSummary`) that the dashboard uses. Reach for it when you need to know how much cash an account holds, what its open positions are worth, or how to reproduce the dashboard's headline number.
+
+**Auth:** every procedure on this page accepts API keys with the **`position:read`** scope, not the general `read` scope. See [API Keys](/rpc/api-keys#scopes) for the full scope map.
+
+> **There is no single "cash + open positions" endpoint.** The Kairos
+> "portfolio value" a user sees on the dashboard is composed from two calls — a
+> cash number and an equity number. See [Reconstructing the dashboard
+> total](#reconstructing-the-dashboard-total) at the bottom; a bot that wants
+> the same number assembles it the same way the web app does. The equity half
+> no longer has to be summed client-side: `portfolio.getSummary` returns a
+> server-side `marketValue` over the user's **complete** position set.
+
+> **Monetary fields are strings unless noted**, to preserve decimal precision.
+> Parse them with a big-decimal library, not `parseFloat` / `float()`.
+
+## wallet.getPortfolio
+
+The **unified balance** view. Returns every Kairos-custodied wallet the user holds — personal (Kairos-custodied) wallets across all EVM chains + Solana, plus provider-bound trading accounts (e.g. the Polymarket deposit-wallet / Safe) — and a single `totalUsd` summing the USD value of all of them.
+
+This is the right call when you want "how much cash does this account hold, everywhere, in one number." It does **not** include the market value of open positions (those live in `positions.getPositions`).
+
+```
+GET https://rpc.kairos.trade/api/rpc/wallet.getPortfolio
+```
+
+**Access:** Invited · **Scope:** `position:read` · **Rate limit:** `queries` bucket (3600/min default)
+**Cache:** Per-chain balances are cached briefly. Pass `forceRefresh: true` to bust the cache (e.g. right after a transfer).
+
+### Input
+
+Input is optional — an empty body returns the cached view.
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `forceRefresh` | boolean \| null | No | `false` | Bust the balance cache and re-read every chain from the blockchain. Slower; use sparingly. |
+| `includeSolana` | boolean \| null | No | `false` | Opt the Solana leg into the aggregate. **Omitted, Solana is left out** unless the account has Kalshi credentials — the standing polls that fund this endpoint don't need it and it burns RPC quota. Pass `true` if your integration cares about SOL/USDC. |
+
+### Example — unified cash balance for a bot
+
+```python
+import httpx, json
+
+async def total_cash_usd(headers: dict) -> str:
+    async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+        r = await client.get(
+            "https://rpc.kairos.trade/api/rpc/wallet.getPortfolio",
+            params={"input": json.dumps({"json": {}}, separators=(",", ":"))},
+        )
+        r.raise_for_status()
+        body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"RPC error: {body['error']}")
+    return body["result"]["data"]["totalUsd"]
+```
+
+### Response
+
+```jsonc
+{
+  "totalUsd": "1284.56",            // unified USD across ALL wallets below (cash only)
+  "personal": {
+    "evmAddress": "0xabc...",       // shared across polygon/bsc/arbitrum/hyperliquid; null if not onboarded
+    "solana": {                     // omitted if the user has no Solana wallet
+      "chain": "solana",
+      "address": "Fxy...",
+      "tokens": [
+        { "symbol": "USDC", "contractAddress": "EPjF...", "balance": "10.000000", "usdValue": "10.00", "isNative": false },
+        { "symbol": "SOL",  "balance": "0.050000", "usdValue": "7.20", "isNative": true }
+      ]
+    },
+    "evmChains": [
+      {
+        "chain": "polygon",
+        "address": "0xabc...",
+        "tokens": [
+          { "symbol": "USDC", "contractAddress": "0x3c49...", "balance": "250.00", "usdValue": "250.00", "isNative": false },
+          { "symbol": "pUSD", "contractAddress": "0x9c4f...", "balance": "0.00",   "usdValue": "0.00",   "isNative": false },
+          { "symbol": "POL",  "balance": "3.10", "usdValue": "1.36", "isNative": true }
+          // USDC.e is included only when non-zero
+        ]
+      },
+      { "chain": "bsc",         "address": "0xabc...", "tokens": [ /* USDT, BNB */ ] },
+      { "chain": "arbitrum",    "address": "0xabc...", "tokens": [ /* USDC, ETH */ ] },
+      { "chain": "hyperliquid", "address": "0xabc...", "tokens": [ /* USDC (spot), USDC_PERP */ ] }
+    ]
+  },
+  "trading": [
+    {
+      "provider": "polymarket",
+      "kind": "deposit_wallet",
+      "displayName": "Polymarket",
+      "chain": "polygon",
+      "address": "0xproxy...",       // the Polymarket proxy / Safe address
+      "tokens": [
+        { "symbol": "pUSD", "contractAddress": "0x9c4f...", "balance": "256.00", "usdValue": "256.00", "isNative": false }
+        // USDC / USDC.e on the proxy appear here too, but only when non-zero
+      ],
+      "balanceUsd": "256.00",        // SPENDABLE trading balance (pUSD only) — see note
+      "canDeposit": true,
+      "canWithdraw": true
+    }
+  ],
+  "lastUpdated": 1718900000000        // Unix milliseconds
+}
+```
+
+### Field notes
+
+- **`totalUsd`** is the unified figure: the sum of every personal-chain token's `usdValue` plus each trading account's `balanceUsd`. It is rendered to 2 decimals and clamped to `>= 0`. It is **cash only** — it does not include open-position market value.
+- **`personal.evmAddress`** is shared across Polygon, BSC, Arbitrum, and Hyperliquid — one EVM key is derived per account, so all EVM chains use the same address. Solana has its own address under `personal.solana`.
+- **Hyperliquid** splits its USDC collateral into two token rows: `USDC` (spot, spendable on HL markets) and `USDC_PERP` (perps book; Arbitrum→HL bridge deposits land here and must be moved to spot before trading HL markets).
+- **`tokens[].usdValue`** is `"0.00"` when the token is unpriced. **`contractAddress`** is omitted for native gas tokens (`isNative: true`).
+- `trading` is always a JSON array (`[]` when the user has no provider trading accounts). Currently only Polymarket is wired; Kalshi / Opinion / Predict.fun cards will appear here as their custodial wallets land.
+
+### Gotchas
+
+<Note>
+**`trading[].balanceUsd` is the *spendable* balance, not the sum of
+`tokens`.** For Polymarket it is the proxy's **pUSD** only. Un-wrapped USDC /
+USDC.e sitting on the proxy are surfaced in `tokens` (so a client can offer a
+"wrap to pUSD" affordance) but are deliberately excluded from `balanceUsd`
+and `totalUsd` — the CLOB only spends pUSD, so counting un-wrapped stables
+would overstate buying power.
+</Note>
+
+---
+
+## balances.getWalletBalances
+
+The **lower-level, per-chain** balance read. Same underlying data as `wallet.getPortfolio`'s personal wallets, but shaped per chain and with an aggregate `buyingPower` figure (tradeable cash across all chains). Use this when you want raw per-chain token breakdowns or the single buying-power number, rather than the unified portfolio shape.
+
+```
+GET https://rpc.kairos.trade/api/rpc/balances.getWalletBalances
+```
+
+**Access:** Invited · **Scope:** `position:read` · **Rate limit:** `queries`
+**Cache:** Cached briefly per address.
+
+### Input
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `chain` | string \| null | No | `null` | Restrict to one chain: `"polygon"`, `"solana"`, `"bsc"`, `"arbitrum"`, `"hyperliquid"`. `null` returns all. |
+| `forceRefresh` | boolean \| null | No | `false` | Bust the per-address cache before reading. |
+| `includeSolana` | boolean \| null | No | `false` | Opt the Solana leg into the all-chains aggregate. Without it, Solana is fetched only when the account has an active `kalshi_offchain` credential (or you passed `chain: "solana"`, which always fetches). The gate fails open — a lookup error keeps the leg rather than hiding funds. |
+
+### Example
+
+```bash
+INPUT=$(jq -cn '{json:{chain:"polygon"}}')
+curl -G "https://rpc.kairos.trade/api/rpc/balances.getWalletBalances" \
+  --data-urlencode "input=$INPUT" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```jsonc
+{
+  "polygon": {
+    "pol": "3.10", "polUsdValue": "1.36",
+    "usdc": "250.00", "usdce": "0.00", "pusd": "0.00",
+    "totalUsdc": "250.00",                 // usdc + pusd (the EOA stable total)
+    "polymarketBuyingPower": "256.00",     // present only for Polymarket deposit-wallet users (proxy pUSD)
+    "proxyUsdc": "0.00"                     // native USDC on the proxy, when present
+  },
+  "solana":      { "sol": "0.05", "solUsdValue": "7.20", "usdc": "10.00", "usdcTokenAccount": "..." },
+  "bsc":         { "bnb": "0.00", "bnbUsdValue": "0.00", "usdt": "0.00" },
+  "arbitrum":    { "eth": "0.00", "ethUsdValue": "0.00", "usdc": "0.00" },
+  "hyperliquid": { "usdc": "0.00", "spotUsdc": "0.00", "perpUsdc": "0.00", "accountValue": "0.00" },
+  "buyingPower": "267.56",                 // aggregate tradeable cash USD across all chains
+  "lastUpdated": 1718900000000
+}
+```
+
+### Field notes
+
+- **`buyingPower`** sums each chain's stable + native-token USD. For a Polymarket **deposit-wallet** user, the Polygon contribution is the proxy `polymarketBuyingPower` (pUSD), **not** the EOA `totalUsdc` — the EOA stables aren't spendable on the CLOB. Sponsored POL is subtracted out.
+- **`polymarketBuyingPower`** and **`proxyUsdc`** are present only for deposit-wallet (V2) Polymarket users; they're `null`/absent otherwise.
+- `usdce` (bridged USDC.e) is **excluded** from `totalUsdc` and buying power — it must be wrapped to pUSD/USDC before it's tradeable.
+
+### Errors
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | `Invalid input: <detail>` — payload doesn't match the schema | Fix the payload |
+| `403` `FORBIDDEN` | `API access is disabled for <provider>` — API-key caller. The providers checked are derived from `chain`: `polygon` → `polymarket`, `bsc` → `predictfun`, `arbitrum`/`hyperliquid` → `hyperliquid`, `solana` → none, no `chain` → all three. | Pass the `chain` whose provider is still enabled |
+| `500` `INTERNAL_SERVER_ERROR` | `Unable to verify platform API access` — platform-access lookup failed, or an unrecognised `chain` resolved to an unknown provider | Check the `chain` spelling, then retry with backoff |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to query wallets` — wallet lookup failed | Retry with backoff |
+
+### Gotchas
+
+<Warning>
+**A `null` chain is not a zero balance.** Any chain the user hasn't onboarded
+— *or that failed to fetch* — comes back as `null` rather than failing the
+call. Don't assume a chain key is present, and don't read `null` as "no
+funds".
+</Warning>
+
+---
+
+## balances.getAllBalances
+
+The **per-venue spendable-cash** view: every chain (via the same fetch as `getWalletBalances`) plus the off-chain Kalshi balance, flattened into one list with a grand total. This is the closest thing to "the dashboard's cash number" available in a single call.
+
+```
+GET https://rpc.kairos.trade/api/rpc/balances.getAllBalances
+```
+
+**Access:** Invited · **Scope:** `position:read` · **Rate limit:** its own `balances_agg` bucket, **30/min** — far tighter than `queries`, because each call fans out across several chain RPCs plus the order-execution service. Poll it accordingly.
+
+### Input
+
+None.
+
+### Example
+
+```bash
+curl -G "https://rpc.kairos.trade/api/rpc/balances.getAllBalances" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```jsonc
+{
+  "venues": [
+    {
+      "venue": "polygon",              // polygon | solana | bsc | arbitrum | hyperliquid | kalshi
+      "label": "Polymarket (Polygon)",
+      "address": "0xproxy...",         // wallet address; the Kalshi API-key id for kalshi
+      "usdValue": "256.00",            // spendable USD, "%.2f"
+      "available": true
+    }
+  ],
+  "totalUsd": "267.56",
+  "lastUpdated": 1718900000000
+}
+```
+
+Each venue's `usdValue` is that venue's contribution to spendable cash, so the rows always sum to `totalUsd`.
+
+### Gotchas
+
+> **`available: false` silently lowers the total.** It means the venue is
+> configured but couldn't be read right now (e.g. the Kalshi balance call
+> failed, or an API-key caller with no session token). Its `usdValue` is then
+> `"0.00"` and it does **not** contribute to `totalUsd` — a partial outage
+> lowers the number rather than erroring. Check the flag before trusting the
+> total.
+
+> **A missing Kalshi row does not mean zero.** The Kalshi row appears only when
+> the account has an active Kalshi credential, and if that credential lookup
+> fails the row is **omitted** rather than marked unavailable.
+
+> **One disabled provider `403`s the whole call.** The provider gate checks
+> `polymarket`, `predictfun`, and `hyperliquid` on every call, plus `kalshi`
+> when a Kalshi credential exists. There's no filter to narrow it.
+
+---
+
+> There is also `balances.getBalanceForAddress` and `balances.getGasEstimate`. Both are `position:read`-scope queries on the `queries` bucket, like everything else on this page.
+>
+> `getBalanceForAddress` takes `{chain, address}` and returns `{chain, polygon|solana|bsc|arbitrum, lastUpdated}`. `chain` must be one of `"polygon"`, `"solana"`, `"bsc"`, `"arbitrum"` — **`"hyperliquid"` is not accepted here** and yields `400 BAD_REQUEST` (`chain must be 'polygon', 'solana', 'bsc', or 'arbitrum'`), as does an empty `address` (`address is required`). Ownership is verified against your account: an address you don't own returns `404 NOT_FOUND` (`Address not found for user`), never another user's balance. There is no `forceRefresh` on this procedure — the shared cache generation still invalidates it after any fund movement.
+
+---
+
+## portfolio.getSummary
+
+The **PnL / trading-stats summary** that powers the dashboard header tiles (net PnL, volume, win rate, ROI, open-position count) over a date range. This is the procedure the portfolio page calls for its performance numbers.
+
+It is **stats plus equity, not cash** — it returns realized PnL and trade aggregates, and alongside them a server-side mark-to-market valuation (`marketValue`, `unrealizedPnL`, `exposure`) computed over the user's **complete** position set. It does not return wallet cash.
+
+```
+GET https://rpc.kairos.trade/api/rpc/portfolio.getSummary
+```
+
+**Access:** InvitedWithToken · **Scope:** `position:read` · **Rate limit:** `queries`
+
+The `WithToken` part applies to browser callers, who must present a session token in addition to being logged in. API-key callers satisfy the level with the three `X-Api-*` headers alone — no session token, and no invite gate.
+
+### Input
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `dateRange` | string | No | `"30D"` | One of `"1D"`, `"7D"`, `"30D"`, `"YTD"`, `"ALL"`, or `"custom"`. |
+| `customStart` | ISO 8601 datetime \| null | No | `null` | Used when `dateRange="custom"`. |
+| `customEnd` | ISO 8601 datetime \| null | No | `null` | Defaults to now when omitted. Applies to **every** range, not just `custom`, and is the anchor the relative windows count back from. |
+
+### Example
+
+```bash
+INPUT=$(jq -cn '{json:{dateRange:"7D"}}')
+curl -G "https://rpc.kairos.trade/api/rpc/portfolio.getSummary" \
+  --data-urlencode "input=$INPUT" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```jsonc
+{
+  "netPnL": 412.55,             // == realizedPnL (USD) over the window
+  "realizedPnL": 412.55,        // closed-position PnL in the window
+  "unrealizedPnL": 61.20,       // mark-to-market PnL over ALL held positions (not windowed)
+  "marketValue": 1043.88,       // mark-to-market value of everything held (not windowed)
+  "exposure": 982.68,           // capital at risk: cost basis of unresolved holdings, net of hedges
+  "volume": 18204.10,           // notional traded in the window (USD)
+  "fees": 36.41,                // total fees in the window (USD)
+  "winRate": 61.5,              // percent of closed positions that were profitable
+  "winningPositions": 24,
+  "losingPositions": 15,
+  "totalPositions": 39,         // closed positions with non-zero PnL in the window
+  "openPositionCount": 7,       // current open positions (point-in-time, not windowed)
+  "marketsTraded": 53,          // distinct markets ever traded (all-time)
+  "biggestWin": 88.20,
+  "roiPercent": 2.27,           // realizedPnL / volume * 100
+  "avgFillSizeMedian": 42.00,
+  "avgFillSizeMean": 51.30,
+  "fillsCount": 355,
+  "dateRange": { "start": "2026-05-21T00:00:00Z", "end": "2026-06-20T00:00:00Z" }
+}
+```
+
+Numeric fields here are JSON **numbers** (not strings) — these are display aggregates, not on-chain amounts.
+
+### Field notes
+
+- `openPositionCount` and `marketsTraded` are point-in-time / all-time, not bounded by `dateRange`. `volume`, `fees`, `realizedPnL`, `netPnL`, `winRate`, `roiPercent`, and the fill-size stats respect the window.
+- `roiPercent` is realized-PnL-over-volume (`realizedPnL / volume * 100`), not a capital-weighted return. It is `0` when `volume` is `0`.
+- `winRate` is `winningPositions / (winningPositions + losingPositions) * 100`, and `totalPositions` is that same denominator — not a count of all positions.
+- `marketValue` counts open positions plus resolved-but-unredeemed winners. Redeemed positions (already cash), dust, and resolved losers contribute `0`.
+- `exposure` is the cost basis of held positions in **unresolved** markets, minus the guaranteed payout of hedged pairs — matched shares on both sides of a binary market pay $1/pair regardless of outcome, so per market `atRisk = max(0, cost − min(side0Shares, side1Shares))`.
+
+### Errors
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | `Invalid input: <detail>` — payload doesn't match the schema (e.g. a non-datetime `customStart`) | Fix the payload |
+| `403` `FORBIDDEN` | `API access is disabled for <provider>` — API-key caller, and API access is off for any provider the user trades on | Wait for access to be re-enabled; there is no filter to narrow the gate here |
+| `500` `INTERNAL_SERVER_ERROR` | `Unable to verify platform API access` — platform-access lookup failed | Retry with backoff |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to fetch positions` / `Failed to fetch trades` / `Failed to fetch PnL trades` / `Failed to calculate portfolio PnL` / `Failed to resolve portfolio market IDs` — the corresponding query or canonicalisation step failed | Retry with backoff |
+
+### Gotchas
+
+> **`dateRange` is not validated against an enum.** Any unrecognised value
+> (including a typo) falls through to the `ALL` branch, which looks back 5
+> years, and `"custom"` without a `customStart` does the same. Check your
+> spelling — you get a plausible-looking answer for the wrong window rather
+> than a `BAD_REQUEST`.
+
+> **`marketValue`, `unrealizedPnL`, and `exposure` ignore `dateRange`
+> entirely.** They are point-in-time over the complete position set. This is
+> deliberate: summing per-row `currentValue` from a paginated
+> `positions.getPositions` silently undercounts large accounts, so the
+> aggregate is computed server-side over every row.
+
+> **A slow price feed depresses PnL rather than hiding holdings.** The price
+> fan-out is capped at 3 s. A position whose live quote doesn't resolve in time
+> is marked **to cost**, not to zero — so `unrealizedPnL` drifts toward `0`
+> instead of positions vanishing from `marketValue`.
+
+> **The provider gate here is account-wide.** It checks **every** platform the
+> user trades on, with no filter to narrow it. If any one is disabled for API
+> access, the whole call fails.
+
+---
+
+## Reconstructing the dashboard total
+
+The big "portfolio value" on the web dashboard is **not** a single endpoint — it's assembled client-side as:
+
+```
+portfolioValue = openPositionsMarketValue + walletCash
+```
+
+where:
+
+- **`openPositionsMarketValue`** = `portfolio.getSummary.marketValue` (this is the off-chain / market-priced component). Prefer this over summing `currentValue` across `positions.getPositions` yourself: the summary values the **complete** position set, whereas a paginated positions read only covers the page you fetched — the exact bug that made large accounts read low.
+- **`walletCash`** = the user's **spendable** cash. `balances.getAllBalances.totalUsd` is that figure, and it is API-key accessible with `position:read`. It applies buying-power semantics — for a Polymarket deposit-wallet user the Polygon contribution is the proxy's pUSD only, **not** the EOA stables — and additionally covers the off-chain Kalshi balance, which no per-chain read can see.
+
+`balances.getWalletBalances.buyingPower` is the on-chain-only version of the same figure: identical buying-power semantics, but no Kalshi leg. Use it when you don't need Kalshi and want the cheaper `queries` bucket instead of `balances_agg`'s 30/min. Either way, use one of those two — not `wallet.getPortfolio.totalUsd` — if you want to match the dashboard's cash number.
+
+<Note>
+**`wallet.getPortfolio.totalUsd` is a different quantity.** It sums *every*
+personal-wallet token's USD value (including EOA USDC/stables and gas tokens)
+plus each trading account's spendable `balanceUsd`. For a deposit-wallet user
+holding EOA USDC alongside their proxy, `totalUsd` will read **higher** than
+the dashboard cash, because the dashboard counts only spendable (proxy) pUSD
+on Polygon. Pick `totalUsd` when you want "all cash held everywhere"; pick
+`buyingPower` when you want "cash I can trade with right now."
+</Note>
+
+So there are two valid net-worth recipes, depending on which cash definition you want:
+
+```python
+async def net_worth_usd(headers: dict) -> float:
+    # "All cash held everywhere" + open-position market value.
+    # For dashboard-matching spendable cash, swap total_cash_usd() for
+    # balances.getAllBalances and read result["totalUsd"].
+    cash = float(await total_cash_usd(headers))     # wallet.getPortfolio.totalUsd
+    summary = await get_portfolio_summary(headers)  # portfolio.getSummary
+    return cash + summary["marketValue"]            # server-side, all positions
+```
+
+There is deliberately no server-side "net worth" endpoint — keeping cash and positions as separate reads lets callers choose the cash definition (all-held vs. spendable, with or without Kalshi) rather than baking one convention into the API.
+
+---
+
+## Other portfolio procedures
+
+The rest of the `portfolio.*` router is API-key accessible with `position:read` on the `queries` bucket, and all of it shares `getSummary`'s account-wide provider gate and its `dateRange` / `customStart` / `customEnd` inputs (with the same unvalidated-fallthrough-to-`ALL` behaviour).
+
+| Procedure | Extra input | Returns |
+|---|---|---|
+| `portfolio.getChartData` | `metric`: `"pnl"` (default), `"volume"`, or `"fees"` — anything else is treated as `"fees"` | `{dataPoints: [{timestamp: "YYYY-MM-DD", value}], metric}`. `value` is **cumulative** across the window, not the daily delta. Days with no activity are absent, and a point for today is appended when the window includes it. |
+| `portfolio.getActivity` | `statuses: string[]`, `limit` (default 50, max 100), `offset` | `{activity: [...], total, hasMore}`. A merged, timestamp-descending feed of order fills (`type`: `"Buy Fill"` / `"Sell Fill"`), wallet deposits/withdrawals (`isWalletTransaction: true`, with `tokenSymbol` / `amount` / `chain`), and redemptions. `fee` is the Kairos platform fee and `exchangeFee` the venue's — reported separately; `netTotal` folds both in. |
+| `portfolio.getSettlements` | `limit` (default 50, max 100), `offset`. `dateRange` defaults to `"ALL"` here, not `"30D"`. | `{settlements: [...], total, hasMore}`. Each row carries `result`: `"Won"`, `"Lost"`, `"Sold"`, `"Redeemed"`, or `"Refunded"`, plus `settledShares`, `payout`, `totalCost`, `realizedPnL`, `resolvedAt`, `redeemedAt`. |
+| `portfolio.getDailyPnLBreakdown` | — | Per-day `{totalPnL, totalVolume, markets: [{marketId, tokenId, outcome, pnl, volume}]}`. |
+
+All four return `500 INTERNAL_SERVER_ERROR` with a procedure-specific message (`Failed to fetch activity`, `Failed to fetch chart data`, `Failed to fetch settlements`, `Failed to fetch daily PnL breakdown`, or `Failed to resolve portfolio market IDs`) when an underlying query fails, and `400 BAD_REQUEST` (`Invalid input: <detail>`) on a schema mismatch.
+
+<Note>
+**Two pagination caveats.** `getActivity` merges its three sources in memory
+and paginates the merged list, so `total` is the sum of the source row counts
+— it can drift slightly from the number of rows you can actually page through
+once duplicate wallet transactions are collapsed. `getSettlements` paginates
+in SQL but derives `total` from a separate count, falling back to the page
+length if that count fails.
+</Note>

@@ -1,0 +1,384 @@
+---
+title: "Positions"
+description: "Read, recalculate, and close positions for the authenticated user"
+---
+
+The `positions.*` router is the **authoritative source** for a user's current holdings across every venue Kairos routes to — `polymarket`, `kalshi` (with `kalshi_offchain` canonicalised to it), `predictfun`, `hyperliquid`, and `opinion`. Reach for it when a bot needs to know what it currently holds, what a position is worth, or how to close one. It reads from the Kairos database — the same positions state that drives the UI's portfolio screen and the bot engine's fill tracking — so it reflects any fill the moment our executor records it.
+
+For programmatic bots / liquidation scripts, prefer `positions.getPositions` over the public `GET /trader-stats/profile/{wallet_address}` REST endpoint. That REST endpoint proxies third-party on-chain indexing for Polymarket and can lag or miss positions that were settled off-exchange (walk-the-book partial fills, redeemed positions, etc.).
+
+**Auth:** `getPositions` and `getPosition` accept an API key with the **`position:read`** scope (not the general `read` scope — see [API Keys](/rpc/api-keys#scopes)); `closePosition` requires the `trade` scope. Pass your credential as the `X-Client-Id` / `X-Api-Key` / `X-Api-Secret` headers. Position management/maintenance procedures are not exposed to API keys.
+
+## positions.getPositions
+
+List the authenticated user's positions across all linked wallets.
+
+```
+GET https://rpc.kairos.trade/api/rpc/positions.getPositions
+```
+
+**Access:** Invited — API key with the `position:read` scope (API keys skip the invite gate) · **Rate limit:** `queries` bucket (3600/min default)
+
+### Input
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `platform` | string \| null | No | `null` | Filter by provider: `"polymarket"`, `"kalshi"`, `"kalshi_offchain"`, `"predictfun"`, `"hyperliquid"`, `"opinion"` |
+| `marketId` | string \| null | No | `null` | Filter to a single market |
+| `onlyOpen` | boolean | No | `true` | Only return positions with non-zero net size |
+| `includeResolved` | boolean | No | `false` | Include resolved markets (redeemable + already-redeemed) |
+| `limit` | integer | No | `50` | Page size. `<= 0` falls back to `50`; anything above `100` is clamped to `100`. |
+| `offset` | integer | No | `0` | Pagination offset. Negative values are rejected with `BAD_REQUEST`, not clamped. |
+| `minPositionSize` | number | No | `0.001` | Drop positions with `\|netSize\| < this`. Use `0` to include dust. |
+
+There is no `checkRedeemable` input — `redeemable` is read from stored position state, never probed on-chain per request.
+
+### Example — find stuck Polymarket positions for a bot
+
+```python
+import httpx, json
+
+async def list_stuck_positions(headers: dict) -> list[dict]:
+    # headers = {"X-Client-Id": ..., "X-Api-Key": ..., "X-Api-Secret": ...}
+    payload = {"json": {
+        "platform": "polymarket",
+        "onlyOpen": True,
+        "includeResolved": False,
+        "minPositionSize": 0.01,  # ignore dust
+        "limit": 100,
+    }}
+    async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+        r = await client.get(
+            "https://rpc.kairos.trade/api/rpc/positions.getPositions",
+            params={"input": json.dumps(payload, separators=(",", ":"))},
+        )
+        r.raise_for_status()
+        body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"RPC error: {body['error']}")
+    return body["result"]["data"]["positions"]
+```
+
+### Response
+
+```jsonc
+{
+  "positions": [
+    {
+      "id": "0192abcd-...",           // Kairos position UUID
+      "userId": "0192efgh-...",
+      "platform": "polymarket",
+      "chainId": "137",
+      "marketId": "1500754",           // provider market ID
+      "tokenId": "66581...",           // CLOB token ID for polymarket
+      "outcome": "Yes",                // human-readable outcome label
+      "holdingWallet": "0xabc...",     // wallet the shares sit on; "" on non-routing venues
+      "netSize": "89.07",              // signed share count (string for precision)
+      "avgEntryPrice": "0.942",        // dollar avg entry price
+      "costBasis": "83.896",           // total USD paid to acquire current netSize
+      "totalFees": "0.0419",
+      "realizedPnL": "0",              // USD, closed PnL only
+      "firstEntryAt": "2026-04-14T05:51:57.426849Z",
+      "lastTradeAt": "2026-04-14T05:51:59.106446Z",
+      "updatedAt": "2026-04-14T05:52:00.000000Z",
+      "conditionId": "0x0f5a...",
+      "marketResolved": false,
+      "redeemable": false,
+      "redeemedAt": null,
+      "botId": null,
+      "botName": null,
+      "currentPrice": 0.951,           // live mid from LVC / SDK cache
+      "currentValue": 84.71,
+      "unrealizedPnL": 0.811,
+      "unrealizedPnLPercent": 0.967,   // PERCENT, not a fraction: upnl / |costBasis| * 100
+
+      // Metadata-cache enrichment — all omitted when the cache misses
+      "marketTitle": "Will X happen?",
+      "eventTitle": "Some event",
+      "image": "https://...",
+      "category": "Politics",
+      "endDate": "2026-11-03T00:00:00Z",
+      "marketStatus": "open"
+    }
+  ],
+  "total": 12,
+  "hasMore": false
+}
+```
+
+`hasMore` is computed as `offset + limit < total`. `total` is the count of matching rows, resolved from a `COUNT` query only when the first page is full or `offset > 0`; otherwise it is the returned row count.
+
+### Field notes
+
+- `netSize`, `avgEntryPrice`, `costBasis`, `totalFees`, `realizedPnL` are **strings** to preserve decimal precision. Parse with a big-decimal library, not `parseFloat`.
+- `unrealizedPnLPercent` is a **percentage** (`unrealizedPnL / |costBasis| * 100`), and is `0` when `costBasis` is `0`.
+- `holdingWallet` identifies which wallet holds the shares on venues that route per wallet. It is `""` on venues that don't.
+- `netSize < 0` means a **SELL-to-open** (short) position. Kairos treats shorts as synthetic; on Polymarket this manifests as owning the opposite outcome's shares. When closing, send the absolute quantity.
+- `marketResolved = true` with `redeemable = true` means the user won but hasn't redeemed yet. Redemption is performed by the order-execution service, not the RPC API.
+- `marketResolved = true` with `redeemable = false` and `netSize != 0` means the user lost (worthless shares). These won't appear in `onlyOpen=true` results.
+
+### Errors
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | `Invalid input: <detail>` — input isn't valid JSON for the schema (e.g. `limit` as a string) | Fix the payload types |
+| `400` `BAD_REQUEST` | `offset must not be negative` — `offset < 0` | Use `offset >= 0` |
+| `403` `FORBIDDEN` | `API access is disabled for <provider>` — API-key caller, and API access is off for a provider this request touches | Narrow the `platform` filter to a provider that is enabled |
+| `500` `INTERNAL_SERVER_ERROR` | `Unable to verify platform API access` — the platform-access lookup failed, or `platform` names a provider the registry doesn't know | Check the `platform` spelling, then retry with backoff |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to fetch positions` — the position query failed | Retry with backoff |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to resolve position market IDs` — legacy Polymarket market-ID canonicalisation failed | Retry with backoff; report if persistent |
+
+### Gotchas
+
+> **Price fields are all-or-nothing, and can be `null`.** `currentPrice`,
+> `currentValue`, `unrealizedPnL`, and `unrealizedPnLPercent` may be `null`
+> when no quote resolves for the token (fresh markets, resolved markets, Kalshi
+> off-hours). They are all four null together. Your code must handle the null
+> case.
+
+> **The enrichment fields are absent, not empty, on a cache miss.**
+> `marketTitle`, `eventTitle`, `image`, `category`, `endDate`, and
+> `marketStatus` come from the market-metadata cache and are **omitted
+> entirely** on a miss. The cache is deliberately not consulted for resolved
+> markets, and the lookup is hard-capped (600 ms by default) so a cold cache
+> never stalls the read. Treat all of them as optional, never as a signal about
+> the position.
+
+> **The provider gate widens without a `platform` filter.** With no `platform`
+> filter, an API-key request checks **every** provider the user holds positions
+> on, and again over the providers actually returned. One disabled provider
+> fails the whole call. Pass the narrowest `platform` filter you can when you
+> only need one venue.
+
+> **Don't fall back to trader-stats when this call is slow.** The trader-stats
+> REST endpoint (`GET /trader-stats/profile/{wallet}`) caches responses keyed
+> by wallet + query params. If a transient upstream outage causes a zero-volume
+> response to be cached, subsequent calls can keep seeing `total_volume: 0`
+> until the cache refreshes. `positions.getPositions` reads live position state
+> rather than that cached proxy, so it is not subject to that staleness.
+
+---
+
+## positions.getPosition
+
+Fetch a single position by ID.
+
+```
+GET https://rpc.kairos.trade/api/rpc/positions.getPosition
+```
+
+**Access:** Invited · **Scope:** `position:read` · **Rate limit:** `queries`
+
+### Input
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `positionId` | string (UUID) | Yes | — | Kairos position UUID from `positions.getPositions[].id`. Must be a well-formed UUID. |
+
+### Example
+
+```bash
+INPUT=$(jq -cn --arg id "$POSITION_ID" '{json:{positionId:$id}}')
+curl -G "https://rpc.kairos.trade/api/rpc/positions.getPosition" \
+  --data-urlencode "input=$INPUT" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+Same shape as one `positions[]` entry from `getPositions`, enriched with current price and PnL — returned **bare**, not wrapped in a `positions` array. The metadata-cache enrichment fields are not populated on this path, so `marketTitle` and friends are absent.
+
+### Errors
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | `Invalid input: <detail>` or a UUID validation message — malformed payload, or a `positionId` that isn't a UUID | Send the `id` exactly as `getPositions` returned it |
+| `403` `FORBIDDEN` | `API access is disabled for <provider>` — API-key caller, API access off for the position's provider | Wait for access to be re-enabled |
+| `404` `NOT_FOUND` | `Position not found` — the ID doesn't exist **or** belongs to another user | Re-read the ID from `getPositions` |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to fetch position` / `Failed to resolve position market ID` — query or canonicalisation failure | Retry with backoff |
+
+<Note>
+**404 is deliberately ambiguous.** "Doesn't exist" and "isn't yours" return
+the same `Position not found`, so position IDs can't be enumerated. Note that
+`closePosition` makes the opposite choice and returns `403` for another
+user's position.
+</Note>
+
+---
+
+## positions.closePosition
+
+Derive the order parameters needed to close an existing position. The handler validates ownership, reads the position's `netSize`, and returns a ready-to-submit order spec — side (`SELL` for longs, `BUY` for shorts), size (`|netSize|`), and the market/token identifiers.
+
+<Note>
+**It does not place the order.** `closePosition` only computes the spec; you
+submit it yourself to the order execution service. It rejects with
+`400 "Position is already closed"` when `netSize == 0`.
+</Note>
+
+```
+POST https://rpc.kairos.trade/api/rpc/positions.closePosition
+```
+
+**Access:** InvitedMutation · **Scope:** `trade` · **Rate limit:** `mutations` bucket (1800/min default)
+
+**This is the only order-related mutation on the RPC server.** There is no `orders.submitOrder` / `orders.cancelOrder` RPC procedure — submitting and cancelling orders are REST endpoints on the **order execution service** (`https://execution.kairos.trade/`), authenticated with the same three API-key headers under the `trade:execute` scope. See [API Keys](/rpc/api-keys#tradeexecute-execution-mutations) for the endpoint list. `closePosition`'s `orderData` is shaped for that service but uses different field names — see the example below.
+
+### Input
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `positionId` | string (UUID) | Yes | — | Kairos position UUID. Only checked for non-emptiness here — unlike `getPosition`, it is not UUID-validated. |
+| `orderType` | string | No | `"market"` | Echoed verbatim into `orderData.orderType`. An empty value defaults to `"market"`; no other validation is applied. |
+| `limitPrice` | number \| null | No | `null` | Dollar price (e.g. `0.95`). Copied verbatim into `orderData.price` and **not validated** — omitting it on a limit close yields `"price": null`. |
+
+### Example — close every open position
+
+`closePosition` runs on the RPC server (`trade` scope); the actual submission runs on the **order execution service** (`trade:execute` scope) with **snake_case** field names, so `orderData` must be translated rather than forwarded as-is:
+
+```python
+# headers = {"X-Client-Id": ..., "X-Api-Key": ..., "X-Api-Secret": ...}
+# closePosition requires `trade`; submitting to order execution requires `trade:execute`.
+positions = await list_stuck_positions(headers)
+for p in positions:
+    payload = {"json": {"positionId": p["id"], "orderType": "market"}}
+    async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+        r = await client.post(
+            "https://rpc.kairos.trade/api/rpc/positions.closePosition",
+            json=payload,
+        )
+        r.raise_for_status()
+        order_data = r.json()["result"]["data"]["orderData"]
+
+        # Translate the RPC's camelCase orderData into the order execution
+        # service's snake_case SubmitOrderRequest — the two are not the
+        # same shape (orderType -> kind, size -> quantity, platform -> exchange_id).
+        submit_body = {
+            "exchange_id": order_data["platform"],
+            "market_id":   order_data["marketId"],
+            "token_id":    order_data["tokenId"],
+            "outcome":     order_data["outcome"],
+            "side":        order_data["side"],
+            "kind":        order_data["orderType"],
+            "quantity":    order_data["size"],
+            # orderData["price"] is null here — closePosition echoes limitPrice
+            # and never derives a mark. Supply a live same-outcome price.
+            "price":       order_data["price"] or await current_bid(p),
+        }
+        submit = await client.post(
+            "https://execution.kairos.trade/orders",
+            json=submit_body,
+        )
+        submit.raise_for_status()
+        print(f"Close submitted for {p['marketId']}: {submit.json()}")
+```
+
+### Response
+
+```jsonc
+{
+  "success": true,
+  "orderData": {
+    "platform":  "polymarket",
+    "chainId":   "polygon",
+    "marketId":  "1349156",
+    "tokenId":   "34215103...",
+    "outcome":   "yes",
+    "side":      "SELL",           // "SELL" for netSize > 0, "BUY" for netSize < 0
+    "orderType": "market",         // your orderType, echoed
+    "size":      0.010766,         // |netSize|, a JSON number
+    "price":     null              // your limitPrice, echoed — null if you didn't send one
+  }
+}
+```
+
+### Errors
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | `Invalid input: <detail>` — malformed payload | Fix the payload |
+| `400` `BAD_REQUEST` | `positionId is required` — empty or missing `positionId` | Send a non-empty `positionId` |
+| `400` `BAD_REQUEST` | `Position is already closed` — `netSize == 0` | Drop it from your close loop |
+| `403` `FORBIDDEN` | `You do not have access to this position` — the position exists but belongs to another user | Re-read the ID from `getPositions` |
+| `403` `FORBIDDEN` | `API access is disabled for <provider>` — API-key caller, API access off for the position's provider | Wait for access to be re-enabled |
+| `404` `NOT_FOUND` | `Position not found` — no such position | Check the ID |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to fetch position` — lookup failure | Retry with backoff |
+
+### Gotchas
+
+<Note>
+**`orderData.price` is exactly whatever you passed as `limitPrice`.** The
+server does not look up a mark, a bid, or a mid. For a market close it will be
+`null` unless you supply one. When you submit the derived order to the order
+execution service, you must fill in a live same-outcome executable price
+yourself — the current bid for the held outcome is the usual choice. Kairos
+rejects missing prices at submission time and does not infer prices from
+another outcome.
+</Note>
+
+---
+
+## positions.recalculatePosition
+
+Force-recompute a position's `netSize`, `avgEntryPrice`, `costBasis`, and `realizedPnL` from the underlying trade history. Useful when fills arrived out-of-order or a fix has been applied to the reconciler.
+
+```
+POST https://rpc.kairos.trade/api/rpc/positions.recalculatePosition
+```
+
+**Access:** InvitedMutation · **Rate limit:** `mutations` · **Not available to API keys** — web app (session auth) only.
+
+### Input
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `platform` | string | Yes | — | Provider id. **Rejected** for venues that key positions on a holding wallet — see the errors below. |
+| `marketId` | string | Yes | — | Provider market ID |
+| `tokenId` | string | Yes | — | CLOB token ID (polymarket) or market+outcome key |
+
+### Response
+
+```jsonc
+{ "success": true, "position": { /* the re-read position row */ } }
+```
+
+`position` is omitted (leaving `{"success": true}`) if the read-back after the upsert fails.
+
+### Errors
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | `platform, marketId, and tokenId are required` — any of the three empty | Supply all three |
+| `400` `BAD_REQUEST` | `<platform> positions are keyed on the wallet that holds them…` — the venue routes positions per holding wallet, and this recalculation is wallet-blind | Use the venue sync (e.g. `syncFromPredictfun`) instead |
+| `404` `NOT_FOUND` | `No filled orders found for this market/token` — nothing to fold | Verify the market/token identifiers |
+| `500` `INTERNAL_SERVER_ERROR` | `Failed to query orders` / `Failed to recalculate position` — query or upsert failure | Retry with backoff |
+
+<Note>
+**Why the wallet-routed venues refuse.** A wallet-blind recalculation on a
+venue that keys positions per holding wallet would create a phantom,
+unsellable row, so it is rejected rather than attempted.
+</Note>
+
+---
+
+## Other maintenance mutations
+
+These exist on the router and the web app uses them, but like `recalculatePosition` **none accept API keys**. Listed so callers aren't surprised by a `403`:
+
+| Procedure | Input | Purpose |
+|---|---|---|
+| `positions.updatePosition` | `{platform, marketId, tokenId}` | Proxies a single-position recalculation to the Python API. Returns `{"success": true}`. |
+| `positions.backfillPositions` | none | Recalculates every market the user has filled orders in. Returns `{"success": true, "positionsUpdated": <n>}`; individual failures are skipped, not surfaced. |
+| `positions.syncFromPolymarket` | none | Reconciles Polymarket positions against on-chain truth. |
+| `positions.syncFromPredictfun` | none | Same for predict.fun — the correct tool for a wallet-routed venue where `recalculatePosition` refuses. |
+| `positions.resyncOnchainShares` | `{venue}` (`polymarket` \| `predictfun`) | The Danger Zone "expecting a transfer?" resync: reads the caller's on-chain CTF balances and forces stored sizes to match (netSize only — PnL is rewritten only when the trade replay reproduces the on-chain size). Heavily rate-limited: `expensive` bucket plus a 10-minute per-user-per-venue cooldown and a 6/day cap, returned as `{"status": "rate_limited", "retryAfterSeconds": <n>}` rather than an error. Success returns `{"status": "applied", "summary": {checked, matched, updated, zeroed, created, skipped}, "cooldownSeconds"}`. |
+
+All five are `InvitedMutation` and require session auth plus a CSRF token; all but `resyncOnchainShares` sit on the `mutations` bucket.
+
+<Note>
+**Redemption is not on this router.** Redeeming a resolved winner is owned
+end-to-end by the order-execution service, which runs the on-chain redeem and
+writes the position result atomically. There is no `positions.redeem`.
+</Note>

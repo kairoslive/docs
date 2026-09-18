@@ -1,0 +1,373 @@
+---
+title: "Search"
+description: "Full-text market and event search, autocomplete, and simple/navbar search endpoints"
+---
+
+Search markets and events across all supported exchanges with full-text queries, filtering, sorting, and autocomplete. Use these endpoints to turn user-typed text — or a pasted venue URL — into market identifiers you can then trade or chart.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+All paths on this page are relative to that host.
+
+## Authentication
+
+Each endpoint below is annotated `x-kairos-auth: api-key`. That means you send API-key credentials as three headers — `X-Client-Id`, `X-Api-Key`, and `X-Api-Secret`. A first-party session JWT or an admin secret is accepted instead; sending no credentials at all returns `401 Authentication required (JWT token / API key / admin secret)`. No scope is required on any search endpoint.
+
+Session-JWT callers additionally pass an invite gate (`403 Invite required` if they haven't); API-key and admin-secret callers bypass it.
+
+Every endpoint on this page shares the same `search` rate-limit group — 60 requests/minute by default.
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+<Note>
+**Gotcha:** `results[].price` is not on one scale. Top-level rows are cents (0–100); sibling rows inside `groups[].markets` are 0–1. See [Price scale](#price-scale) before you render a price.
+</Note>
+
+## Search markets
+
+```
+GET /search/markets
+```
+
+Full-text search over markets, returning one flat scored list.
+
+`x-kairos-auth: api-key` (any valid credentials — no scope required), 60 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `q` | string | Yes | — | 1–200 chars. Search query text |
+| `limit` | integer | No | `50` | 1–100. Max results |
+| `provider` | string | No | — | An active provider id. Filter by provider (see [Provider parameter alias](#provider-parameter-alias)) |
+| `include_expired` | boolean | No | `false` | Include expired/closed markets |
+| `statuses` | string[] | No | — | Repeatable. Market status filter, passed through unvalidated (e.g. `open`, `closed`, `settled`) |
+| `categories` | string[] | No | — | Repeatable. Category filter |
+| `tags` | string[] | No | — | Repeatable. Platform tag-slug filter |
+
+```bash
+curl "https://data.kairos.trade/search/markets?q=trump%202028&limit=10" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "results": [
+    {
+      "market_id": "KXPRES-28-DJT",
+      "provider_id": 1,
+      "provider": "kalshi",
+      "name": "Will Trump win in 2028?",
+      "status": "open",
+      "relevance_score": 87.3
+    }
+  ],
+  "meta": {
+    "query": "trump 2028",
+    "returned": 1,
+    "requested": 10,
+    "query_time_ms": 12.4,
+    "include_expired": false,
+    "provider_id": null
+  }
+}
+```
+
+The `results[]` row above is abridged. Every row is the full search-result record and always carries these keys: `market_id`, `provider_id`, `provider`, `event_id`, `event_name`, `name`, `symbol`, `category`, `status`, `expires_at`, `relevance_score`, `volume_24h`, `outcome_label`, `series_key`, `series_title`, `text_score`, `business_score`, `penalty`, `price`, `volume_1h`, `liquidity`, `image`, `icon`.
+
+| Field | Type | Description |
+|---|---|---|
+| `results[].market_id` | string | Market identifier |
+| `results[].provider_id` | integer | Numeric provider id (1=kalshi, 2=polymarket, 3=opinion, 8=predictfun) |
+| `results[].name` | string \| null | Market title |
+| `results[].relevance_score` | float | Composite score: `text_score` + `business_score` − `penalty` (each also returned separately) |
+| `results[].price` | float \| null | Best-effort price from the discover cache — see [Price scale](#price-scale) |
+| `meta.returned` | integer | Result count **after** provider-visibility filtering |
+| `meta.requested` | integer | The `limit` that was requested |
+| `meta.provider_id` | string \| null | The normalized (lower-cased) provider filter that was applied, or `null` |
+| `meta.include_expired` | boolean | Echoes the applied `include_expired` flag |
+
+## Search markets and events
+
+```
+GET /search/markets-and-events
+```
+
+Runs market and/or event search depending on `type`, merges both result sets, sorts by `relevance_score` descending, and truncates to `limit`. Same provider-visibility filtering and proxy short-circuit as `/search/markets` above.
+
+`x-kairos-auth: api-key`, 60 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `q` | string | Yes | — | 1–200 chars. Search query text |
+| `limit` | integer | No | `50` | 1–100. Max results |
+| `type` | string | No | `both` | One of `market`, `event`, `both`. Which result set(s) to include |
+| `provider` | string | No | — | An active provider id. Filter by provider |
+| `include_expired` | boolean | No | `false` | Include expired/closed markets |
+| `statuses` / `categories` / `tags` | string[] | No | — | Repeatable. Same as `/search/markets` |
+
+```bash
+curl "https://data.kairos.trade/search/markets-and-events?q=trump%202028&type=both&limit=10" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+The same `results` + `meta` envelope as `/search/markets`, abridged here to the keys documented below:
+
+```json
+{
+  "results": [
+    {
+      "market_id": "KXPRES-28-DJT",
+      "provider_id": 1,
+      "provider": "kalshi",
+      "name": "Will Trump win in 2028?",
+      "status": "open",
+      "relevance_score": 87.3
+    }
+  ],
+  "meta": {
+    "search_type": "both",
+    "returned": 1,
+    "requested": 10,
+    "include_expired": false,
+    "provider_id": null
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `results` | array | Merged market + event rows, sorted by `relevance_score` descending |
+| `results[].type` | string | Only present, and only ever `"event"`, on rows returned when `type=event` or `both` |
+| `meta.search_type` | string | Echoes the normalized (lower-cased, trimmed) `type` filter |
+| `meta.returned` | integer | Length of the merged, truncated `results` array |
+| `meta.requested` | integer | The `limit` that was requested |
+| `meta.provider_id` / `meta.include_expired` | — | Same as `/search/markets` |
+
+<Note>
+**Gotcha:** `limit` is applied twice. Each of the market and event searches is run with `limit`, the two sets are merged and re-sorted, and the merged list is then truncated back to `limit`.
+</Note>
+
+## Simple search
+
+```
+GET /search/simple
+```
+
+Primary endpoint behind the web navbar overlay: search plus optional server-side event grouping.
+
+`x-kairos-auth: api-key`, 60 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `q` | string | Yes | — | 1–200 chars. Search query text |
+| `limit` | integer | No | `20` | 1–1000. Max results |
+| `offset` | integer | No | `0` | Pagination offset |
+| `provider` | string | No | — | An active provider id. Filter by provider |
+| `tags` | string[] | No | — | Repeatable. Platform tag-slug filter |
+| `statuses` | string[] | No | — | Repeatable. Market status filter |
+| `sort_by` | string | No | `relevance` | One of `relevance`, `volume_24h`, `newest`, `ending_soon`. Sort field |
+| `sort_order` | string | No | `desc` | One of `asc`, `desc`. Sort direction |
+| `include_total` | boolean | No | `false` | Include `meta.total` |
+| `include_expired` | boolean | No | `false` | Include expired/closed markets |
+| `group_results` | boolean | No | `true` | Group markets by event server-side |
+
+```bash
+curl "https://data.kairos.trade/search/simple?q=bitcoin&limit=20&group_results=true" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "results": [
+    {
+      "market_id": "btc-100k-2025",
+      "provider_id": 2,
+      "provider": "polymarket",
+      "event_id": "btc-price-milestones",
+      "event_name": "Bitcoin Price Milestones",
+      "name": "Will Bitcoin reach $100k by end of 2025?",
+      "category": "crypto",
+      "status": "active",
+      "relevance_score": 70.0
+    }
+  ],
+  "meta": { "query": "bitcoin", "returned": 1, "query_time_ms": 12.45 }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `results` | array | Flat list. When `group_results=true` this is one representative row per group followed by the singles, not every matched market |
+| `groups` | array | Event groups (present when `group_results=true`); each has `event_id`, `event_name`, `market_count`, `representative`, and `markets` |
+| `singles` | array | Ungrouped markets (present when `group_results=true`) |
+| `meta.total` | integer \| null | Only present when `include_total=true`; falls back to the post-filter count if visibility filtering dropped rows |
+
+`meta` on this endpoint carries only `query`, `returned`, `query_time_ms`, and (conditionally) `total` — there is no `requested`.
+
+<Note>
+**Gotcha:** `groups[].markets` is not a subset of your matches. Groups are expanded server-side with sibling markets pulled from the discover cache, so a group can contain markets that did not themselves match `q`; those siblings carry `relevance_score: 0`. Filter on `relevance_score` if you only want true matches.
+</Note>
+
+Standalone singles priced at the resolved edge (0 or 100) are dropped from `results`/`singles`; the same edge prices are kept inside groups.
+
+The response may also carry `classifiedGroups`, `absorbedMarketIds`, and `correlations` — best-effort, fail-open enrichment (interactive threshold-ladder groupings and cross-venue similar-market suggestions) attached when available. They're never guaranteed present; see [API Reference](/api-reference) for the full shape.
+
+## Resolve a market URL
+
+```
+GET /search/resolve-url
+```
+
+Resolves a pasted Polymarket or Kalshi market/event URL to the matching market(s). An event URL returns every outcome market of that event; a market URL returns just that market.
+
+`x-kairos-auth: api-key`, 60 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | string | Yes | — | 1–1000 chars. The market or event URL to resolve |
+
+```bash
+curl -G "https://data.kairos.trade/search/resolve-url" \
+  --data-urlencode "url=https://polymarket.com/event/btc-price-milestones" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+Identical envelope to `/search/simple` (`results`, `groups`, `singles`, `meta`), so the same rendering path works for both. Cross-venue `correlations` enrichment is attached; ladder classification (`classifiedGroups` / `absorbedMarketIds`) is **not** run on this endpoint.
+
+> **Gotcha:** Unrecognised input never errors. Any other host, or bare text, returns `200` with an empty envelope, so check `meta.returned` rather than the status code:
+>
+> ```json
+> {"results": [], "groups": [], "singles": [], "meta": {"query": "", "returned": 0, "query_time_ms": 0.0}}
+> ```
+>
+> Fall back to a normal text search when you see it.
+
+## Autocomplete suggestions
+
+```
+GET /search/suggest
+```
+
+Lightweight results for dropdown/typeahead UI. **Not provider-visibility filtered**, unlike the three endpoints above.
+
+`x-kairos-auth: api-key`, 60 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `q` | string | Yes | — | 2–100 chars. Search query text |
+| `limit` | integer | No | `10` | 1–50. Max suggestions |
+| `provider` | string | No | — | An active provider id. Filter by provider |
+
+```bash
+curl "https://data.kairos.trade/search/suggest?q=bit&limit=10" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+<Note>
+**Gotcha:** This endpoint's parameters are not the same as the others'. There is no `provider_id` alias — only `provider` — and no `include_expired` at all. See [Provider parameter alias](#provider-parameter-alias) and [Default filters](#default-filters).
+</Note>
+
+### Response
+
+```json
+{
+  "suggestions": [
+    { "text": "bitcoin price", "type": "market", "frequency": 42 }
+  ],
+  "meta": { "query": "bit", "returned": 1 }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `frequency` | integer | Aggregated match count; exact semantics can vary by backend and may always read `1` |
+
+## Default filters
+
+When `include_expired=false` (the default on `/search/markets`, `/search/markets-and-events`, and `/search/simple`), expired/closed markets are excluded from results.
+
+`/search/suggest` has **no** `include_expired` parameter: it always excludes markets past their trading-end timestamp and anything in `closed`/`settled` status. Markets in `disputed` status are exempt from the expiry cut-off, since a UMA dispute keeps them tradeable.
+
+## Provider parameter alias
+
+`/search/markets`, `/search/markets-and-events`, and `/search/simple` accept the provider filter under either `provider` or the legacy `provider_id` query key (aliases of each other). If both are supplied they must match (case-insensitive) or the request fails with `400 provider and provider_id must match when both are provided`. **`/search/suggest` does not accept `provider_id`** — only `provider`.
+
+## Visibility filtering
+
+Results from `/search/markets`, `/search/markets-and-events`, `/search/simple`, and `/search/resolve-url` are post-filtered to drop any market whose provider is currently disabled. This can make `meta.returned` smaller than `meta.requested` even when the backend matched more rows. On `/search/simple` with `include_total=true`, `meta.total` falls back to the post-filter count when rows were dropped.
+
+## Price scale
+
+`results[].price` is **not normalized to a single scale** and can be `null`.
+
+- Top-level result rows carry the discover cache's value, which is on the 0–100 (cents) scale; the same scale is used by the edge-price filter and by the ClickHouse backfill that fills a cache miss.
+- Sibling markets added to `groups[].markets` by event expansion are divided by 100 when above 1, so those rows are on the 0–1 scale.
+
+Treat any value above `1` as cents and divide by 100 client-side. `price` is best-effort enrichment, not a quote — use the market/orderbook endpoints for tradeable prices.
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`, with two exceptions noted in the table: `429` uses an `error` key, and `422` uses FastAPI's standard validation body. The Code column holds the exact message string the service returns; `—` means the body has no fixed message.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 400 | `Search query cannot be empty` | `q` is present but whitespace-only | Send a non-blank `q`. Deterministic — retrying unchanged returns the same error |
+| 400 | `Invalid provider: <provider>` | Invalid or unknown `provider` value | Use an active provider id and resend |
+| 400 | `provider and provider_id must match when both are provided` | `provider` and `provider_id` both set with mismatched values | Send only one of the two keys |
+| 400 | `type must be 'market', 'event', or 'both'` | `markets-and-events` `type` not `market`/`event`/`both` | Fix `type` and resend |
+| 400 | `Invalid sort_by: <value>. Must be one of: relevance, volume_24h, newest, ending_soon` | `simple` `sort_by` invalid | Pick one of the listed values |
+| 400 | `Invalid sort_order: <value>. Must be one of: asc, desc` | `simple` `sort_order` invalid | Pick `asc` or `desc` |
+| 400 | `Invalid search parameters` (`Invalid suggestion parameters` on `/search/suggest`) | Search backend rejected the parameters | Re-check the parameters against the request table; retrying unchanged returns the same error |
+| 401 | `Authentication required (JWT token / API key / admin secret)` | No credentials at all | Send API-key headers, a session JWT, or an admin secret — see [Authentication](#authentication) |
+| 401 | `X-Api-Key and X-Api-Secret required with X-Client-Id` | `X-Client-Id` sent without `X-Api-Key` **and** `X-Api-Secret` | Send all three API-key headers together |
+| 401 | `Invalid API credentials` | API key/secret don't match a credential | Check the credential pair; do not retry unchanged |
+| 403 | `IP not whitelisted` | Caller IP is not on the credential's IP whitelist | Call from a whitelisted IP or have the whitelist updated — retrying from the same IP always fails |
+| 403 | `Invite required` | Session JWT belongs to a user who hasn't been invited (API-key and admin callers skip this) | Use API-key credentials, or get the user invited |
+| 422 | — | FastAPI/Pydantic parameter validation — missing `q`/`url`, `q` outside 1–200 (2–100 on `/search/suggest`), `url` outside 1–1000, out-of-range `limit` or negative `offset` | Read the FastAPI validation body for the offending field, fix it, and resend |
+| 429 | `Rate limit exceeded: 60 per 1 minute` | Rate limit exceeded (`error` key, not `detail`) | Back off and retry; `Retry-After` says how long. `X-RateLimit-*` headers are set, and a 429 does not consume quota |
+| 429 | `API key data rate limit exceeded` | Per-credential data-API ceiling exceeded (only when the API credential carries a `data` rate-limit override) | Back off and retry, or have the credential's `data` override raised |
+| 500 | `Search query failed` (`Suggestions query failed` on `/search/suggest`) | Search backend failure | Safe to retry — the request is read-only. Report to support if it persists |
+| 500 | `URL resolution failed` | `/search/resolve-url` failed to resolve a recognised URL | Safe to retry; fall back to a text search. Report to support with the response body if it persists |
+| 500 | `Search proxy base URL is not configured` | The service is configured to proxy search upstream but no proxy base URL is set | Not fixable client-side — report to support with the response body |
+| 500 | `An internal error occurred. Please try again later.` | Any other unhandled error | Retry once, then report to support with the response body |
+| 502 | `Search upstream unavailable: <error>` | Proxied search upstream unreachable or timed out | Safe to retry — the request is read-only |
+| 502 | `Search upstream returned invalid JSON: <error>` | Proxied search upstream returned a non-JSON body | Safe to retry; report to support with the response body if it persists |
+
+<Note>
+**Gotcha:** The table above is not exhaustive. When search is served through the upstream proxy, the upstream's status code and body are returned verbatim, so a proxied request can surface statuses not listed here. Handle unexpected statuses rather than switching on this list alone.
+</Note>
+
+Enrichment failures never fail a request: `classifiedGroups`, `absorbedMarketIds`, and `correlations` are fail-open and are simply absent when their backing lookup errors.

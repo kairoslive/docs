@@ -1,0 +1,222 @@
+---
+title: "Order books"
+description: "Deep-book representation, sequencing, and deterministic recovery"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, enabled in production and staging today; a
+deployment with the flag off returns `404` for every perpetual route. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+What a perpetual book contains, how deep you can ask for, which books are
+refused as invalid, and why a book can vanish from the stream without anything
+being broken.
+
+Perp books use direct bid and ask prices. They do **not** use prediction-market
+complement arithmetic. A book can contain far more levels than a prediction
+book, so depth, aggregation, backpressure, and recovery are first-class parts
+of the contract.
+
+<Note>
+**Beta:** Read-only REST snapshots and live v2 WebSocket book snapshots are
+available for Hyperliquid Perps, Polymarket Perps, and Kalshi Margin.
+</Note>
+
+## Canonical book view
+
+A book view is identified by:
+
+- instrument
+- venue connection and source epoch
+- `book_view_id`
+- requested or available maximum depth
+- price aggregation rule
+
+<Warning>
+**Snapshots from different views cannot be combined.** A venue's
+unaggregated book, a 100-level view, and a grouped-price view are distinct
+states even when they describe the same instrument. Never merge books across
+venues, epochs, or `book_view_id` values.
+</Warning>
+
+Each level has an exact price and exact quantity. Sides are explicit. Bids are
+ordered highest first and asks lowest first.
+
+## Snapshot
+
+A snapshot contains the complete state for its declared view, plus sequence,
+source cursor, timestamps, and source context. A snapshot with an incorrect
+instrument, view, connection, or epoch is rejected before it can alter state.
+
+<Note>
+**An empty book is refused, not published.** The general Kairos model treats
+an empty, correctly identified snapshot as valid — it clears the book. **The
+perpetual v2 stream does not.** Both the producer and the gateway refuse a
+snapshot with no bids *and* no asks, so a book that empties out stops
+publishing rather than publishing a cleared book. A one-sided book (bids
+only, or asks only) is valid and does publish. **Treat prolonged silence,
+not an empty frame, as the signal that a perpetual book has drained.**
+</Note>
+
+## Book validity
+
+| Condition | Verdict |
+|---|---|
+| Best bid below best ask | Normal |
+| Best bid above best ask | Crossed, invalid |
+| Negative or zero price or quantity | Invalid |
+| Duplicate price levels on one side after normalization | Invalid |
+
+Best bid *equal* to best ask — a locked book — is where the two live surfaces
+differ, and the difference is deliberate rather than a gap:
+
+| Surface | Locked book |
+|---|---|
+| REST snapshot | Accepted. Only `bid > ask` is refused |
+| v2 WebSocket stream | Refused. The producer treats `bid >= ask` as crossed, and the gateway independently requires `best bid < best ask` |
+
+<Warning>
+**A perpetual book that locks disappears from the v2 stream until it
+unlocks.** Do not read that gap as a connection fault. The same instrument
+polled over REST during the lock returns normally.
+</Warning>
+
+## Live v2 book stream
+
+All perpetual venues publish the same `kairos.v2.BookSnapshot`. Prices and
+quantities use `ExactDecimal`, so small-token prices and large quantities do
+not depend on a fixed integer scale and cannot be silently clamped into a
+plausible but false book.
+
+Every message is a complete replacement. Hyperliquid and Polymarket Perps
+originate as venue book images. Kalshi Margin applies authenticated venue
+updates to an internal book, then publishes the complete validated image.
+
+The producer refuses empty or crossed books, missing ownership epochs,
+non-canonical metadata, and invalid values. The public gateway independently
+checks subject/payload identity, positive exact values, side ordering,
+crossing, view metadata, source context, and sequence monotonicity before
+fan-out.
+
+Two view fields are fixed for every perpetual venue today, and `max_depth` is
+checked against the payload:
+
+| Field | Value | Gateway rejects |
+|---|---|---|
+| `aggregation` | The literal string `price` | Any other value |
+| `book_view_id` | `full-depth-<max_depth>` | An empty value |
+| `max_depth` | Declared per view | Zero, or a value smaller than the levels the message actually carries |
+
+<Warning>
+**`checksum` is defined on the message but never populated for
+perpetuals.** Do not build a recovery rule that waits for one.
+</Warning>
+
+See [Streaming and recovery](/perpetuals/streaming-and-recovery) for the
+`0x40 0x02` frame and reconnect algorithm.
+
+## Deep-book controls
+
+Depth is not silently truncated. Any cap is declared in the view metadata.
+Request only the depth you can process, bound your buffers, and resnapshot
+instead of allowing unbounded lag. Coalescing is allowed only when it preserves
+the documented state contract.
+
+### The `depth` parameter
+
+`?depth=` on the [REST snapshot](/perpetuals/overview#live-snapshot) is
+optional and defaults to the venue's own ceiling:
+
+| Venue | Default `depth` |
+|---|---|
+| `hyperliquid` | 20 |
+| `polymarket_perps` | 500 |
+| `kalshi_margin` | 500 |
+
+A flat default would mark every Hyperliquid snapshot depth-limited for no
+reason and ask Kalshi for less book than it has.
+
+| Bad value | Error |
+|---|---|
+| Non-integer | `400 invalid_request` / `depth must be an integer` |
+| Outside `[1, 500]` | `400 invalid_request` / `depth must be between 1 and 500` |
+
+### Depth reporting
+
+The REST snapshot reports what it actually got:
+
+| Field | Meaning |
+|---|---|
+| `requested_depth` | The caller's requested maximum |
+| `depth` | The deeper populated side actually returned |
+| `source_depth_limit` | The venue endpoint's declared cap, or `null` |
+| `depth_limited` | Whether that source cap prevented the requested view |
+
+| Venue | Upstream behavior | `source_depth_limit` | `depth_limited` |
+|---|---|---|---|
+| Hyperliquid | Public `l2Book` view is capped at 20 levels per side, so a 500-level request cannot be satisfied | `20` | `true` for a 500-level request |
+| Polymarket Perps | Accepts tiered native depths — the Market Data API rounds the upstream request up to 10, 100, or 500, then applies the caller's exact maximum | `1000` | `false` |
+| Kalshi Margin | Honours an explicit depth up to 100; above that it sends `depth=0` (all levels) and applies the caller's maximum locally | `null` | `false` |
+
+### Per-venue book metadata
+
+| Venue | `sequence_domain` | `feed_mode` | `source_sequence` | `order_count` per level |
+|---|---|---|---|---|
+| Hyperliquid | `hyperliquid:unsequenced-l2-snapshot` | `snapshot_only` | absent | Present, and required to be positive |
+| Polymarket Perps | `polymarket:rest-book-sequence` | `snapshot_only` | Present — the only venue that carries one | `null` |
+| Kalshi Margin | `kalshi-margin:rest-unsequenced-snapshot` | `snapshot_only` | absent | `null` |
+
+The v2 stream never populates `order_count`.
+
+## Deltas: defined, not published
+
+<Note>
+**No perpetual delta is published in the beta.** Every perpetual venue is
+emitted as `BOOK_FEED_MODE_SNAPSHOT_ONLY`, and the gateway rejects any other
+feed mode. Read this section as the shape a future delta feed would take, not
+as a message you will receive today.
+</Note>
+
+The canonical schema defines `kairos.v2.BookDelta` with level updates keyed by
+`(side, price, action)`, where `BOOK_UPDATE_ACTION_DELETE` removes a level and
+`BOOK_UPDATE_ACTION_UPSERT` replaces its quantity. A delta applies only when
+`source_epoch` matches and `previous_sequence` equals the consumer's current
+sequence.
+
+The canonical sequence is a Kairos sequence for one declared stream scope. The
+venue's native sequence is retained separately, in `source_sequence`, with its
+scope named in `transport_sequence_domain`. Native sequence numbers may be
+connection-wide or shared across instruments and therefore must not be assumed
+contiguous per instrument.
+
+### Applying a stream
+
+The general algorithm, for a feed that has deltas:
+
+1. Subscribe and buffer incoming deltas.
+2. Fetch or receive a snapshot for the same view and source epoch.
+3. Validate identity and install the snapshot.
+4. Discard buffered events already covered by the snapshot fence.
+5. Apply the remaining contiguous canonical deltas.
+6. On a gap, epoch change, checksum failure, or view mismatch, invalidate the
+   state and repeat recovery.
+
+Consumers must not display or trade from a book while it is invalid.
+
+<Note>
+**For the perpetual beta this collapses to steps 3 and 4 alone.** There are
+no deltas to buffer and no checksum to fail, so every frame installs
+directly. [Streaming and recovery](/perpetuals/streaming-and-recovery)
+gives the snapshot-only algorithm that actually applies.
+</Note>
+
+## Snapshot-only venues
+
+Some sources deliver full-book images instead of true deltas. Kairos preserves
+that fact. It may publish snapshots at each update or derive deltas only when
+the derivation is deterministic and marked as derived. A derived delta does not
+acquire a venue-native sequence that never existed.
+
+Next: [Trades and candles](/perpetuals/trades-and-candles).

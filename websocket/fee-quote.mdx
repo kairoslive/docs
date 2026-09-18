@@ -1,0 +1,280 @@
+---
+title: "Fee Quote (RFQ)"
+description: "Stream live fee quotes for a trade you're eyeing over WebSocket"
+---
+
+Lock the trade you're eyeing and stream the fees you can expect to pay. Instead of polling `GET /orders/fee-quote`, you send one `subscribe_fee_quote` message and the server pushes a `fee_quote` frame immediately, then again **whenever the number changes** — a request-for-quote (RFQ) feed suitable for both UIs and bots.
+
+The REST [`GET /orders/fee-quote`](/rest/orders#fee-quote) endpoint remains available; this stream is the lower-latency, push-based equivalent.
+
+## Connection
+
+This uses the same WebSocket connection as [Order Updates](/websocket/order-updates) and [Order Execution](/websocket/order-execution):
+
+```
+wss://execution.kairos.trade/ws
+```
+
+See [Order Updates - Connecting](/websocket/order-updates#connecting) for authentication and setup. Once connected, send the messages below as JSON text frames.
+
+API-key subscriptions require `trade:read` scope and [platform access](/guides/authentication#platform-access) to `exchange_id`. If either check fails, the server sends a message-only `fee_quote_error` frame and does not create the subscription. If access is later disabled or cannot be verified, the subscription is removed and a message-only `fee_quote_error` frame is emitted.
+
+```javascript
+import WebSocket from "ws";
+
+const ws = new WebSocket("wss://execution.kairos.trade/ws", {
+  headers: {
+    "X-Client-Id": process.env.KAIROS_CLIENT_ID,
+    "X-Api-Key": process.env.KAIROS_API_KEY,
+    "X-Api-Secret": process.env.KAIROS_API_SECRET,
+  },
+});
+
+// 1. Subscribe to the trade you're eyeing — a market buy of 100 shares.
+//    No price: the server walks the book for the size.
+ws.on("open", () => {
+  ws.send(JSON.stringify({
+    type: "subscribe_fee_quote",
+    request_id: crypto.randomUUID(),
+    payload: {
+      quote_id: "ticket-1",
+      exchange_id: "polymarket",
+      token_id: "713210...",
+      side: "buy",
+      quantity: "100",
+      order_type: "market",
+    },
+  }));
+});
+
+// 2. Receive streamed quotes
+ws.on("message", (data) => {
+  const msg = JSON.parse(data.toString());
+  if (msg.type === "fee_quote" && msg.quote_id === "ticket-1") {
+    if (msg.pricing_unavailable) return; // placeholder frame — render "pricing…"
+    const liq = msg.sufficient_liquidity ? "" : " (partial — low liquidity)";
+    console.log(`~${msg.avg_price_usdc} avg, all-in $${msg.total_cost_usdc}${liq}`);
+  } else if (msg.type === "fee_quote_error" && msg.quote_id === "ticket-1") {
+    console.error(`Quote rejected: ${msg.error}`);
+  }
+});
+
+// 3. Resize in place (same quote_id) — still no price for a market order.
+ws.send(JSON.stringify({
+  type: "subscribe_fee_quote",
+  payload: { quote_id: "ticket-1", exchange_id: "polymarket",
+             token_id: "713210...", side: "buy", quantity: "250",
+             order_type: "market" },
+}));
+
+// 4. Stop when done
+ws.send(JSON.stringify({
+  type: "unsubscribe_fee_quote",
+  payload: { quote_id: "ticket-1" },
+}));
+```
+
+---
+
+## How it works
+
+1. You send `subscribe_fee_quote` describing the **trade** — instrument, `side`, and `quantity` (size) — plus a `quote_id` you choose (or let the server assign one). For a **market order you do not send a price**: the server prices the size from the live order book. For a **limit order** you send your resting `price`.
+2. The server replies with a `fee_quote` frame: the size-weighted **executable price** (VWAP — the average price you'd pay walking the book for your size) for your size, the **fees** on that notional, and the **all-in cost**.
+3. While the subscription is active, the server re-evaluates every active subscription on a fixed tick (**100 ms** by default) and re-sends a `fee_quote` frame **only when the quote value changes**. A market that isn't moving emits once, then stays quiet.
+4. To change the trade (new size, side, market, or limit price), send `subscribe_fee_quote` again with the **same `quote_id`** — it replaces the spec in place.
+5. Send `unsubscribe_fee_quote` to stop.
+
+Because the market-order subscription contains **no price**, it does not churn as the BBO (best bid/offer) ticks — the server walks the book each evaluation instead. The server continuously re-evaluates active subscriptions, and unchanged quotes emit nothing, so an idle subscription costs effectively nothing on the wire.
+
+<Note>
+Quotes are **estimates** (`is_estimate: true`) until the order executes. For a market order, `avg_price_usdc` is the VWAP of walking the book for your size and `sufficient_liquidity` is `false` when the book can't fill the whole size. Polymarket charges fees on [taker](/learn/glossary) fills only — a limit (maker) order shows `$0` exchange fee.
+</Note>
+
+---
+
+## Client messages
+
+### subscribe_fee_quote
+
+```json
+{
+  "type": "subscribe_fee_quote",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "quote_id": "ticket-1",
+    "exchange_id": "polymarket",
+    "token_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+    "side": "buy",
+    "quantity": "100",
+    "order_type": "market"
+  }
+}
+```
+
+**Payload fields:**
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `quote_id` | string | No | server-assigned | Your subscription handle. Used to correlate `fee_quote` frames and to unsubscribe. If omitted, the server assigns one and returns it on the first frame. Re-subscribing with the same `quote_id` updates the spec in place. |
+| `exchange_id` | string | Yes | — | `"polymarket"`, `"kalshi"`, or `"predictfun"` |
+| `token_id` | string | Conditional\* | — | Token ID (preferred for Polymarket) |
+| `market_id` | string | Conditional\* | — | Market/condition ID (Polymarket fallback; **the series ticker for Kalshi**; the market id for Predict.fun) |
+| `side` | string | Yes | — | `"buy"` (walks the ask side) or `"sell"` (bid side) |
+| `quantity` | string\|number | Yes | — | Size — number of contracts (> 0) |
+| `order_type` | string | Yes | — | `"market"` (taker) or `"limit"` (maker) |
+| `price` | string\|number | limit only | — | Resting limit price (> 0 and ≤ 1.0). **Omit for market orders** — the server prices the size from the live book. Sending it on a market order pins the quote to that price instead of the book. |
+
+\*For Polymarket, provide either `token_id` or `market_id` (required). For **Kalshi**, `market_id` is optional but **strongly recommended**: it is the series ticker (e.g. `KXNFLGAME-…`) used to resolve the per-series fee tier. Without it the quote assumes the *standard* tier, which under-estimates the fee on non-standard series (most sports/macro markets price makers very differently); the `exchange_fee_note` will say `… assumed — pass market_id` in that case. For **Predict.fun**, `market_id` is optional and lets the quote use the live per-market rate instead of the 2% default.
+
+Numbers may be sent as JSON strings to preserve precision (recommended) or as JSON numbers.
+
+`exchange_id` is trimmed and lower-cased before validation, and the deprecated
+`kalshi_offchain` alias is canonicalized to `kalshi`. The payload fields may
+also be sent flat at the top level instead of nested under `payload` — the
+server reads `payload` when it is an object and falls back to the message
+root.
+
+<Note>
+**Gotcha: `request_id` is not echoed on fee-quote frames.** It is accepted on
+the envelope, but no `fee_quote`, `fee_quote_error`, or
+`fee_quote_unsubscribed` frame carries it. Correlate on `quote_id` instead.
+</Note>
+
+### unsubscribe_fee_quote
+
+```json
+{
+  "type": "unsubscribe_fee_quote",
+  "payload": { "quote_id": "ticket-1" }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `quote_id` | string | Yes | — | The subscription to stop |
+
+Unsubscribing an unknown `quote_id` is a no-op and still returns an ack.
+
+---
+
+## Server frames
+
+### fee_quote
+
+```json
+{
+  "type": "fee_quote",
+  "quote_id": "ticket-1",
+  "seq": 1,
+  "avg_price_usdc": "0.452000",
+  "filled_size": "100",
+  "requested_size": "100",
+  "sufficient_liquidity": true,
+  "notional_usdc": "45.200000",
+  "platform_fee_usdc": "0.500000",
+  "exchange_fee_usdc": "0.810000",
+  "total_fee_usdc": "1.310000",
+  "exchange_fee_note": "1.75% taker fee, Crypto Curve",
+  "total_cost_usdc": "46.510000",
+  "pricing_unavailable": false,
+  "is_estimate": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `quote_id` | string | The subscription this frame belongs to |
+| `seq` | integer | Monotonically increasing per `quote_id`, so you can order frames |
+| `avg_price_usdc` | string | Size-weighted executable price (VWAP) from walking the book for the size; the limit price for a limit order |
+| `filled_size` | string | Size the book can actually fill (equals `requested_size` when liquidity suffices) |
+| `requested_size` | string | The size you asked to quote |
+| `sufficient_liquidity` | boolean | `false` when the book can't fill the full requested size |
+| `notional_usdc` | string | `filled_size × avg_price_usdc` |
+| `platform_fee_usdc` | string | Kairos platform fee (based on your fee tier) |
+| `exchange_fee_usdc` | string | Exchange-specific fee, priced on the executable fill |
+| `total_fee_usdc` | string | `platform_fee_usdc + exchange_fee_usdc` |
+| `exchange_fee_note` | string \| null | Human-readable note (e.g. `"no maker fee"`, `"4.5% taker fee"`) |
+| `total_cost_usdc` | string | All-in: buy → notional + fees; sell → proceeds = notional − fees |
+| `pricing_unavailable` | boolean | `true` when the server has no executable price yet; every numeric field is a placeholder `"0"` |
+| `is_estimate` | boolean | Always `true` — fills/fees are estimates until execution |
+
+<Note>
+**Gotcha: guard on `pricing_unavailable` before reading any cost field.**
+When the server has no client price and no fresh book yet, it emits a frame
+with `pricing_unavailable: true`, all-zero numerics, and
+`exchange_fee_note: "live price unavailable"`; it re-emits a real quote
+(`pricing_unavailable: false`) once the book arrives. Render a "pricing…"
+state — never `$0.00`.
+</Note>
+
+### fee_quote_error
+
+Sent when a subscribe/unsubscribe is malformed or the spec is invalid. The subscription is not created; the connection stays open.
+
+```json
+{
+  "type": "fee_quote_error",
+  "quote_id": "ticket-1",
+  "error": "price must be greater than 0 and at most 1.0"
+}
+```
+
+`quote_id` is `null` when the offending message didn't carry one.
+
+### fee_quote_unsubscribed
+
+Acknowledges an `unsubscribe_fee_quote`.
+
+```json
+{ "type": "fee_quote_unsubscribed", "quote_id": "ticket-1" }
+```
+
+---
+
+## Sequencing and recovery
+
+`seq` increases monotonically **per `quote_id`**, so a client that renders
+frames out of order can discard anything with a `seq` below the one it has
+already applied. Frames are only emitted when the quote value changes, so
+silence means "unchanged", not "stalled".
+
+On disconnect, all subscriptions are dropped. After reconnect, re-send your `subscribe_fee_quote` messages — the server does not replay them. Close codes and reconnect backoff for this socket are documented on [Order Updates → Server-initiated close codes](/websocket/order-updates#errors-disconnection).
+
+---
+
+## Errors
+
+Every condition below produces a `fee_quote_error` frame; the subscription is not created and the connection stays open.
+
+| Condition | When it happens | What to do |
+|-----------|-----------------|------------|
+| `exchange_id` not one of polymarket / kalshi / predictfun | Unsupported venue | Send a supported `exchange_id` |
+| `order_type` not `"market"` or `"limit"` | Invalid spec | Fix the field |
+| `side` not `"buy"` or `"sell"` | Invalid spec | Fix the field |
+| `quantity` ≤ 0 | Invalid size | Send a positive size |
+| `price` present and ≤ 0 or > 1.0 | `price must be greater than 0 and at most 1.0` | Send a price in `(0, 1.0]` |
+| `order_type: "limit"` without a `price` | `limit orders require a price` — a limit quote is never priced off the book | Supply the resting limit price |
+| Polymarket without `token_id` or `market_id` | No instrument to quote | Supply either identifier |
+| Scope or platform-access check fails | API key lacks `trade:read`, or platform access to `exchange_id` is disabled | Check the key's scopes; the subscription is also removed if access is disabled later |
+
+---
+
+## Limits
+
+| Limit | Value | What happens when you exceed it |
+|-------|-------|---------------------------------|
+| Active subscriptions per connection | 50 | `fee_quote_error` (re-using an existing `quote_id` does not count against the limit) |
+| `subscribe_fee_quote` frames per second per connection | 40 | `fee_quote_error` — slow down; unsubscribe/re-subscribe churn counts |
+
+---
+
+## WebSocket vs REST
+
+| | WebSocket RFQ | REST (`GET /orders/fee-quote`) |
+|--|---------------|--------------------------------|
+| **Delivery** | Push — server streams on change | Pull — you poll |
+| **Latency** | Sub-second on change | One round-trip per request |
+| **Auth** | At connection time | Per-request headers |
+| **Best for** | Live order tickets, trading bots | One-off quotes, simple integrations |
+
+Both compute fees identically (the same server-side path), so a REST quote and a streamed quote for the same spec match.

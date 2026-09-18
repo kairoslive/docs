@@ -1,0 +1,979 @@
+---
+title: "Market Data Stream"
+description: "Real-time market data via WebSocket with protobuf encoding"
+---
+
+Stream live orderbooks, trades, candles, prices, and volume over a persistent WebSocket connection using binary protobuf messages. This page is the full contract for that stream: how to connect and authenticate, what to send, what arrives, how to stay in sequence, and what every error and close code means.
+
+## Connecting
+
+```text
+wss://stream.kairos.trade
+```
+
+The server accepts API keys, session JWTs, and a deliberately bounded
+anonymous public-market-data tier.
+
+### Authenticated connections
+
+The presence of any API-key header switches the server into API-key mode and
+requires the complete header set. Otherwise it expects a JWT.
+
+**API key (recommended for programmatic clients):**
+
+Include your API credentials as HTTP headers on the upgrade request:
+
+```text
+X-Client-Id: kairos_ck_...
+X-Api-Key: <64 hex chars>
+X-Api-Secret: <64 hex chars>
+```
+
+If `X-Client-Id` is present but `X-Api-Key` or `X-Api-Secret` is missing or invalid, the upgrade is rejected with `401 Unauthorized`. If API-key validation is not configured on this server, the upgrade returns `503 Service Unavailable`.
+
+**JWT (browser / SDK):**
+
+Browsers cannot set custom headers on a WebSocket upgrade, so the JWT is passed via `Sec-WebSocket-Protocol`:
+
+```text
+Sec-WebSocket-Protocol: authorization, Bearer_<base64url(jwt_token)>
+```
+
+Encode the complete JWT as base64url without `=` padding. The server echoes
+back `Sec-WebSocket-Protocol: authorization` on the 101 response. If the
+protocol header is missing/malformed or the token fails validation (signature,
+expiry, revocation), the upgrade is rejected with `401 Unauthorized`.
+
+JWTs are also revalidated **every 60 seconds** while the connection is open — see [Errors & Disconnection](#errors-disconnection).
+
+### Anonymous public access
+
+Connect to the environment you are integrating with and request:
+
+```text
+Sec-WebSocket-Protocol: kairos.marketdata.public.v1
+```
+
+The server echoes `kairos.marketdata.public.v1` in the `101 Switching
+Protocols` response. The explicit protocol is required: a missing credential
+does not silently downgrade an authenticated integration into the anonymous
+tier.
+
+Anonymous sessions are limited across a gateway fleet to 100
+concurrent connections and two connections per observed source IP. Each
+connection is limited to three markets, ten inbound control messages per
+second, and a one-hour lifetime. Redis-backed leases enforce the fleet limits
+across replicas and expire after a crashed task. These limits can be lowered
+during beta and are not a service-level commitment.
+
+An empty topic list selects the ordinary public topics. `analytics` and `arb`
+must be named explicitly, for every auth mode. Snapshot recovery
+(`FetchRequest`) is limited to one request per second for anonymous callers and
+cannot consume the recovery capacity reserved for authenticated clients.
+Unknown topics, invalid intervals/providers, and malformed or
+transport-unsafe market identifiers fail with an error.
+
+Ordinary demand-driven subscriptions can create bounded upstream presence
+leases. Perpetual v2 books are different: automatic catalog enrollment keeps
+them warm, and a `perps_book`-only subscription does not create a legacy
+presence key. A successful subscription acknowledgment validates the request;
+it does not by itself guarantee a fresh upstream message.
+
+### A complete connect-and-subscribe example
+
+This Python client connects with API-key headers, subscribes to one Polymarket
+contract, and dispatches every frame by its 1-byte type tag. Compile the
+protobuf schemas first — see [Protobuf Reference](/websocket/protobuf-reference).
+
+```python
+import os
+import websocket
+
+from kairos.v1 import websocket_control_pb2, orderbook_pb2
+
+TAG_SUBSCRIBE = 0x10
+TAG_ORDERBOOK = 0x02
+TAG_SUBSCRIBED = 0x14
+TAG_ERROR = 0x17
+
+ws = websocket.create_connection(
+    "wss://stream.kairos.trade",
+    header=[
+        f"X-Client-Id: {os.environ['KAIROS_CLIENT_ID']}",
+        f"X-Api-Key: {os.environ['KAIROS_API_KEY']}",
+        f"X-Api-Secret: {os.environ['KAIROS_API_SECRET']}",
+    ],
+)
+
+request = websocket_control_pb2.SubscribeRequest(
+    contract_id="570362",
+    provider="polymarket",
+    topics=["orderbook", "price", "trades"],
+)
+ws.send_binary(bytes([TAG_SUBSCRIBE]) + request.SerializeToString())
+
+while True:
+    frame = ws.recv()
+    if not isinstance(frame, bytes) or not frame:
+        continue
+    tag, payload = frame[0], frame[1:]
+
+    if tag == TAG_SUBSCRIBED:
+        ack = websocket_control_pb2.SubscribedResponse()
+        ack.ParseFromString(payload)
+        print("subscribed", ack.contract_id)
+    elif tag == TAG_ORDERBOOK:
+        snapshot = orderbook_pb2.OrderbookSnapshot()
+        snapshot.ParseFromString(payload)
+        scale = snapshot.price_scale or 10000
+        for outcome in snapshot.outcomes:
+            best_bid = max((lvl.price for lvl in outcome.bids.levels), default=None)
+            print(snapshot.contract_id, best_bid / scale if best_bid else None)
+    elif tag == TAG_ERROR:
+        err = websocket_control_pb2.ErrorResponse()
+        err.ParseFromString(payload)
+        print("server error", err.action, err.message)
+    else:
+        pass  # Unknown tag — ignore for forward compatibility
+```
+
+## Message Format
+
+All messages are binary WebSocket frames. Existing v1 messages have the
+format:
+
+```text
+[1-byte type tag] [protobuf payload]
+```
+
+The first byte identifies the message type. The remaining bytes are a serialized protobuf message. See [Protobuf Reference](/websocket/protobuf-reference) for schema definitions.
+
+The v2 perpetual book adds an explicit version byte:
+
+```text
+[0x40] [0x02] [kairos.v2.BookSnapshot protobuf]
+```
+
+See [Perpetual streaming and recovery](/perpetuals/streaming-and-recovery).
+
+## Subscribing to a Market
+
+Send a `SubscribeRequest` to start receiving data for a contract:
+
+```text
+Wire: [0x10] [SubscribeRequest protobuf]
+```
+
+**SubscribeRequest fields:**
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `contract_id` | string | Yes | — | Market identifier (e.g., `"570362"`) |
+| `provider` | string | Yes | — | Provider slug — see [Venues and products](#venues-and-products) |
+| `topics` | string[] | No | all public topics | Filter to specific data types. An empty list means all public topics, for every auth mode. Maximum 16 entries per frame; duplicates are de-duplicated. |
+| `candle_timeframes` | uint32[] | No | the gateway's default set | Filter candle timeframes in seconds. Maximum 16 entries per frame; each must be between 1 and 604800. |
+| `arb_subscription` | ArbSubscription | `arb` only | — | Creates or updates an identified server-side arb subscription — see [Arb subscriptions](#arb-subscriptions). |
+
+### Venues and products
+
+One gateway carries every product. The `provider` slug — not the market id —
+decides which product you are subscribing to, so read this table before
+choosing a `contract_id`.
+
+| `provider` | Product | `contract_id` you send | Book shape |
+|---|---|---|---|
+| `polymarket` | Prediction market | Polymarket market id (`570362`) | One independent book per outcome token |
+| `kalshi` | Prediction market | Market ticker (`KXFEDCHAIRNOM-29-KH`) | One merged venue book, outcomes derived |
+| `predictfun` | Prediction market | Venue market identifier | One independent book per outcome token |
+| `opinion` | Prediction market | Venue market identifier | One independent book per outcome token |
+| `hyperliquid` | Prediction market (HIP-4 outcome market) | Numeric HIP-4 outcome id (`101`) | Two outcomes, one independent book per side coin |
+| `hyperliquid_perps` | Perpetual future | Canonical instrument id (`hl-mainnet-btc-usdt`) | v2 direct two-sided book |
+| `polymarket_perps` | Perpetual future | Canonical instrument id (`poly-perps-mainnet-6`) | v2 direct two-sided book |
+| `kalshi_margin` | Perpetual future | Canonical instrument id (`kalshi-margin-mainnet-kxbtcperp`) | v2 direct two-sided book |
+| `oracle` | Crypto spot price feed | Symbol (`btc-usd`) | No book — `price` only |
+| `synthetic` | Weighted prediction-market package | Canonical synthetic id (`syn_` plus 16 lowercase hex characters) | Versioned synthetic snapshots and deltas |
+
+> **Hyperliquid appears twice on purpose: HIP-4 outcome markets and perpetuals
+> are two different products on one venue.** They use different id schemes,
+> different price scales, and separate decoders, and they are never
+> interchangeable. A HIP-4 market is addressed by its numeric outcome id under
+> `hyperliquid`; a perpetual is addressed by its canonical instrument id under
+> `hyperliquid_perps`. See
+> [Instruments and identity](/perpetuals/instruments-and-identity) for the
+> perpetual id rule.
+
+> These slugs identify gateway routing. A slug being accepted does **not**
+> promise that a producer for that venue is enabled — see
+> [Availability](/perpetuals/availability-and-guarantees).
+
+**Available topics:**
+
+| Topic | Data Received |
+|-------|---------------|
+| `orderbook` | Full orderbook snapshots **and incremental deltas** (see [Orderbook Delta](#orderbook-delta-tag-0x0f)) |
+| `trades` | Executed trade batches |
+| `candles` | OHLC candle updates |
+| `price` | Best bid/ask/mid price changes |
+| `volume` | 1h and 24h rolling volume |
+| `ticks` | Tick-level quote updates |
+| `quote` | Lightweight top-of-book quote updates |
+| `perps_book` | Canonical v2 perpetual full-book snapshots; request explicitly |
+| `synthetic` | Synthetic book snapshots and deltas; request explicitly with a canonical `syn_...` ID |
+| `analytics` | Internal analytics broadcasts; request explicitly. Denied on the anonymous tier unless an operator opts in. |
+| `arb` | Filtered cross-venue match and spread batches; request explicitly — see [Arb subscriptions](#arb-subscriptions). Denied on the anonymous tier unless an operator opts in. |
+
+`price_updates` is accepted as an alias of `price`. Any other value is rejected
+with an `ErrorResponse` carrying `Unknown subscription topic: <value>`.
+
+Only `price`, `volume`, `trades`, `candles`, `orderbook`, `ticks`, and `quote`
+are selected by an empty topic list. `analytics`, `arb`, `perps_book`, and
+`synthetic` are never included in that default set.
+
+The `orderbook` topic also carries **tick-grid changes** (`TickSizeChange`,
+tag `0x1C`, payload `kairos.v1.TickSizeUpdate`): a market's valid price grid
+can change mid-session (Polymarket flips its flat tick at the 0.96/0.04
+extremes; Kalshi grids are synthesized from the venue's `price_ranges`), and
+the notice rides the book topic so no extra subscription is needed.
+
+Synthetic books use their own versioned data envelope and decoder. See the
+[Synthetic Book Stream tutorial](/websocket/synthetic-books) for the exact subscription,
+schema, and recovery rules.
+
+**Example:** Subscribe to only prices and trades for a Polymarket contract:
+```
+topics: ["price", "trades"]
+```
+
+**Example:** Subscribe to 1-minute and 1-hour candles only:
+```
+topics: ["candles"]
+candle_timeframes: [60, 3600]
+```
+
+**Example:** Subscribe to a Hyperliquid HIP-4 outcome market:
+
+```text
+contract_id: "101"
+provider: "hyperliquid"
+topics: ["orderbook", "price", "trades"]
+```
+
+Use the numeric HIP-4 outcome id as `contract_id`. The initial
+`OrderbookSnapshot.token_ids` contains the side coins (for example `#1010` and
+`#1011`) used as `token_id` during order submission.
+
+<Note>
+**One connection cannot carry the same `contract_id` from two providers.**
+Market-data routing and cache identity are provider-qualified, and until every
+legacy v1 frame carries provider identity on the wire, you must use separate
+connections. This matters for non-expiring perp symbols such as `BTC` and
+prevents venue A from receiving venue B's book or delta stream.
+</Note>
+
+**Example:** Subscribe to a Hyperliquid perpetual v2 book:
+
+```text
+contract_id: "hl-mainnet-btc-usdt"
+provider: "hyperliquid_perps"
+topics: ["perps_book"]
+```
+
+A perpetual book arrives as `[0x40][0x02][BookSnapshot]`. Treat it as a full
+replacement and use its `ExactDecimal` prices and quantities directly. Do not
+apply prediction-market complement arithmetic.
+
+Polymarket Perps:
+
+```text
+contract_id: "poly-perps-mainnet-6"
+provider: "polymarket_perps"
+topics: ["perps_book"]
+```
+
+Kalshi Margin:
+
+```text
+contract_id: "kalshi-margin-mainnet-kxbtcperp"
+provider: "kalshi_margin"
+topics: ["perps_book"]
+```
+
+Always discover the canonical ID rather than deriving it from these examples.
+Perps use v2 only; `topics: ["orderbook"]` selects the legacy v1 orderbook
+family and is not the perpetual beta contract.
+
+### Crypto oracle prices
+
+Subscribe with `provider: "oracle"` to receive live crypto resolution prices as
+`price` (`PriceUpdate`) messages. These feeds are **always on** (no warm-up
+needed) and carry no orderbook/trades/candles, so subscribe with
+`topics: ["price"]`.
+
+Every resolution source shares `provider: "oracle"`. The **contract id** is the
+source identity — bare symbols are Binance spot; venue series append a suffix
+so they never overwrite each other.
+
+```
+contract_id: "btc-usd"
+provider: "oracle"
+topics: ["price"]
+```
+
+```
+contract_id: "btc-usd-polymarket-chainlink"
+provider: "oracle"
+topics: ["price"]
+```
+
+<Note>
+⚠️ **Reading the price:** an oracle `PriceUpdate` is not a two-sided quote —
+`mid_price`, `best_bid`, and `best_ask` are always `0`. The spot price is in the
+**`raw_price_cents`** field, which for oracle is scaled by **100,000** (micro-USD),
+*not* cents. Compute `price_usd = raw_price_cents / 100000`.
+Example: BTC at `$97,000.50` arrives as `raw_price_cents = 9700050000`.
+</Note>
+
+Available `contract_id` symbols:
+
+| Symbol | Feed |
+|--------|------|
+| `btc-usd`, `eth-usd`, `sol-usd`, `xrp-usd`, `doge-usd`, `hype-usd`, `bnb-usd` | Binance spot |
+| `{asset}-polymarket-chainlink` | Polymarket RTDS Chainlink ticks (same assets as Binance) |
+| `btc-usd-kalshi-cfb`, `eth-usd-kalshi-cfb` | Kalshi CF Benchmarks (BTC/ETH only) |
+| `{asset}-hyperliquid-mark` | Hyperliquid mark |
+| `{asset}-polymarket-twap30`, `{asset}-polymarket-twap60` | Polymarket Chainlink TWAP (legacy window overlays) |
+
+<Note>
+For historical oracle prices (down to 1-second resolution), use the REST
+`GET /markets/crypto/oracle-history` endpoint with the matching `source` —
+see [Crypto oracle history](/rest/markets#crypto-oracle-history).
+</Note>
+
+The server responds with a `SubscribedResponse` (`0x14`):
+```
+contract_id: "570362"  // Normalized ID
+```
+
+## Unsubscribing
+
+Send an `UnsubscribeRequest` to stop receiving data:
+
+```
+Wire: [0x11] [UnsubscribeRequest protobuf]
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `contract_id` | string | Yes | — | Market identifier |
+| `provider` | string | Yes | — | Provider name |
+
+The server responds with `UnsubscribedResponse` (`0x15`).
+
+Unsubscribing removes **all topics** for that contract. There is no way to selectively unsubscribe from individual topics.
+
+## Modifying Subscriptions
+
+There is no dedicated "modify subscription" message. However, you can change what data you receive for a contract using the existing subscribe/unsubscribe messages.
+
+### Adding Topics
+
+Send another `SubscribeRequest` for the same `contract_id` with the additional topics. Subscriptions are **additive** — the new topics are added on top of any existing ones.
+
+```text
+# Already subscribed to ["orderbook", "trades"]
+# Now want candles too — just send another subscribe:
+
+SubscribeRequest {
+  contract_id: "570362"
+  provider: "polymarket"
+  topics: ["candles"]
+  candle_timeframes: [60, 3600]
+}
+```
+
+After this, you will receive orderbook snapshots, trades, **and** candles. The server will also re-send cached snapshots (orderbook, latest prices, etc.) when it processes the new subscribe.
+
+### Removing Topics
+
+You **cannot** remove individual topics from an active subscription. To narrow your subscription (e.g., stop receiving orderbook data but keep trades), you must:
+
+1. Unsubscribe from the contract entirely
+2. Re-subscribe with only the topics you want
+
+```text
+# Currently receiving orderbook + trades + candles
+# Want to drop orderbook:
+
+UnsubscribeRequest {
+  contract_id: "570362"
+  provider: "polymarket"
+}
+
+SubscribeRequest {
+  contract_id: "570362"
+  provider: "polymarket"
+  topics: ["trades", "candles"]
+}
+```
+
+There will be a brief gap in data delivery between the unsubscribe and re-subscribe.
+
+### Changing Candle Timeframes
+
+To add new candle timeframes, send another `SubscribeRequest` with the additional timeframes. To remove timeframes, unsubscribe and re-subscribe with the desired set.
+
+## Arb subscriptions
+
+Cross-venue match and spread batches are a server-filtered, identified
+subscription rather than a per-contract one. Subscribe with
+`contract_id: "arb"` and `topics: ["arb"]` — any other combination is rejected
+with `arb subscriptions must use contract_id=arb and topics=[arb]`.
+
+Set `SubscribeRequest.arb_subscription` to an `ArbSubscription`:
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `subscription_id` | string | Yes | — | 1–64 characters, alphanumerics plus `-_.:`. Re-sending the same id replaces its filters in place. |
+| `filter.provider_pairs` | ArbProviderPair[] | In practice yes | empty | Unordered `(a_provider, b_provider)` `Provider` enum pairs. **An empty list matches nothing** — you must name the pairs you want. |
+| `filter.min_spread_bps` | int32 | No | `0` | 0–10000. Applied to spread batches. |
+| `filter.min_similarity_scaled` | int32 | No | `0` | 0–10000 (match confidence × 10,000). |
+| `filter.min_arb_liquidity_scaled` | int64 | No | `0` | Minimum executable notional in dollars × 10,000. `0` disables. Non-zero also excludes pairs whose liquidity is unknown. |
+| `filter.categories` | MarketCategory[] | No | all categories | Subjects to deliver. **An empty list means all categories** — the opposite of `provider_pairs`. |
+
+The server acknowledges with `SubscribedResponse` (`0x14`) carrying
+`contract_id: "arb"` and the effective `arb_subscription`, then replays cached
+batches through the filter. Data arrives as `ArbMatchList` (`0x0D`) and
+`ArbSpreadList` (`0x0E`), each echoing your `subscription_id`.
+`ArbMatchList.category_counts` is a census of the catalogue by subject counted
+*before* the category filter, so a client can draw its own category controls.
+
+Send `FetchRequest` with `arb_subscription_id` to read a subscription back plus
+its cached batches; an unknown id returns `ErrorResponse` with
+`action: "fetch"` and `arb subscription not found`. Send `UnsubscribeRequest`
+with `arb_subscription_id` to delete one (or `contract_id: "arb"`,
+`provider: "arb"` to delete all on the connection); the ack is
+`UnsubscribedResponse` echoing the removed id.
+
+Each arb subscription counts as one subscription against the per-connection and
+per-account subscription limits.
+
+## Keepalive
+
+### Client Ping
+
+Send a `PingRequest` (`0x12`) with your timestamp. The server echoes it back as `PongResponse` (`0x13`). Use this to measure round-trip latency. A `PingRequest` that fails to parse still gets a `PongResponse` with `timestamp_ms = 0`.
+
+### Idle timeout and protocol pings
+
+The socket has a **30-second idle timeout**. Keepalive is handled at the
+WebSocket protocol level: the server relies on standard `Ping`/`Pong` control
+frames (which browsers and mainstream client libraries answer automatically)
+and closes a connection that produces no traffic within the timeout. On a
+subscribed market-data connection, inbound data resets the timer.
+
+<Warning>
+**Gotcha: the server never sends `ServerPingRequest`.** `ServerPingRequest`
+(`0x18`) and `ClientPongResponse` (`0x19`) exist in the protocol and are
+accepted (a `0x19` frame is consumed and ignored), but the gateway does not
+currently emit `0x18`. Build liveness on protocol-level `Ping`/`Pong` control
+frames, never on receiving a `0x18`.
+</Warning>
+
+## Data Messages
+
+After subscribing, the server pushes data as it arrives.
+
+### Orderbook Snapshot (tag `0x02`)
+
+Full orderbook state for all outcomes of a contract. Sent on initial subscribe and periodically thereafter as a refresh, independent of the incremental deltas described below.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | Provider | Exchange source |
+| `contract_id` | string | Market ID |
+| `timestamp_us` | int64 | Microseconds since epoch |
+| `token_ids` | string[] | Token ID per outcome |
+| `outcome_names` | string[] | Human-readable names ("Yes", "No") |
+| `outcomes` | OutcomeOrderbook[] | Bids and asks per outcome. Perpetuals have exactly one entry. |
+| `seq` | uint64 | Monotonic sequence number per contract |
+| `epoch` | uint64 | Owning streamer-instance fencing token, bumped on ownership transfer. Drop any snapshot/delta whose `epoch` is below the highest you have seen for the contract. `0` = unfenced (legacy publishers). |
+| `price_scale` | int64 | Divisor for **this snapshot's** prices. `0` means the global 10,000. |
+| `size_scale` | int64 | Divisor for **this snapshot's** sizes. `0` means the publisher's usual scale. |
+
+Each `OutcomeOrderbook` contains `bids` and `asks`, each a list of `PriceLevel`:
+- `price`: divide by the snapshot's `price_scale` (or 10,000 when it is `0`)
+- `size_scaled`: divide by the snapshot's `size_scale` when it is non-zero
+
+When you receive a snapshot, **replace your local book** entirely and set `expected_seq = seq + 1` for delta tracking.
+
+<Note>
+**Every prediction-market provider sends `price_scale = 0` and
+`size_scale = 0`**, which means "use 10,000" — behaviour is unchanged from
+before these fields existed. Only perpetual snapshots set them. See
+[Price and size scaling](#price-and-size-scaling).
+</Note>
+
+### Orderbook Delta (tag `0x0F`)
+
+Incremental update to a previously delivered snapshot. Each delta lists only the price levels that changed since the last message. Deltas are emitted whenever the book changes (typically every few milliseconds on liquid markets).
+
+**Bandwidth**: deltas are typically 5–20× smaller than full snapshots — a delta carrying a single level change is ~60 bytes versus ~1,300 bytes for a full snapshot. On busy markets this can reduce orderbook bandwidth by ~70–90%.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `contract_id` | string | Market ID |
+| `timestamp_us` | int64 | Microseconds since epoch |
+| `outcomes` | OutcomeDelta[] | Changed levels per outcome (indexed same as snapshot's `outcomes`) |
+| `seq` | uint64 | Monotonic sequence number per contract |
+| `snapshot_seq` | uint64 | Seq of the baseline snapshot this delta applies to |
+| `epoch` | uint64 | Same fencing token as `OrderbookSnapshot.epoch`. `0` = unfenced. |
+
+Each `OutcomeDelta` contains `bids` and `asks`, each a list of `DeltaLevel`:
+- `price`: scaled by 10,000
+- `size_scaled`: new quantity at this price level. **`0` means the level was removed.**
+
+**Applying a delta to your local book:**
+
+For each outcome, for each side (bids/asks), iterate the `DeltaLevel` entries:
+- If `size_scaled == 0`: remove the level at `price` from your local book
+- Otherwise: insert or replace the level at `price` with `size_scaled`
+
+After applying, increment `expected_seq`. Before applying anything, run the
+sequence checks in [Sequencing and recovery](#sequencing-and-recovery) — they
+are mandatory for correctness.
+
+### Trade Batch (tag `0x04`)
+
+Batch of executed trades.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | Provider | Exchange source |
+| `contract_id` | string | Market ID |
+| `timestamp_us` | int64 | Microseconds since epoch |
+| `trades` | Trade[] | Individual trades |
+| `count` | uint32 | Number of trades in batch |
+| `backfilled` | bool | `true` when the batch comes from historical backfill rather than the live feed |
+
+Each `Trade` contains:
+- `trade_id`, `outcome_index`, `outcome`, `token_id`, `token_ids`, `outcome_names`
+- `price`: scaled by 10,000
+- `size_scaled`: trade size
+- `side`: `TRADE_SIDE_BUY` / `TRADE_SIDE_SELL` (`TRADE_SIDE_UNSPECIFIED` = 0)
+- `taker_side`: venue-supplied taker side as a string
+- `timestamp_sec`: Unix seconds
+- `outcome_0_price`, `outcome_1_price`: outcome prices at trade time (scaled by 10,000)
+- `block_number`, `log_index`: on-chain ordering key
+- `tx_hash`, `taker_address`, `maker_address`
+
+### Candle (tag `0x03`)
+
+OHLC candle updated on every trade.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | Provider | Exchange source |
+| `contract_id` | string | Market ID |
+| `timeframe_seconds` | uint32 | `60`, `300`, `900`, `3600`, `14400`, `86400` |
+| `bucket_start` | int64 | Unix timestamp (seconds) of candle start |
+| `volume_scaled` | int64 | Total volume in candle |
+| `outcomes` | OutcomeOHLC[] | Per-outcome OHLC |
+| `seq` | uint64 | Sequence number |
+| `trade_ts` | int64 | Timestamp of the trade that triggered this candle update |
+
+Each `OutcomeOHLC`: `index`, `name`, `token_id`, and `open`, `high`, `low`,
+`close` (all scaled by 10,000).
+
+`timeframe_seconds` lists the timeframes the gateway subscribes when you omit
+`candle_timeframes`. You may request any value between 1 and 604800, but only
+timeframes an upstream producer publishes will deliver data.
+
+### Price Update (tag `0x05`)
+
+Lightweight mid/bid/ask price change.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | Provider | Exchange source |
+| `contract_id` | string | Market ID |
+| `timestamp_us` | int64 | Microseconds since epoch |
+| `mid_price` | int32 | Contract mid price (scaled 10,000) |
+| `best_bid` | int32 | Best bid (scaled 10,000) |
+| `best_ask` | int32 | Best ask (scaled 10,000) |
+| `tokens` | TokenPriceUpdate[] | Per-outcome prices |
+| `raw_price_cents` | int64 | Raw price in cents for oracle/crypto prices (0 if unused) |
+
+### Volume (tag `0x06`)
+
+Rolling volume statistics.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | Provider | Exchange source |
+| `contract_id` | string | Market ID |
+| `volume_1h_scaled` | int64 | Volume in last hour |
+| `volume_24h_scaled` | int64 | Volume in last 24 hours |
+| `timestamp_us` | int64 | Microseconds since epoch |
+| `seq` | uint64 | Sequence number for ordering |
+
+### Quote (tag `0x1A`)
+
+Lightweight top-of-book for a single token, delivered on the `quote` topic.
+Payload is `kairos.v1.Quote`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `contract_id` | string | Market ID |
+| `token_id` | string | Outcome token this quote is for |
+| `provider` | Provider | Exchange source |
+| `bid` / `ask` / `mid` | int32 | Prices scaled by 10,000 |
+| `timestamp_us` | int64 | Microseconds since epoch |
+
+### Tick Size Change (tag `0x1C`)
+
+Delivered to `orderbook` subscribers when a market's valid price grid changes.
+Payload is `kairos.v1.TickSizeUpdate`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provider` | Provider | Exchange source |
+| `contract_id` | string | Market ID |
+| `asset_id` | string | Token the grid applies to; empty means market-wide (Kalshi) |
+| `timestamp_us` | int64 | Event time, microseconds since epoch |
+| `ranges` | TickRange[] | The current grid: `start`, `end`, `step` as decimal strings |
+| `min_tick` | string | Finest step across all ranges |
+| `previous_min_tick` | string | Previous tick for venue-pushed changes; empty for synthetic/initial |
+| `synthetic` | bool | `true` when Kairos synthesized the grid rather than the venue pushing a change |
+
+## Market Resolution
+
+When a market resolves (any venue), the server pushes an unsolicited `MarketResolvedNotice` (`0x1D`) to every subscriber of that contract:
+
+```
+Wire: [0x1D] [MarketResolvedNotice protobuf]
+
+MarketResolvedNotice {
+  contract_id    = "..."   // same id you subscribed with
+  provider       = "..."   // e.g. "polymarket", "kalshi"
+  resolved_at_sec = 1720000000  // unix seconds the resolution was observed
+}
+```
+
+On receiving it:
+
+- **Data stops.** The server stops refreshing its upstream feeds for the market, so no further orderbook, trade, price, or candle messages will arrive. The book dies at the source within seconds.
+- **Drop local subscription state.** Treat the contract as unsubscribed. Sending your own `UnsubscribeRequest` afterwards is harmless — the server tolerates it.
+- **Re-subscribes are rejected.** A `SubscribeRequest` for a recently-resolved market returns the standard `ErrorResponse` (`0x17`) with `action: "subscribe"` and `message: "market resolved — subscription rejected"`, and no data is sent. The rejection persists for 7 days after resolution.
+
+For Polymarket-family (CTF) markets the notice is keyed on the CLOB token id (the id the book streams on); a notice is also emitted for the numeric market id. Kalshi markets are keyed on the ticker. Match the notice's `contract_id`/`provider` against your active subscriptions exactly as you match data messages.
+
+Enforcement is soft: the server does not force-close your socket, so a non-compliant client simply ends up in a dead topic receiving nothing. Well-behaved clients surface the resolution and stop expecting live data.
+
+## Message Type Tags
+
+| Tag | Direction | Message |
+|-----|-----------|---------|
+| `0x01` | Server | Tick |
+| `0x02` | Server | OrderbookSnapshot |
+| `0x03` | Server | Candle |
+| `0x04` | Server | TradeBatch |
+| `0x05` | Server | PriceUpdate |
+| `0x06` | Server | Volume |
+| `0x07` | Server | Sports update |
+| `0x08` | Server | Analytics |
+| `0x09` | Server | Analytics — wallet graph |
+| `0x0A` | Server | Analytics — deposit scanner |
+| `0x0B` | Server | Analytics — capital flow |
+| `0x0C` | Server | Analytics — leaderboard velocity |
+| `0x0D` | Server | ArbMatchList |
+| `0x0E` | Server | ArbSpreadList |
+| `0x0F` | Server | OrderbookDelta |
+| `0x10` | Client | SubscribeRequest |
+| `0x11` | Client | UnsubscribeRequest |
+| `0x12` | Client | PingRequest |
+| `0x13` | Server | PongResponse |
+| `0x14` | Server | SubscribedResponse |
+| `0x15` | Server | UnsubscribedResponse |
+| `0x16` | Client | FetchRequest |
+| `0x17` | Server | ErrorResponse |
+| `0x18` | Server | ServerPingRequest |
+| `0x19` | Client | ClientPongResponse |
+| `0x1A` | Server | Quote |
+| `0x1B` | Server | TxOdds update |
+| `0x1C` | Server | TickSizeChange (`kairos.v1.TickSizeUpdate`) |
+| `0x1D` | Server | MarketResolvedNotice |
+| `0x40 0x02` | Server | Perpetual v2 BookSnapshot (type and version bytes) |
+| `0x50 0x01` | Server | SyntheticSnapshot (type and version bytes) |
+| `0x52 0x01` | Server | SyntheticDelta (type and version bytes) |
+
+<Note>
+**Forward compatibility:** Always dispatch on the 1-byte type tag and silently ignore unknown tags. New message types may be added in future versions; clients that hard-fail on unknown tags will break on protocol updates.
+</Note>
+
+## Price and size scaling
+
+Prices in protobuf messages are integers. The divisor is **10,000 by default**,
+which is what every prediction-market message uses.
+
+| Raw Value | Decimal Price | Meaning |
+|-----------|---------------|---------|
+| `6500` | $0.65 | 65% implied probability |
+| `100` | $0.01 | 1% implied probability |
+| `9900` | $0.99 | 99% implied probability |
+
+**Formula (prediction markets):** `decimal_price = raw_value / 10000`
+
+### Per-snapshot scales (perpetuals)
+
+`OrderbookSnapshot` carries two extra fields, `price_scale` and `size_scale`.
+**`0` means "use the default"** — that is what every prediction-market
+provider sends, and it is why this changed nothing for existing clients.
+
+A perpetual snapshot instead sets both to the smallest power of ten that
+represents that book's own levels exactly, chosen per snapshot:
+
+```python
+price = level.price / (snapshot.price_scale or 10000)
+
+if snapshot.size_scale:
+    size = level.size_scaled / snapshot.size_scale
+else:
+    size = level.size_scaled / provider_size_scale  # unchanged legacy handling
+```
+
+<Note>
+**`size_scale = 0` does not mean "divide by one".** It means the publisher
+used its own long-standing, provider-specific size scale (Polymarket book
+sizes, for example, are shares × 100). Keep whatever handling you already
+have for that case and only switch to the carried divisor when the field is
+set.
+</Note>
+
+**This is the single most important integration detail for perpetuals.** One
+fixed scale cannot carry them. At 10,000, 131 of Hyperliquid's 177 live coins
+truncate — HMSTR quotes `0.000169` and would decode as `0.0001`, wrong by 41%
+and still looking like a real quote. At a scale fine enough for HMSTR, BTC's
+price overflows the `int32` price field. Sizes fail the same way in the other
+direction: at a fixed fine size scale, HMSTR's real 167M-token depth clamps to
+`int64` max and advertises effectively unlimited liquidity.
+
+Both scales are chosen **across both sides of one book**, so a bid and an ask
+in the same snapshot are always directly comparable. Varying the scale between
+snapshots is safe only because perpetual books publish as whole baselines and
+are never merged with a snapshot at a different scale.
+
+A book that cannot be represented exactly within `int32` prices / `int64`
+sizes at any power of ten is **refused, not rounded** — the publisher drops it
+rather than emitting a saturated price or a clamped size.
+
+### Other scales
+
+- `Trade.price`, `Candle` OHLC, and `PriceUpdate.mid_price` / `best_bid` /
+  `best_ask` are scaled by 10,000.
+- `PriceUpdate.raw_price_cents` for `provider: "oracle"` is scaled by
+  **100,000** (micro-USD), not cents — see
+  [Crypto oracle prices](#crypto-oracle-prices).
+
+## Sequencing and recovery
+
+An orderbook you maintain from deltas is only correct if every delta lands on
+the exact baseline it was built against. The rules below are not optional.
+
+### Sequence gap handling
+
+Track `expected_seq` per contract. When a delta arrives:
+
+- If `delta.seq < expected_seq`: stale, drop it
+- If `delta.seq == expected_seq`: apply it, set `expected_seq = delta.seq + 1`
+- If `delta.seq > expected_seq`: **gap detected** — you missed messages. Request a fresh snapshot via [FetchRequest](#fetchrequest-tag-0x16) and skip applying any further deltas until the new snapshot arrives.
+
+Also verify `delta.snapshot_seq` matches the seq of your last snapshot. If it doesn't, your baseline is stale and you must resync.
+
+<Note>
+**Gotcha: a sequence gap has no tolerance.** There is no "close enough"
+window and no catch-up stream — applying a delta to a stale baseline produces
+a corrupted local book that mixes levels from two different snapshots, and
+nothing on the wire will tell you it happened. On any gap, stop applying
+deltas and resync from a full snapshot.
+</Note>
+
+Independently of `seq`, drop any snapshot or delta whose `epoch` is **below**
+the highest you have seen for that contract — the epoch is the owning
+streamer-instance fencing token, and two sequence spaces collide during a
+handoff. `0` means unfenced (legacy publishers).
+
+### FetchRequest (tag `0x16`)
+
+Sent by the client to request a fresh full snapshot. The server fetches the
+reconstructed live snapshot from the book cache — not its own relay copy, which
+can be behind the sequence you already saw — and delivers it as an
+`OrderbookSnapshot` (tag `0x02`), which you should use to reset your local book.
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `contract_id` | string | Yes | — | Market ID |
+| `provider` | string | Yes | — | Provider name |
+| `arb_subscription_id` | string | `arb` only | — | Reads back an arb subscription instead of a market snapshot — see [Arb subscriptions](#arb-subscriptions). |
+
+Use this when you detect a sequence gap or your `snapshot_seq` baseline doesn't
+match the incoming delta's `snapshot_seq`. You do **not** need an active
+subscription on the contract to fetch its snapshot.
+
+A fetch does not always produce a snapshot. When it cannot, the server replies
+with an `ErrorResponse` (`0x17`) whose `action` is scoped to the request:
+
+| `action` | `message` | What to do |
+|---|---|---|
+| `fetch` | `fetch requires provider and contract_id` / `invalid FetchRequest protobuf` | The request was malformed — fix it before retrying. |
+| `fetch_rate_limit` | `Snapshot recovery rate exceeded: max N fetches/second per connection` | You exceeded the authenticated per-connection fetch quota (20/s by default). Back off. |
+| `fetch_rate_limit` | `Anonymous snapshot recovery is limited to one request per second per connection` | Anonymous quota. Back off, or authenticate. |
+| `fetch_waiting:{provider}:{contract_id}` | `orderbook snapshot unavailable in relay and book cache`, `orderbook snapshot superseded; retry` | No usable snapshot yet — keep listening, a live snapshot will re-anchor you. |
+| `fetch_error:{provider}:{contract_id}` | `orderbook snapshot fetch capacity exhausted; retry`, `anonymous snapshot fetch capacity exhausted; retry`, `book-cache snapshot request failed; retry`, `book-cache snapshot failed validation; retry`, `orderbook snapshot unavailable; book-cache fallback disabled` | Recovery failed for this attempt; retry with backoff. |
+
+Anonymous fetches can never consume the last two upstream recovery slots, which
+are reserved for authenticated clients.
+
+### Slow-consumer (coalesced) delivery
+
+When a contract's measured delta rate
+crosses the gateway's threshold (150 deltas/s by default, leaving again below
+60/s), connections that are not on the fast lane stop receiving individual
+deltas for that contract and instead receive a **full `OrderbookSnapshot` every
+50 ms**, which re-anchors `expected_seq`. Nothing is lost. By default only
+API-key connections are fast-lane eligible (browser JWT sessions are not);
+the mode is server-configured (`api_key`, `all`, or `none`).
+
+<Note>
+**Gotcha: "no deltas arrived" is not a stalled book.** A coalesced contract
+stops sending deltas entirely. Keep applying snapshots as full replacements
+and re-derive `expected_seq` from each one.
+</Note>
+
+## Errors & Disconnection
+
+Clients MUST be prepared for the server to reject the upgrade, push an in-band error, or close the socket at any time. Robust clients reconnect with exponential backoff and re-subscribe their topic set from a clean slate.
+
+### Upgrade-time rejections (HTTP status before 101)
+
+| HTTP Status | When it happens | What to do |
+|-------------|-------|------------------------------|
+| `401 Unauthorized` | Missing/invalid `Sec-WebSocket-Protocol` JWT (`Authentication required via Sec-WebSocket-Protocol header or API key headers`, `Invalid token`), or an incomplete/invalid API-key triple (`X-Client-Id, X-Api-Key, and X-Api-Secret are all required`, `Invalid API credentials`) | Refresh the JWT or fix credentials, then retry. Do NOT retry on a tight loop — the token will not become valid on its own. |
+| `429 Too Many Requests` | Per-user or per-IP connection limit exceeded (`Connection limit exceeded`); credential-verification admission throttle (`Token verification rate exceeded`, `Credential verification rate exceeded`); anonymous admission throttle or per-IP cap (`Anonymous admission rate exceeded`, `Anonymous connection limit exceeded`) | Close other connections for this user, then retry with backoff (e.g. 1s, 2s, 4s, …, capped at 30s). |
+| `503 Service Unavailable` | API-key validator not configured (`API key authentication not configured`), or the anonymous tier is unavailable / at fleet capacity (`Anonymous admission unavailable`, `Anonymous admission unavailable or at capacity`) | Retry with longer backoff; if persistent, fall back to an authenticated connection. |
+
+The response body is JSON: `{"error":"<reason>"}`.
+
+A `503` on the load balancer health check is also possible while an instance is
+congested: it stops receiving **new** connections, but existing sockets are
+untouched.
+
+### In-band `ErrorResponse` (tag `0x17`)
+
+The server reports recoverable, message-scoped errors as a binary protobuf frame with type tag `0x17`. The payload is an `ErrorResponse`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message` | string | Human-readable error description |
+| `action` | string | Which client action triggered the error: `"subscribe"`, `"unsubscribe"`, `"rate_limit"`, `"fetch"`, `"fetch_rate_limit"`, `"fetch_error:{provider}:{contract_id}"`, `"fetch_waiting:{provider}:{contract_id}"`, or empty for generic errors (unknown message type, text frame received) |
+
+The connection **stays open** when an `ErrorResponse` is sent — the server has dropped the offending message only. The client may continue using the connection.
+
+<Note>
+**Gotcha: two `action` values embed the market.** Because
+`fetch_error:{provider}:{contract_id}` and
+`fetch_waiting:{provider}:{contract_id}` are templated, match `action` by
+prefix rather than by equality if you route errors per subscription.
+</Note>
+
+Every `ErrorResponse` the gateway emits:
+
+| `action` | `message` | When it happens |
+|---|---|---|
+| `subscribe` | `Invalid SubscribeRequest protobuf` | Payload failed to decode |
+| `subscribe` | `Too many topics in one subscribe (max 16)` | `topics` longer than 16 |
+| `subscribe` | `Unknown subscription topic: <value>` | Topic string not in the allowlist |
+| `subscribe` | `Topic requires authentication: <value>` | Anonymous connection asked for `analytics` or `arb` while the opt-in is off |
+| `subscribe` | `Too many candle timeframes in one subscribe (max 16)` | `candle_timeframes` longer than 16 |
+| `subscribe` | `Candle timeframes must be between 1 and 604800 seconds` | Timeframe of `0` or above one week |
+| `subscribe` | `arb subscriptions must use contract_id=arb and topics=[arb]` | Arb requested alongside other topics or with a different `contract_id` |
+| `subscribe` | `arb subscription_id must be 1-64 URL-safe characters`, `arb min_spread_bps must be between 0 and 10000`, `arb min_similarity_scaled must be between 0 and 10000`, `arb min_arb_liquidity_scaled cannot be negative`, `arb categories must be valid market categories`, `arb provider pairs must contain two distinct supported providers` | Invalid arb filter |
+| `subscribe` | `Provider identifier is invalid` | `provider` is not a transport-safe identifier |
+| `subscribe` | `contract_id is not a valid market identifier` | `contract_id` is not a transport-safe identifier |
+| `subscribe` | `synthetic requires a canonical synthetic id (syn_ followed by 16 hex digits)` | `synthetic` topic with a non-canonical id |
+| `subscribe` | `perps_book requires provider hyperliquid_perps, polymarket_perps, or kalshi_margin` | `perps_book` on a non-perpetual provider |
+| `subscribe` | `The same contract_id cannot be subscribed from multiple providers on one connection` | Provider-qualification conflict — use a second connection |
+| `subscribe` | `market resolved — subscription rejected` | Market resolved within the last 7 days |
+| `subscribe` | `Subscription limit exceeded: max N subscriptions per connection` | Per-connection subscription cap |
+| `subscribe` | `Subscription limit exceeded: too many active subscriptions for this account` | Fleet-wide per-account subscription cap |
+| `unsubscribe` | `Invalid UnsubscribeRequest protobuf`, `Provider identifier is invalid` | Malformed unsubscribe |
+| `rate_limit` | `Rate limit exceeded: max N messages/second` | Inbound frame rate exceeded |
+| `fetch` / `fetch_rate_limit` / `fetch_error:…` / `fetch_waiting:…` | see [FetchRequest](#fetchrequest-tag-0x16) | Snapshot recovery |
+| *(empty)* | `Unknown message type` | Unrecognized 1-byte tag |
+| *(empty)* | `Text messages not supported. Use binary protobuf format.` | Text frame received — the server only accepts binary frames |
+
+An empty binary frame is dropped silently, with no error.
+
+### Server-initiated close codes
+
+| Close code | When it happens | What to do |
+|------------|-------|------------------------------|
+| `1000` (normal) | Server shutdown / graceful close | Reconnect after a short delay, re-subscribe. |
+| `1001` (going away) | Server restarting | Reconnect with backoff. |
+| `1006` (abnormal) | Underlying TCP/TLS dropped; server force-closed without a code (severe rate-limit abuse, or a connection-limit race at open); **slow consumer** — the socket's outbound buffer exceeded 4 MB of backpressure and was closed rather than buffered without bound; or the 30-second idle timeout elapsed | Throttle your message rate, drain your receive loop faster, and reconnect with backoff. Persistent `1006` after reconnect indicates your traffic pattern is being shed — subscribe to fewer contracts or read faster. |
+| `4001` (auth expired/revoked) | JWT expired or revoked; the 60s auth revalidation timer closed the connection | Refresh the JWT (do NOT reuse the expired one), then reconnect. API-key connections are not affected. |
+| `4002` (anonymous lifetime) | An anonymous session reached its one-hour lifetime | Reconnect as-is. Nothing is wrong with the client; the tier is time-boxed. |
+| `4003` (anonymous lease lost) | The anonymous admission lease could not be renewed (fleet capacity or Redis loss) | Reconnect with backoff; consider authenticating. |
+
+### Recommended reconnect / resync flow
+
+1. On any close, wait at least 500 ms before reconnecting; on repeated failures use exponential backoff up to 30 s with jitter.
+2. On close code `4001`, refresh the JWT **before** reconnecting. On `4002` /
+   `4003` (anonymous tier), reconnect as-is with backoff.
+3. After reconnecting, re-send all `SubscribeRequest`s. The server has no memory of prior subscriptions.
+4. On reconnect, reset all per-contract `expected_seq` / `snapshot_seq` state and wait for the fresh `OrderbookSnapshot` that arrives in response to each subscribe — applying deltas across a reconnect with stale baselines will corrupt your local book.
+5. Treat unexpected `1006`s during normal operation as a hint that you may be sending too many messages — review your subscribe churn and ping frequency.
+
+## Connection Limits
+
+All values below are server defaults and may be tuned per environment. An API
+key can carry its own `ws.maxConnections` / `ws.maxSubscriptions` overrides,
+which replace the defaults for connections opened with that key.
+
+| Limit | Default |
+|-------|---------|
+| Connections per user | 100 |
+| Connections per IP | 50 |
+| Subscriptions per connection | 100 |
+| Active subscriptions per account (across connections) | 2000 |
+| Maximum inbound frame size | 64 KiB |
+| Upgrade attempts per IP (credential verification) | 20/s |
+
+Exceeding a connection limit returns `429 Too Many Requests` on upgrade.
+Exceeding a subscription limit returns an in-band `ErrorResponse` with
+`action: "subscribe"`; the connection stays open.
+
+Anonymous connections have their own, stricter quotas — see
+[Anonymous public access](#anonymous-public-access).
+
+## Message Rate Limits
+
+| Data Type | Default |
+|-----------|---------|
+| Price updates | 20 per second per contract (server-wide, shared by all subscribers) |
+| Orderbook snapshots / deltas | Per-contract limiter, **disabled by default** |
+| Trades | Never rate-limited (all trades delivered) |
+
+Inbound client frames are limited to **50 per second per connection** (10/s for
+anonymous connections). Exceeding it returns an `ErrorResponse` with
+`action: "rate_limit"` and the frame is dropped.
+
+<Note>
+**Gotcha: the error path is itself throttled, and abuse ends the
+connection.** At most **3 error frames per 10-second window** are sent, while
+violations keep accumulating even during that suppression. Once accumulated
+violations reach **10× the per-second limit** within the window, the server
+force-closes the connection without a close code.
+</Note>
+
+Snapshot recovery (`FetchRequest`) has its own quota: **20/s per connection**
+for authenticated clients, **1/s per connection** for anonymous ones.

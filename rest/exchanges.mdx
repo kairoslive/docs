@@ -1,0 +1,404 @@
+---
+title: "Exchanges & Allowances"
+description: "Per-venue capability discovery and ERC-20/ERC-1155 allowance status for on-chain exchanges"
+---
+
+Discover what each venue supports before you build against it — order types, time-in-force values, tick and size bounds, fee model, settlement currency — and read or grant the on-chain token allowances that on-chain venues need before they can trade on your behalf.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://execution.kairos.trade
+```
+
+## Authentication
+
+Every endpoint on this page requires authentication — none are public. Same API-key headers as [Orders](/rest/orders):
+
+```
+X-Client-Id: kairos_ck_...
+X-Api-Key: <64 hex chars>
+X-Api-Secret: <64 hex chars>
+```
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+The three metadata reads and the allowance read enforce **no scope** — any credential that authenticates can call them. `POST /exchanges/{exchange_id}/allowances` is fund-affecting: it requires the `trade:execute` scope, sits behind the mutation gate that runs *before* user auth (so a bad credential triple is a **`403`**, not a `401`), and requires your installed Turnkey trading policies to be current.
+
+Scopes only bind API-key callers; a session-JWT caller carries no scope set and skips both the scope check and the per-provider enable flag.
+
+## Exchange ids
+
+<Note>
+**Gotcha:** `{exchange_id}` is matched **case-sensitively** against the registry, with exactly one alias: `kalshi_offchain` resolves to `kalshi` (that alias *is* matched case-insensitively). Everything else is used verbatim, so `Polymarket` and `POLYMARKET` return `404` where `polymarket` succeeds.
+</Note>
+
+The recognised ids are `polymarket`, `kalshi`, `predictfun`, `opinion`, and `hyperliquid`. **Which of them are actually registered is deployment-dependent** — Kalshi, Opinion, and Predict.fun each register conditionally, and a cell-scoped deployment registers exactly one venue. Call [`GET /exchanges`](#list-exchanges) to see what this deployment actually serves rather than assuming the full list.
+
+## List exchanges
+
+```
+GET /exchanges
+```
+
+Every exchange id registered on this deployment. Call it first to find out which venues this deployment serves.
+
+Authenticated; no scope required.
+
+### Request
+
+No parameters.
+
+```bash
+curl https://execution.kairos.trade/exchanges \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+["polymarket", "kalshi", "hyperliquid"]
+```
+
+A bare JSON array of strings — not a wrapped object. **The order is not stable** between calls; sort client-side if you need determinism.
+
+## Get exchange
+
+```
+GET /exchanges/{exchange_id}
+```
+
+Display metadata plus the full capability block for one venue.
+
+Authenticated; no scope required.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` (path) | string | Yes | — | Case-sensitive venue id. One of `polymarket`, `kalshi`, `predictfun`, `opinion`, `hyperliquid`, or the alias `kalshi_offchain` |
+
+```bash
+curl https://execution.kairos.trade/exchanges/polymarket \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "id": "polymarket",
+  "name": "Polymarket",
+  "is_active": true,
+  "capabilities": { "...": "see Capabilities below" }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | **Echoed back exactly as you spelled it in the path**, not the canonical id |
+| `name` | string | Human-readable venue name |
+| `is_active` | boolean | Whether the venue is currently active |
+| `capabilities` | object | The same object [`/capabilities`](#get-capabilities) returns |
+
+> **Gotcha:** `id` echoes the request, so a lookup on `kalshi_offchain` returns `"id": "kalshi_offchain"` while `capabilities.exchange_id` is `"kalshi"`. Key off `capabilities.exchange_id` when you need the canonical value.
+
+> **Gotcha:** an unregistered id returns **`404` with an empty body** — no JSON, so do not try to parse one.
+
+## Get capabilities
+
+```
+GET /exchanges/{exchange_id}/capabilities
+```
+
+The capability block on its own. This is the endpoint to consult before submitting an order: it tells you whether the venue will accept your time-in-force, whether `post_only` is honoured, and what the tick and size bounds are.
+
+Authenticated; no scope required.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` (path) | string | Yes | — | Case-sensitive venue id, as on [`GET /exchanges/{exchange_id}`](#get-exchange) |
+
+```bash
+curl https://execution.kairos.trade/exchanges/polymarket/capabilities \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "exchange_id": "polymarket",
+  "display_name": "Polymarket",
+  "supported_order_types": {
+    "market": true,
+    "limit": true,
+    "stop_loss": false,
+    "stop_limit": false,
+    "take_profit": false,
+    "trailing_stop": false
+  },
+  "supported_tif": ["GTC", "GTD", "FOK", "FAK", "IOC"],
+  "supports_post_only": true,
+  "requires_allowances": true,
+  "supports_redemption": true,
+  "has_outcome_tokens": true,
+  "supports_user_websocket": true,
+  "supports_cancel_all": true,
+  "supports_batch_orders": true,
+  "min_tick_size": "0.01",
+  "min_order_size": "1",
+  "max_order_size": null,
+  "fee_model": "maker_rebate",
+  "maker_fee_bps": 0,
+  "taker_fee_bps": 200,
+  "chain_id": "137",
+  "settlement_currency": "USDC",
+  "autonomous_settlement": false,
+  "settlement_deferred_fill": false,
+  "sell_quantity_decimals": 2,
+  "max_price": "1",
+  "is_active": true,
+  "ws_fill_authoritative": true,
+  "ws_fills_include_exchange_fee": true
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `exchange_id` | string | Canonical venue id |
+| `display_name` | string | Human-readable name |
+| `supported_order_types` | object | Six booleans: `market`, `limit`, `stop_loss`, `stop_limit`, `take_profit`, `trailing_stop` |
+| `supported_tif` | string[] | Accepted time-in-force values (`GTC`, `GTD`, `FOK`, `FAK`, `IOC`) |
+| `supports_post_only` | boolean | Whether `post_only` is honoured. A `post_only` order to a venue without it is rejected `400`, never downgraded |
+| `requires_allowances` | boolean | Whether the venue needs on-chain token approvals. **Not a reliable predictor of whether the allowance endpoints work — see [Allowances](#allowances)** |
+| `supports_redemption` | boolean | Whether [CTF redeem](/rest/ctf) is available |
+| `has_outcome_tokens` | boolean | Whether positions are on-chain outcome tokens |
+| `supports_user_websocket` | boolean | Whether a per-user order/fill socket exists |
+| `supports_cancel_all` | boolean | Whether `POST /orders/cancel-all` is supported |
+| `supports_batch_orders` | boolean | Whether batch submission is supported |
+| `min_tick_size` | string | Minimum price increment, **a decimal string** |
+| `min_order_size` | string | Minimum order size, decimal string |
+| `max_order_size` | string \| null | Maximum order size; `null` means unbounded |
+| `fee_model` | string | `zero_fee`, `maker_rebate`, `tiered_schedule`, or `fixed_bps` |
+| `maker_fee_bps` / `taker_fee_bps` | integer \| null | Basis points; `null` where the venue uses a tiered schedule |
+| `chain_id` | string \| null | EVM chain id **as a string**; `null` for off-chain venues |
+| `settlement_currency` | string | Settlement asset |
+| `autonomous_settlement` | boolean | Venue settles without a Kairos-initiated call |
+| `settlement_deferred_fill` | boolean | Fills settle asynchronously after acknowledgement |
+| `sell_quantity_decimals` | integer \| null | Decimal places allowed on a sell quantity; `null` means no venue-specific rounding |
+| `max_price` | string \| null | Maximum price, decimal string |
+| `is_active` | boolean | Whether the venue is active |
+| `ws_fill_authoritative` | boolean | Whether the user socket's fills are authoritative |
+| `ws_fills_include_exchange_fee` | boolean | Whether socket fills already carry the venue fee |
+
+<Note>
+**Gotcha:** all decimal fields are JSON strings, not numbers (`"0.01"`, not `0.01`) — including `min_tick_size`, `min_order_size`, `max_order_size`, and `max_price`. `chain_id` is a string too. Nullable fields emit an explicit `null`; nothing in this object is ever omitted.
+</Note>
+
+An unregistered id returns **`404` with an empty body**.
+
+### Capability matrix
+
+These values are compile-time constants, identical across deployments:
+
+| | `polymarket` | `opinion` | `predictfun` | `hyperliquid` | `kalshi` |
+|---|---|---|---|---|---|
+| `supported_tif` | all five | **`GTC` only** | all five | all five | all five |
+| `supports_post_only` | yes | no | yes | yes | yes |
+| `requires_allowances` | **yes** | no | **yes** | no | no |
+| `supports_redemption` | **yes** | no | **yes** | no | no |
+| `has_outcome_tokens` | yes | yes | yes | yes | **no** |
+| `supports_user_websocket` | yes | no | no | no | yes |
+| `supports_cancel_all` | yes | no | no | no | yes |
+| `supports_batch_orders` | yes | no | no | no | no |
+| `min_tick_size` | `"0.01"` | `"0.01"` | `"0.001"` | `"0.0001"` | `"0.01"` |
+| `max_order_size` | null | null | null | null | `"100000"` |
+| `fee_model` | `maker_rebate` | `zero_fee` | `zero_fee` | `zero_fee` | `tiered_schedule` |
+| `taker_fee_bps` | `200` | `0` | `0` | `0` | **null** |
+| `chain_id` | `"137"` | `"56"` | `"56"` | null | null |
+| `settlement_currency` | USDC | USDC | **USDT** | USDC | **USD** |
+| `autonomous_settlement` | no | no | no | **yes** | no |
+| `settlement_deferred_fill` | no | no | **yes** | no | no |
+| `sell_quantity_decimals` | 2 | null | null | null | 2 |
+| `ws_fill_authoritative` | yes | no | yes | no | no |
+
+Only `market` and `limit` are true in `supported_order_types` on every venue — no venue advertises native stop, stop-limit, take-profit, or trailing-stop orders.
+
+## Allowances
+
+On-chain venues need ERC-20 and ERC-1155 approvals in place before the exchange contracts can move your collateral and outcome tokens. These two endpoints read and grant them.
+
+<Note>
+**Gotcha:** only `polymarket`, `predictfun`, and `opinion` have an allowance manager registered. `kalshi` and `hyperliquid` return `404` on both endpoints. `opinion` reports `requires_allowances: false` yet still has a manager, so branch on the `404` rather than on the capability flag.
+</Note>
+
+### Get allowance status
+
+```
+GET /exchanges/{exchange_id}/allowances
+```
+
+Reads current on-chain approval state for the caller's trading wallet. Signs nothing and moves nothing, so it takes neither the mutation gate nor the policy-version gate.
+
+Authenticated; no scope required.
+
+**Rate limit: 30 requests/minute per user.** It fails **closed** — if the limiter's backing store is unavailable you get `429`, never a bypass.
+
+#### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` (path) | string | Yes | — | Case-sensitive venue id. Only `polymarket`, `predictfun`, and `opinion` have an allowance manager |
+
+Path parameter only. **The wallet is resolved server-side from your credential** — there is no wallet parameter, and you cannot read another account's allowances.
+
+```bash
+curl https://execution.kairos.trade/exchanges/polymarket/allowances \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+#### Response
+
+```json
+{
+  "enabled": false,
+  "wallet_address": "0x1234...",
+  "allowances": [
+    {
+      "token_address": "0xabc...",
+      "token_symbol": "pUSD",
+      "spender_address": "0xdef...",
+      "spender_name": "CTF Exchange V2",
+      "current_allowance": "0",
+      "required_allowance": "1000000",
+      "is_sufficient": false,
+      "is_unlimited": false
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `enabled` | boolean | True only when `allowances` is non-empty **and** every entry is sufficient. An empty read is always `false` |
+| `wallet_address` | string | The effective trading wallet — the smart account for an imported wallet, not the owner EOA |
+| `allowances[].token_address` / `token_symbol` | string | Token being approved |
+| `allowances[].spender_address` / `spender_name` | string | Contract being approved, e.g. `CTF Exchange V2`, `NegRisk Adapter (CLOB v1)` |
+| `allowances[].current_allowance` | string | Current on-chain allowance, decimal string |
+| `allowances[].required_allowance` | string \| null | Required amount; `null` when the venue does not express a minimum |
+| `allowances[].is_sufficient` | boolean | Whether this slot is already good |
+| `allowances[].is_unlimited` | boolean | Whether the approval is unlimited |
+
+Every field is always present. Predict.fun approves each market variant separately, so expect roughly a dozen entries there against Polymarket's four.
+
+#### Errors
+
+These use the structured envelope described under [Errors](#errors); the Code column holds `error_details.code`, and `—` means this page names no distinct code for that condition.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `404` | — | No credential provider, no credentials on file for the venue, credentials carry no wallet, or **no allowance manager for the venue** (`kalshi`, `hyperliquid`) | Confirm the venue has a manager and that credentials for it are on file — retrying unchanged returns the same `404` |
+| `429` | — | More than 30 reads/minute for this user | Back off and retry; the limiter is per user and per minute |
+| `502` | — | The on-chain read failed (RPC error) | Retry — the failure is upstream of the service and not caused by your request |
+
+### Set allowances
+
+```
+POST /exchanges/{exchange_id}/allowances
+```
+
+Submits any missing approvals for the venue. Already-sufficient slots are skipped, so a repeat call after success submits nothing on-chain and still returns `success: true`.
+
+Scope `trade:execute`. Behind the mutation gate, so a bad credential triple is `403`, and your installed Turnkey trading policies must be current.
+
+#### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` (path) | string | Yes | — | Case-sensitive venue id. Only `polymarket`, `predictfun`, and `opinion` have an allowance manager |
+| `user_id` | string (UUID) | Yes | — | Must be the authenticated account. A non-UUID value is `400 user_id is not a valid UUID` |
+| `turnkey_org_id` | string | Yes | — | Must match the Turnkey organization on your session |
+| `wallet_address` | string | Yes | — | Must be an active wallet on your account, and must match the venue's active signing wallet |
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/allowances \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "3f8a1c2e-5d6b-4f70-9a21-8b7c6d5e4f30",
+    "turnkey_org_id": "b1d94f27-6c05-4a8e-9f13-2e7a5c8d0b46",
+    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+  }'
+```
+
+<Note>
+**Gotcha:** the three identity fields are optional on [CTF operations](/rest/ctf) but **all three are required here** — a missing field is `422`.
+</Note>
+
+They are still identity assertions, not overrides: a value that does not match the authenticated caller is rejected `403` with `error_details.code = AUTH_IDENTITY_MISMATCH` naming the offending field, and a `user_id` that is not a UUID is `400 user_id is not a valid UUID`. The wallet that is actually approved is the venue's active signing wallet, and `wallet_address` must match it.
+
+#### Response
+
+```json
+{
+  "usdc_tx_hash": "0xabc...",
+  "ctf_tx_hash": "0xdef...",
+  "success": true
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `usdc_tx_hash` | string \| null | Collateral approval transaction; `null` when nothing needed submitting |
+| `ctf_tx_hash` | string \| null | Outcome-token approval transaction; `null` when nothing needed submitting |
+| `success` | boolean | Whether the call completed without error |
+
+<Warning>
+**Gotcha:** `null` hashes do not mean failure — they mean no transaction was needed. On predict.fun both hashes are **always** `null`, even on a successful first-time approval, because that venue's transaction hashes are not surfaced through this endpoint; a successful predict.fun call is `{"usdc_tx_hash": null, "ctf_tx_hash": null, "success": true}`. Read [`GET /allowances`](#get-allowance-status) to confirm state rather than inferring it from the hashes.
+</Warning>
+
+Polymarket approvals are gas-sponsored and cover the CTF Exchange V2, NegRisk Exchange V2, NegRisk CTF Collateral Adapter, and NegRisk Adapter (CLOB v1) spenders. Predict.fun submits its missing approvals in sequence and fails fast rather than leaving a wallet half-enabled.
+
+## Errors
+
+The allowance endpoints return the same structured envelope as order submission — top-level `code` is legacy PascalCase, `error_details.code` is the canonical SCREAMING_SNAKE_CASE wire code, and `error_details.details`/`metadata` are omitted when absent rather than `null`. Match on `error_details.code`.
+
+The three metadata endpoints (`/exchanges`, `/exchanges/{id}`, `/exchanges/{id}/capabilities`) do **not** use that envelope: their only failure is `404` with an **empty body**.
+
+Auth-layer and mutation-gate failures on any endpoint return a bare `{"error": "<message>"}` with no `error_details`.
+
+The Code column holds `error_details.code` where this page names one; `—` means the status covers conditions with no distinct code.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | — | `user_id` is not a valid UUID | Send a well-formed UUID — deterministic, retrying unchanged returns the same error |
+| `401` | — | Missing/invalid/expired/revoked credentials on the four non-gated endpoints | Fix the credential triple and resend |
+| `403` | `AUTH_INSUFFICIENT_SCOPE` | Missing `trade:execute` scope on `POST /allowances` | Issue a key carrying `trade:execute` |
+| `403` | `AUTH_IDENTITY_MISMATCH` | `user_id`, `turnkey_org_id`, or `wallet_address` does not match the authenticated caller | The response names the offending field — send the caller's own values, not another account's |
+| `403` | `AUTH_POLICY_OUTDATED` | Stale trading policies | Approve the pending policy update, then retry |
+| `403` | — | Bad credential triple on `POST /allowances`; API-key access to the venue disabled; IP not allow-listed; the requested wallet is not the venue's active signing identity | Check the credential triple, that the venue is enabled for the key, that your source IP is allow-listed, and that `wallet_address` is the venue's active signing wallet |
+| `404` | — | Unknown or unregistered `exchange_id`; no credentials for the venue; no allowance manager for the venue | Body is empty on the metadata endpoints — do not parse it. Check spelling and case, then `GET /exchanges` for what this deployment serves |
+| `408` | — | Request exceeded the service request timeout | Retry; on `POST /allowances` re-read `GET /allowances` first — the submission may have landed |
+| `413` | — | Request body over the service-wide size cap | Shrink the body and resend |
+| `422` | — | Malformed body, or a missing required field on `POST /allowances` | Send valid JSON carrying all three of `user_id`, `turnkey_org_id`, and `wallet_address` |
+| `429` | — | Allowance-read limiter (30/min per user), or too many failed auth attempts from one source IP | Back off and retry the read; for auth failures, fix the credentials before retrying |
+| `500` | — | Credential load failure, missing regional signing authority, wallet-ownership check failure, or an approval submission error | Re-read `GET /allowances` to see which slots are still missing; report to support with the response body |
+| `502` | — | On-chain allowance read failed | Retry — the failure is upstream of the service |
+| `503` | — | Provider-access lookup unavailable, or the service concurrency limit was reached | Retry — the condition is service-side and transient |
+
+One mapping worth noting: on `POST /allowances` the underlying on-chain error is not surfaced — every submission failure collapses into a generic `500`. Re-read `GET /allowances` to see which slots are still missing.

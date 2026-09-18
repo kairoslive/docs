@@ -1,0 +1,236 @@
+---
+title: "Overview"
+description: "Calling convention for the account-scoped Kairos RPC procedures (tRPC over HTTP)"
+---
+
+The Kairos RPC API exposes account-scoped procedures for positions, orders, balances, bots, and copy-trading state, read straight from the Kairos database and trade pipeline rather than a third-party subgraph. This page is the calling convention — URL shape, auth headers, request/response envelope, rate limits, pagination, and errors — that every RPC page assumes. Read it once before you write your first call.
+
+## When to use RPC instead of REST
+
+Use the RPC API instead of the public REST `/trader-stats/*` endpoints when you need:
+
+- Current open positions for a user (wallet + all linked wallets).
+- Real-time order status, fills, and execution errors.
+- Programmatic position close / liquidation flows.
+- Bot configuration and history.
+
+REST `/trader-stats/*` is a cached proxy over third-party on-chain indexing for Polymarket. It's great for public-facing trader profiles, but it can lag and its volume numbers use Polymarket's contract-count convention — not notional USD ([notional](/learn/glossary) is quantity × price). For anything operational, use RPC.
+
+## Base URL
+
+```
+https://rpc.kairos.trade/api/rpc/<router>.<procedure>
+```
+
+Every procedure follows the `<router>.<procedure>` naming. Example: `positions.getPositions`, `positions.closePosition`, `markets.getMarkets`. Order submission and cancellation are the one exception — those live on the order execution REST service (`https://execution.kairos.trade/`), not under this `<router>.<procedure>` scheme; see [API Keys](/rpc/api-keys#tradeexecute-execution-mutations).
+
+## Authentication
+
+Programmatic clients authenticate with an **API key** — the `kairos_ck_...` triple — passed as three HTTP headers on every request:
+
+```
+X-Client-Id:  kairos_ck_...
+X-Api-Key:    <64-char hex>
+X-Api-Secret: <64-char hex>
+```
+
+See [API Keys](/rpc/api-keys) for how to obtain a credential, the full per-scope list of procedures it unlocks, and the security model. Your key scopes every call to its owner's account — `positions.getPositions` only ever returns **that user's** positions, across every wallet linked to the account.
+
+### Scopes
+
+Keys carry **scopes** with limited one-way inheritance:
+`position:read`/`trade:read` satisfy RPC `read`, and `trade:execute` satisfies
+RPC `trade`. The reverse is not true — holding `read` does not grant
+`position:read`. See the [full scope table](/rpc/api-keys#scopes) for the
+exact mapping. Calling a procedure your key isn't scoped for returns
+`403 FORBIDDEN`.
+
+### Access levels
+
+Each procedure declares an access level. For API-key callers:
+
+| Level | API-key access |
+|---|---|
+| `Public` | No auth required. The API-key allowlist is not consulted for `Public` procedures. |
+| `Protected` / `Invited` | Requires a valid API key with whichever scope that specific procedure declares — usually `read`, but position/portfolio/balance procedures require `position:read` instead. (API keys skip the invite gate — issuing a key implies access.) |
+| `*Mutation` (trading) | Requires the `trade` scope. No CSRF token needed — header auth isn't cookie-replayable. |
+| `Admin` / `SupportAdmin` / `GrowthAdmin` | Never reachable with an API key — always `403 FORBIDDEN` ("Admin procedures are not available via API key"). On the public instance they aren't registered at all and return `404 NOT_FOUND`. |
+
+Only the procedures in the [API-key allowlist](/rpc/api-keys) accept API keys; any other procedure returns `403 FORBIDDEN` with `This procedure does not accept API key authentication`.
+
+## HTTP semantics (tRPC)
+
+The server speaks **tRPC v10** over plain HTTP. If you're calling from TypeScript, use the generated `@kairoslive/kairos` client; from anything else, call the HTTP endpoints directly — the wire format is simple.
+
+| Operation | HTTP method | Input location | Body |
+|---|---|---|---|
+| Query (read) | `GET` | `?input=<url-encoded JSON>` | none |
+| Mutation (write) | `POST` | `{"json": <payload>}` in body | JSON |
+
+### Queries — GET
+
+Pass the input as a URL-encoded JSON object in `?input=...`. The input is wrapped in `{"json": ...}` by the standard tRPC client, but the server also accepts raw JSON without the wrapper.
+
+```bash
+INPUT=$(jq -cn --argjson in '{"onlyOpen":false,"limit":100}' '{json:$in}')
+curl -G "https://rpc.kairos.trade/api/rpc/positions.getPositions" \
+  --data-urlencode "input=$INPUT" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+Python with `httpx`:
+
+```python
+import httpx, json, urllib.parse
+
+payload = {"json": {"onlyOpen": False, "limit": 100}}
+params = {"input": json.dumps(payload, separators=(",", ":"))}
+
+headers = {
+    "X-Client-Id": client_id,
+    "X-Api-Key": api_key,
+    "X-Api-Secret": api_secret,
+}
+
+async with httpx.AsyncClient() as client:
+    r = await client.get(
+        "https://rpc.kairos.trade/api/rpc/positions.getPositions",
+        params=params,
+        headers=headers,
+    )
+    r.raise_for_status()
+    data = r.json()["result"]["data"]
+```
+
+### Mutations — POST
+
+Send the input as JSON in the body, wrapped in `{"json": ...}`:
+
+```bash
+curl -X POST "https://rpc.kairos.trade/api/rpc/positions.closePosition" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"json":{"positionId":"$POSITION_ID","orderType":"market"}}'
+```
+
+Trading mutations like this require an API key with the `trade` scope. No CSRF token is needed — header auth isn't cookie-replayable.
+
+<Note>
+**Gotcha: mutations are strict about the envelope.** Anything other than
+`POST` returns `405 METHOD_NOT_SUPPORTED`, and a missing or
+non-`application/json` `Content-Type` returns `415 UNSUPPORTED_MEDIA_TYPE`.
+Bodies are capped at 1 MB (`413 PAYLOAD_TOO_LARGE`), enforced on both
+`Content-Length` and the actual read, so chunked encoding can't bypass it.
+</Note>
+
+## Response shape
+
+Successful calls return:
+
+```json
+{
+  "result": {
+    "data": { /* procedure-specific payload */ }
+  }
+}
+```
+
+Errors return:
+
+```json
+{
+  "error": {
+    "message": "Human-readable error",
+    "code": -32600,
+    "data": {
+      "code": "BAD_REQUEST",
+      "httpStatus": 400,
+      "path": "positions.getPositions"
+    }
+  }
+}
+```
+
+`data.code` is the tRPC string code, `data.httpStatus` matches the HTTP status on the response, and `data.path` echoes the procedure (truncated to 128 characters for unrouted paths). The outer `code` is the JSON-RPC numeric equivalent:
+
+| tRPC code | JSON-RPC `code` | HTTP |
+|---|---|---|
+| `BAD_REQUEST` | `-32600` | 400 |
+| `UNAUTHORIZED` | `-32001` | 401 |
+| `FORBIDDEN` | `-32003` | 403 |
+| `NOT_FOUND` | `-32004` | 404 |
+| `METHOD_NOT_SUPPORTED` | `-32005` | 405 |
+| `PAYLOAD_TOO_LARGE` | `-32013` | 413 |
+| `UNSUPPORTED_MEDIA_TYPE` | `-32015` | 415 |
+| `TOO_MANY_REQUESTS` | `-32029` | 429 |
+| `INTERNAL_SERVER_ERROR` | `-32603` | 500 |
+
+Always extract `result.data` for success or check for the `error` field on failure.
+
+<Note>
+**Gotcha: a missing `result.data` with no `error` field is not an empty
+result.** It indicates a malformed response — treat it as a fatal error, not
+as "no data".
+</Note>
+
+## Rate limits
+
+Every procedure declares one bucket. Buckets are sliding one-minute windows in Redis, shared across replicas. The identity a window is keyed on depends on how you authenticated:
+
+- **API key** → the credential (`apikey:<credentialId>`). Two credentials owned by the same user get **separate** budgets.
+- **Session JWT** → the user.
+- **Unauthenticated** → the client IP.
+
+Server defaults (all overridable per deployment via `RATE_LIMIT_*_RPM`, and per credential by Kairos):
+
+| Bucket | Default cap (per minute) |
+|---|---|
+| `queries` | 3600 |
+| `mutations` | 1800 |
+| `expensive` | 600 |
+| `auth` | 300 |
+| `public` | 30 |
+| `feature_flags` | 60 |
+| `balances_agg` | 30 |
+| `sports_read` | 120 |
+| unrouted paths | 30 |
+
+Exceeding a bucket returns `TOO_MANY_REQUESTS` (HTTP 429).
+
+> **Gotcha: there is no `Retry-After` header on a 429.** The wait is embedded in
+> the message — `Rate limit exceeded. Please retry in <N> seconds.` Parse it, or
+> back off exponentially.
+
+> **Gotcha: the rate limiter fails closed.** If its Redis is unreachable the
+> server returns `500 INTERNAL_SERVER_ERROR` with `Service temporarily
+> unavailable. Please retry shortly.` That is a retryable outage, not a bug in
+> your payload.
+
+## Pagination
+
+Queries that list entities use **offset/limit** pagination unless otherwise documented:
+
+- `limit` — integer; `<= 0` falls back to the procedure default (50 on the position/portfolio lists), values above `100` are clamped to `100`.
+- `offset` — integer, default `0`. `positions.getPositions` rejects a negative offset with `BAD_REQUEST`; other list procedures treat out-of-range offsets as an empty page.
+
+Responses include `total` and `hasMore` (`offset + limit < total`) so callers can loop until `hasMore` is `false`.
+
+## Errors you'll see
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `400` `BAD_REQUEST` | Input failed to unmarshal, or a handler-level validation rule tripped (missing required field, bad UUID, unknown chain, negative offset) | Fix the payload |
+| `401` `UNAUTHORIZED` | Missing/partial or invalid API key, revoked credential, or an owner account that is deleted or suspended | Check your `X-Client-Id` / `X-Api-Key` / `X-Api-Secret` headers |
+| `403` `FORBIDDEN` | Procedure not in the API-key allowlist, key lacks the required scope, source IP not in the credential whitelist, or API access disabled for a requested provider | Check the allowlist, your key's scopes, and the IP whitelist |
+| `404` `NOT_FOUND` | Procedure name doesn't exist (`Procedure "x" not found`), or the entity doesn't exist / isn't yours | Check the procedure path and the ID |
+| `405` `METHOD_NOT_SUPPORTED` | A mutation was called with something other than `POST` | Use `POST` for mutations |
+| `413` `PAYLOAD_TOO_LARGE` | Request body over the 1 MB default cap | Shrink the body |
+| `415` `UNSUPPORTED_MEDIA_TYPE` | A mutation without `Content-Type: application/json` | Set the header |
+| `429` `TOO_MANY_REQUESTS` | Rate limited | Sleep the number of seconds named in `message` |
+| `500` `INTERNAL_SERVER_ERROR` | Handler failure, upstream (DB / Redis / metadata cache / order-execution) failure, rate-limiter Redis outage, or a recovered panic | Retry with backoff; report if persistent |
+
+Unrouted paths (`404`) are themselves rate limited on a separate per-IP bucket, so a scanner probing for procedure names gets `429`s rather than an enumeration oracle.

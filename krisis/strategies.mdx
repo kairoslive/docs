@@ -1,0 +1,392 @@
+---
+title: "Strategies & DSL"
+description: "Strategy CRUD, strategy legs, and DSL validation endpoints"
+---
+
+This page documents the low-level strategy primitives: creating and editing
+strategies, attaching legs, and checking DSL expressions. Reach for it when the
+dedicated [Conditional Orders](/krisis/conditional-orders) endpoints don't express the
+condition you want — those endpoints build strategies for you under the hood.
+
+A **strategy** is the core Krisis object: a named rule attached to a market
+that the engine evaluates on every tick. A strategy carries an optional
+top-level DSL `expression` and/or a set of **legs** — each leg is one
+condition paired with one order to submit when that condition is true.
+
+All endpoints require an `Authorization: Bearer <jwt>` header except
+`dsl/validate` and `dsl/evaluate`, which are public.
+
+## Strategy lifecycle
+
+1. **Draft the condition.** Check it with
+   [`POST /api/v1/dsl/validate`](#validate-an-expression), and dry-run it
+   against the live book with
+   [`POST /api/v1/dsl/evaluate`](#evaluate-an-expression). Neither needs auth,
+   and neither creates anything.
+2. **Create the strategy** with [`POST /api/v1/strategies`](#create-strategy),
+   supplying an `expression`, `legs`, or both. A created strategy arms — the
+   engine picks it up and evaluates it without a further call. Whether it is
+   still armed is `is_active` on the strategy row.
+3. **The engine evaluates it every tick.** When a leg's condition is truthy and
+   no order is already in flight for the strategy, the leg's order is
+   submitted. `pending_order_id` is the fire-once guard.
+4. **The attempt is logged either way** — as an execution row with
+   `action_taken: true` and an `order_id`, or `action_taken: false` and a
+   `skip_reason`. See
+   [List executions](/krisis/positions-pnl#list-executions).
+5. **Disarm, edit, or delete.** `PUT /api/v1/strategies/{id}` with
+   `is_active: false` disarms without losing the row;
+   `DELETE /api/v1/strategies/{id}` hard-deletes it and its legs. A strategy
+   with `expires_at` auto-deactivates at that time.
+
+A strategy with `trigger_order_id` set stays dormant until that entry order
+fires — that is how [OTO](/krisis/conditional-orders#oto) legs wait for their entry.
+
+## List strategies
+
+```
+GET /api/v1/strategies
+```
+
+Returns every strategy owned by the caller.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `active` | boolean | No | all | Query parameter. `true` returns only armed strategies, `false` only disarmed ones. Omit for all of them |
+
+### Example
+
+```bash
+curl https://krisis.kairos.trade/api/v1/strategies \
+  -H "Authorization: Bearer $JWT"
+```
+
+### Response
+
+Array of strategy objects.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | uuid | Strategy id |
+| `name` | string | Display name |
+| `description` | string \| null | Always `null` (reserved) |
+| `expression` | string \| null | Top-level DSL expression; `null` for leg-only strategies |
+| `market_id` | string | Market / contract identifier |
+| `exchange_id` | string | `"kalshi"` or `"polymarket"` |
+| `is_active` | boolean | Whether the engine is evaluating it |
+| `fund_id` | uuid \| null | Linked spending fund |
+| `expires_at` | string \| null | ISO 8601; strategy auto-deactivates after this |
+| `pending_order_id` | uuid \| null | In-flight order — fire-once guard |
+| `oco_group_id` | uuid \| null | Bracket group linking sibling legs |
+| `trigger_order_id` | uuid \| null | When set, the strategy stays dormant until that entry order fires |
+| `conditional_kind` | string \| null | Which [conditional-order kind](/krisis/conditional-orders) the engine armed this row as, or `null` when you authored it directly. Always present |
+| `created_at` | string | ISO 8601 |
+| `updated_at` | string | ISO 8601 |
+| `legs` | array | Strategy legs (see [List legs](#list-legs)) |
+
+## Create strategy
+
+```
+POST /api/v1/strategies
+```
+
+Creates a strategy and, optionally, its legs in the same call. Returns
+`201 Created` with the strategy object.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | Yes | — | Display name |
+| `market_id` | string | Yes | — | Market / contract identifier |
+| `expression` | string | * | — | DSL expression, compiled on create |
+| `legs` | array | * | — | Legs to create atomically with the strategy (see [Create leg](#create-leg)) |
+| `description` | string | No | — | Reserved; **not stored** |
+| `exchange_id` | string | No | `"kalshi"` | `"kalshi"`, `"polymarket"`, or `"predictfun"` |
+| `action_config` | object | No | — | Free-form JSON action metadata, passed to the engine untouched — see [action_config](#action_config) |
+| `fund_id` | uuid | No | — | Spending fund to link |
+| `expires_at` | string | No | — | ISO 8601 auto-deactivation time |
+
+\* You must supply at least one of `expression` or `legs`.
+
+### Example
+
+```bash
+curl -X POST https://krisis.kairos.trade/api/v1/strategies \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "BTC dip buy",
+    "market_id": "KXBTCD-25",
+    "exchange_id": "kalshi",
+    "expression": "ask > 0 and ask <= 0.35"
+  }'
+```
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| At least one of `expression` / `legs` is required | `400` |
+| `exchange_id` must be one of the supported venues | `400` |
+| A DSL `expression` must compile | `400` |
+| The account's strategy-count [tier limit](/krisis/overview#tier-limits) must not be exceeded | `400` |
+| `expression` requires the `allow_expressions` tier flag | `400` |
+
+## action_config
+
+`action_config` is stored as-is and read by the engine when a leg fires, so
+it is where per-strategy execution detail lives that the strategy row itself
+has no column for. Keys the engine acts on:
+
+| Key | Type | Description |
+|---|---|---|
+| `outcome` | string | Outcome label to trade (e.g. `"Yes"`) |
+| `token_id` | string | CLOB token id of that outcome — Krisis prices the strategy against it and keys the strategy's position on it, so it must be the token belonging to `outcome` |
+| `time_in_force` | string | Time in force for the submitted order, e.g. `"FAK"` |
+| `max_slippage_cents` | integer | Walk-the-book cap for market fills, in cents |
+| `total_capital` | number | Capital allocation for the strategy. Read by the `strategy_capital_remaining` / `strategy_spent` [DSL variables](#dsl-variables); absent means uncapped |
+
+## Get strategy
+
+```
+GET /api/v1/strategies/{id}
+```
+
+Returns one strategy object, or `404` if it does not exist or is not yours.
+
+## Update strategy
+
+```
+PUT /api/v1/strategies/{id}
+```
+
+Returns the updated strategy object.
+
+### Request
+
+All fields are optional — only those supplied are changed.
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | No | unchanged | Rename |
+| `description` | string | No | unchanged | Reserved |
+| `expression` | string | No | unchanged | Replace the DSL expression (recompiled) |
+| `is_active` | boolean | No | unchanged | Arm (`true`) or disarm (`false`) |
+| `exchange_id` | string | No | unchanged | `"kalshi"` or `"polymarket"` |
+| `action_config` | object | No | unchanged | Replace action metadata |
+| `fund_id` | uuid | No | unchanged | Re-link the strategy to a different fund |
+| `expires_at` | string | No | unchanged | New ISO 8601 expiry |
+
+<Note>
+**Gotcha: you cannot clear a field back to empty.** Sending a field as `null`
+is treated the same as omitting it, so an omitted *and* an explicitly-null
+field are both left untouched. Once `fund_id` or `expires_at` is set, this
+endpoint cannot unset it.
+</Note>
+
+## Delete strategy
+
+```
+DELETE /api/v1/strategies/{id}
+```
+
+Hard-deletes the strategy and its legs. Returns `204 No Content`.
+
+<Note>
+**Gotcha: prefer the conditional-order cancel for conditional orders.**
+`DELETE /api/v1/conditional-orders/{id}` deactivates the row (keeping
+history) and cancels any resting venue order; this endpoint destroys the row
+and does neither. See [Conditional Orders](/krisis/conditional-orders).
+</Note>
+
+## Strategy legs
+
+A **leg** binds one DSL condition to one order. When the condition evaluates
+truthy and no order is already in flight, the engine submits the leg's order.
+
+### List legs
+
+```
+GET /api/v1/strategies/{id}/legs
+```
+
+#### Response
+
+Array of leg objects.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | uuid | Leg id |
+| `strategy_id` | uuid | Parent strategy |
+| `label` | string | Display label |
+| `position` | integer | Ordering within the strategy |
+| `condition_expr` | string | DSL condition |
+| `side` | string | `"buy"` or `"sell"` |
+| `order_type` | string | `"market"` or `"limit"` |
+| `quantity_value` | number \| null | Static quantity |
+| `quantity_expr` | string \| null | DSL expression for a dynamic quantity |
+| `price_value` | number \| null | Static limit price |
+| `price_expr` | string \| null | DSL expression for a dynamic limit price |
+| `is_active` | boolean | Whether the leg is evaluated |
+| `created_at` | string | ISO 8601 |
+| `updated_at` | string | ISO 8601 |
+
+### Create leg
+
+```
+POST /api/v1/strategies/{id}/legs
+```
+
+Returns `201 Created` with the leg object.
+
+#### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `label` | string | Yes | — | Display label |
+| `condition_expr` | string | Yes | — | DSL condition, compiled on create |
+| `side` | string | Yes | — | `"buy"` or `"sell"` |
+| `position` | integer | No | — | Ordering within the strategy |
+| `order_type` | string | No | `"limit"` | `"limit"` or `"market"` |
+| `quantity_value` | number | No | — | Static quantity |
+| `quantity_expr` | string | No | — | DSL expression for quantity |
+| `price_value` | number | No | — | Static limit price |
+| `price_expr` | string | No | — | DSL expression for limit price |
+| `is_active` | boolean | No | active | Whether the leg is evaluated |
+
+**Validation:** `side` must be `"buy"` / `"sell"`; `order_type` must be
+`"market"` / `"limit"`; every DSL expression must compile.
+
+### Update leg
+
+```
+PUT /api/v1/strategies/{id}/legs/{leg_id}
+```
+
+Takes the same fields as [Create leg](#create-leg), all optional — only
+fields present in the request body are updated. As with updating a strategy,
+sending a field as `null` is treated the same as omitting it.
+
+### Delete leg
+
+```
+DELETE /api/v1/strategies/{id}/legs/{leg_id}
+```
+
+Returns `204 No Content`.
+
+## DSL endpoints
+
+The Krisis DSL is the small expression language used in `expression`,
+`condition_expr`, `quantity_expr`, and `price_expr`. The two endpoints below
+let you check and trial expressions without creating a strategy.
+
+### DSL variables
+
+The engine injects these into every evaluation:
+
+| Variable | Unit | Meaning |
+|---|---|---|
+| `price` | price | Last / mark price — what the engine-generated conditional-order triggers compare against |
+| `ask` | price | What you pay to buy right now |
+| `bid` | price | What you receive when selling right now |
+| `spread` | price | `ask - bid` |
+| `book_stale_secs` | seconds | Seconds since the orderbook last updated |
+| `seconds_since_trigger` | seconds | Time since this strategy last fired. Infinite before the first fill, so it never blocks the first one |
+| `seconds_since_armed` | seconds | Time since the strategy was created — useful as a warm-up guard |
+| `strategy_capital_remaining` | currency | `action_config.total_capital` minus what is deployed. Sells return it, so it recycles |
+| `strategy_spent` | currency | Every unit of currency ever deployed. Never decreases — a hard turnover ceiling |
+| `strategy_pnl` | currency | Marked to the current bid; negative while underwater |
+| `strategy_position_qty` | shares | This strategy's own inventory, not the market-wide position |
+| `entry_price` | price | Price the entry filled at. Only meaningful after a fill — this is what an [ATR bracket leg](/krisis/conditional-orders#atr-legs) anchors to |
+
+> **Gotcha: an absent quote reads as `0`,** so `ask <= 0.35` is true on a dead
+> book and your strategy fires into nothing. Always pair a price comparison
+> with its guard — `ask > 0 and ask <= 0.35`.
+
+> **Gotcha: the live engine has no candle series.** `atr(period, "timeframe")`
+> is available, with `timeframe` one of `1s`, `1m`, `5m`, `15m`, `1h`, `4h`,
+> `1d`. Beyond that, expressions referencing candle indicators, volume, or bar
+> history are **rejected at compile time** rather than armed and left to never
+> fire. Trial them against [Backtest](/krisis/market-data#backtest) instead, which
+> replays candles you supply.
+
+### Validate an expression
+
+```
+POST /api/v1/dsl/validate
+```
+
+Parses and compiles an expression. **Public — no authentication required.**
+
+#### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `expression` | string | Yes | — | DSL source to parse and compile |
+
+#### Example
+
+```bash
+curl -X POST https://krisis.kairos.trade/api/v1/dsl/validate \
+  -H "Content-Type: application/json" \
+  -d '{ "expression": "ask > 0 and ask <= 0.35 and seconds_since_trigger > 300" }'
+```
+
+#### Response
+
+| Field | Type | Description |
+|---|---|---|
+| `valid` | boolean | Whether it parsed and compiled |
+| `error` | string \| null | Compile error, when `valid` is `false` |
+| `tokens` | array \| null | Lexed tokens (`token_type`, `value`) |
+| `ast` | string \| null | Debug rendering of the parse tree |
+
+<Note>
+**Gotcha: a rejected expression is still `200 OK`.** The status does not
+change — check `valid` and read `error`. A client that branches on HTTP
+status alone will treat every broken expression as valid.
+</Note>
+
+### Evaluate an expression
+
+```
+POST /api/v1/dsl/evaluate
+```
+
+Compiles the expression and runs it once against the **current live market
+context** for a market. **Public — no authentication required.**
+
+#### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `expression` | string | Yes | — | DSL source |
+| `market_id` | string | Yes | — | Market to pull live data for |
+| `exchange_id` | string | Yes | — | `"kalshi"` or `"polymarket"` |
+
+#### Example
+
+```bash
+curl -X POST https://krisis.kairos.trade/api/v1/dsl/evaluate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expression": "price > 0.50",
+    "market_id": "KXBTCD-25",
+    "exchange_id": "kalshi"
+  }'
+```
+
+#### Response
+
+| Field | Type | Description |
+|---|---|---|
+| `result_value` | string \| null | The evaluated value |
+| `result_type` | string \| null | Its type |
+| `is_truthy` | boolean \| null | Whether the engine would treat it as a trigger |
+| `market_snapshot` | object | `price`, `bid`, `ask`, `spread` used in the run |
+| `evaluation_ms` | number | Evaluation time in milliseconds |
+| `error` | string \| null | Set when evaluation failed |

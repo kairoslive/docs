@@ -1,0 +1,128 @@
+---
+title: "Glossary"
+description: "Quick reference for all trading terms"
+---
+
+Every term you'll meet on Kairos, alphabetically. Each entry gives a
+plain-language definition first, then any Kairos-specific detail, then a link to
+the page where the term does real work.
+
+## A
+
+**Ask** — The price a seller is willing to accept. The lowest ask on the book is the cheapest price you can buy at right now. Also called the "offer." See [The Order Book](/learn/order-book).
+
+## B
+
+**Basis Point (bps)** — One hundredth of a percent. 50 bps is 0.50%. Kairos platform fee rates are quoted in bps. See [Fees](/trading/fees).
+
+**Best Bid / Best Ask** — The highest bid and lowest ask currently on the order book. Together they define the current market price. See [The Order Book](/learn/order-book).
+
+**Bid** — The price a buyer is willing to pay. The highest bid on the book is the most you can sell for right now. See [The Order Book](/learn/order-book).
+
+**Buying Up** — What a large buy order does when it walks up through multiple ask price levels, filling at progressively higher prices. See [Execution & Slippage](/learn/execution-and-slippage).
+
+## C
+
+**Condition ID** — Polymarket's `0x…` identifier for a market. Distinct from a token id, which identifies one outcome within that market. See [Order Types](/guides/order-types#specifying-the-outcome).
+
+## D
+
+**Depth** — The total quantity of shares available at each price level on the order book. More depth means you can trade larger amounts without moving the price. See [The Order Book](/learn/order-book).
+
+## F
+
+**FAK (Fill and Kill)** — A time-in-force that fills whatever it can immediately and cancels the rest. Same meaning as IOC; exchanges differ on which name they use. See [Time-in-Force](/learn/time-in-force).
+
+**Fee Tier** — The maker and taker rates, in basis points, that Kairos applies to your fills. See [Fees](/trading/fees).
+
+**Fill** — A match between your order and someone else's. "Your order filled at $0.55" means you got your shares at that price. See [Execution & Slippage](/learn/execution-and-slippage).
+
+**FOK (Fill or Kill)** — A time-in-force that requires the entire order to fill instantly or be cancelled completely. No partial fills. See [Time-in-Force](/learn/time-in-force).
+
+## G
+
+**Gas Sponsorship** — Kairos covering the network gas for supported on-chain transactions. Availability is determined by the wallet and chain integration, not by a user's fee tier.
+
+**GTC (Good Till Cancelled)** — A time-in-force that keeps your order on the book until it fills or you cancel it manually. The Kairos default. See [Time-in-Force](/learn/time-in-force).
+
+**GTD (Good Till Date)** — A time-in-force that keeps your order on the book until an expiry, then cancels automatically if unfilled. On Kairos you set it as `expiration_minutes` — minutes from now, 1 to 43,200 — not as a date. See [Time-in-Force](/learn/time-in-force).
+
+## I
+
+**IOC (Immediate or Cancel)** — A time-in-force that fills whatever it can instantly, then cancels the rest. Does not rest on the book. Same meaning as FAK. See [Time-in-Force](/learn/time-in-force).
+
+## L
+
+**Limit Order** — An order to buy or sell at a specific price or better. May not fill immediately, but gives you price control. See [Order Types](/learn/order-types).
+
+**Liquidity** — How easy it is to trade without significantly moving the price. High liquidity means tight spreads and deep order books. See [The Order Book](/learn/order-book).
+
+**Long** — Holding shares. "Long Yes" means you hold Yes shares and profit if the event happens. See [Positions & PnL](/learn/positions-and-pnl).
+
+## M
+
+**Maker** — A trader who adds liquidity by placing an order that rests on the book. Usually pays lower fees — but not always: Kalshi's non-standard series charge the maker the higher rate. See [Fees](/trading/fees#kalshi).
+
+**Market Order** — An order to buy or sell immediately at the best available price. Fast, but you give up price control. On Kairos a market order still requires a `price`, which acts as the limit it may cross to. See [Order Types](/guides/order-types#market-orders).
+
+## N
+
+**No Shares** — Shares that pay out $1.00 if the event does NOT happen, and $0.00 if it does. See [What Are Prediction Markets?](/learn/prediction-markets).
+
+**Notional** — The dollar value of a fill: quantity × price. Platform fees are charged as a percentage of notional. See [Fees](/trading/fees).
+
+## O
+
+**Order Book** — The live list of all open buy (bid) and sell (ask) orders for a market, organized by price. See [The Order Book](/learn/order-book).
+
+**Outcome** — One tradeable side of a market. On Kairos you name it with the exact label from market metadata, or with its `token_id` — never with a side alias like `yes`/`no`. See [Order Types](/guides/order-types#specifying-the-outcome).
+
+## P
+
+**Partial Fill** — When only some of your order gets filled. Common with IOC orders, or when there isn't enough depth at your price. See [Execution & Slippage](/learn/execution-and-slippage#partial-fills).
+
+**PnL (Profit and Loss)** — How much money you've made or lost. Unrealized PnL is on open positions; realized PnL is from closed trades. See [Positions & PnL](/learn/positions-and-pnl).
+
+**Position** — The shares you currently hold in a market. See [Positions & PnL](/learn/positions-and-pnl).
+
+**Post-Only** — An order flag that refuses to cross the spread, so the order either rests as a maker or is rejected. Requires a resting time-in-force (`GTC` or `GTD`). See [Order Types](/guides/order-types#order-parameters).
+
+**Price Impact** — How much your own trade moves the market price. Larger orders have more impact. See [Execution & Slippage](/learn/execution-and-slippage).
+
+## R
+
+**Realized PnL** — Profit or loss from trades you've already closed. This is locked in. See [Positions & PnL](/learn/positions-and-pnl#unrealized-vs-realized-pnl).
+
+**Resolution** — When a prediction market's question is answered and shares settle to $1.00 or $0.00. See [Positions & PnL](/learn/positions-and-pnl#settlement-how-markets-resolve).
+
+**Resting Order** — A limit order sitting on the order book waiting to be filled. It provides liquidity. See [Order Types](/learn/order-types#resting-orders).
+
+**Retry** — Kairos automatically re-sending an order after a temporary failure such as a network blip or a busy exchange. Retries are capped by the order's `max_retries` (0–20) and, where the failure is a liquidity miss, re-priced only within the `max_slippage_cents` band you authorised. See [Execution & Slippage](/learn/execution-and-slippage#retries).
+
+## S
+
+**Selling Down** — What a large sell order does when it walks down through multiple bid price levels, filling at progressively lower prices. See [Execution & Slippage](/learn/execution-and-slippage).
+
+**Settlement** — The process of converting shares to cash after a market resolves. Yes shares become $1.00 or $0.00; No shares the opposite. See [Positions & PnL](/learn/positions-and-pnl#settlement-how-markets-resolve).
+
+**Slippage** — The difference between the price you expected and the price you actually got. Happens with large orders or thin markets. See [Execution & Slippage](/learn/execution-and-slippage).
+
+**Spread** — The difference between the best bid and best ask. A tight spread means an active, liquid market; a wide spread means less activity. See [The Order Book](/learn/order-book#the-spread).
+
+**Synthetic Book** — A live order book for a weighted package of outcomes, `S = w1*A + w2*B + …`, built by combining the source books. See [Synthetic Books](/guides/synthetic-books).
+
+## T
+
+**Taker** — A trader who removes liquidity by filling against resting orders. Usually pays the higher fee; on Polymarket and Predict.fun the taker is the only side charged an exchange fee. See [Fees](/trading/fees#exchange-fees).
+
+**Time-in-Force** — Instructions telling the exchange how long to keep your order active. Kairos accepts `GTC`, `GTD`, `FOK`, `FAK`, and `IOC`. See [Time-in-Force](/learn/time-in-force).
+
+**Token ID** — The per-outcome identifier for a market's tradeable side. An alternative to `outcome` when submitting an order. See [Order Types](/guides/order-types#specifying-the-outcome).
+
+## U
+
+**Unrealized PnL** — Paper profit or loss on shares you still hold, based on the current market price. Changes as prices move. See [Positions & PnL](/learn/positions-and-pnl#unrealized-vs-realized-pnl).
+
+## Y
+
+**Yes Shares** — Shares that pay out $1.00 if the event happens, and $0.00 if it doesn't. See [What Are Prediction Markets?](/learn/prediction-markets).

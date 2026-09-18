@@ -1,0 +1,205 @@
+---
+title: "API Overview"
+description: "Kairos REST API and WebSocket quick start — base URLs, modules, auth, and rate limits"
+---
+
+Kairos exposes prediction market data, trading, portfolio analytics, sports markets, and trader intelligence across multiple providers over REST and WebSocket. This page is the map: where each service lives, how to make your first authenticated call, and what the shared conventions are for errors, rate limits, and status codes. Start here, then follow the links into the module reference.
+
+## Base URLs
+
+| Service | URL | Description |
+|---------|-----|-------------|
+| Data API | `https://data.kairos.trade` | Markets, candles, trades, search, PnL, sports, trader stats |
+| Order Execution | `https://execution.kairos.trade` | Submit, cancel, and query orders (REST + WebSocket) |
+| Market Data Stream | `wss://stream.kairos.trade` | Real-time market data WebSocket (protobuf) |
+| Order Execution Stream | `wss://execution.kairos.trade/ws` | Real-time order execution and status updates (JSON) |
+
+<Warning>
+**Don't confuse this with the Market Data API.** The separate
+[Market Data API](/market-data/overview) (`md.kairos.trade`) is a
+lighter-weight, beta, read-only service with a free anonymous tier and ETag
+caching — reach for it instead of the Data API above if you only need
+candles/trades/marks at scale. See its
+[authentication guide](/market-data/authentication) for the free tier.
+</Warning>
+
+## Quick Start
+
+### 1. Get credentials
+
+Contact Kairos for API credentials, then export them for the examples below:
+
+```bash
+export CLIENT_ID=kairos_ck_your_client_id
+export API_KEY=your_api_key
+export API_SECRET=your_client_secret
+```
+
+You can authenticate with either **API keys** (recommended for programmatic access) or **JWT tokens** (`Authorization: Bearer <token>`, for user-facing apps). See [Authentication](/guides/authentication) for headers, scopes, and token structure — or the [Market Data API's free tier](/market-data/authentication) if you just need read-only market data without a key at all.
+
+### 2. Discover markets
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2?limit=10&sort_by=volume_24h" \
+  -H "X-Client-Id: $CLIENT_ID" -H "X-Api-Key: $API_KEY" -H "X-Api-Secret: $API_SECRET"
+```
+
+### 3. Get market prices
+
+```bash
+curl -X POST "https://data.kairos.trade/markets/batch-prices" \
+  -H "X-Client-Id: $CLIENT_ID" -H "X-Api-Key: $API_KEY" -H "X-Api-Secret: $API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"markets": [{"market_id": "BTCUSD-24JAN05", "provider_id": 1}]}'
+```
+
+### 4. Fetch historical candles
+
+```bash
+curl "https://data.kairos.trade/candles?provider=kalshi&contract_id=PRES-2024-DEM&timeframe_seconds=3600&start=2024-01-01T00:00:00Z&end=2024-01-02T00:00:00Z" \
+  -H "X-Client-Id: $CLIENT_ID" -H "X-Api-Key: $API_KEY" -H "X-Api-Secret: $API_SECRET"
+```
+
+### 5. Submit an order via WebSocket
+
+Connect to `wss://execution.kairos.trade/ws` with your credentials, then send:
+
+```json
+{
+  "type": "submit_order",
+  "request_id": "my-unique-id",
+  "payload": {
+    "exchange_id": "polymarket",
+    "market_id": "570362",
+    "outcome": "Yes",
+    "side": "buy",
+    "kind": "limit",
+    "quantity": "100",
+    "price": "0.45"
+  }
+}
+```
+
+See [Order Types](/guides/order-types) for `kind`, `time_in_force`, and price-format details.
+
+## Providers
+
+The Kairos API aggregates data from multiple prediction market providers:
+
+| Provider | ID | Description |
+|----------|-----|-------------|
+| Kalshi | 1 | US-regulated prediction market |
+| Polymarket | 2 | Blockchain-based prediction market (Polygon) |
+| Opinion | 3 | Decentralized prediction market *(sunset — no longer active)* |
+| Predict.fun | 8 | Blockchain-based prediction market (BNB Chain) |
+| Hyperliquid | 9 | HIP-4 outcome markets on Hyperliquid L1 |
+
+Pass the numeric `provider_id` (or the string provider name, e.g. `"predictfun"`) wherever an endpoint takes a provider.
+
+## API Modules
+
+| Module | Prefix | Description |
+|--------|--------|-------------|
+| [Markets](/rest/markets) | `/markets` | Market details, prices, metadata, outcomes |
+| [Discovery](/rest/markets#active-markets-snapshot) | `/api/markets/discover/v2` | Discover, trending, breaking, and expiring markets |
+| [Crypto Markets](/rest/markets#crypto-markets) | `/markets/crypto` | Short-interval crypto prediction markets and oracle prices |
+| [Trading Data](/rest/trading-data) | `/candles`, `/trades` | OHLCV candles, trade history, metrics |
+| [Orders](/rest/orders) | `/orders` | Submit, cancel, query orders (execution service) |
+| [PnL](/rest/pnl) | `/pnl` | Historical realized + unrealized PnL time-series |
+| [Positions (RPC)](/rpc/positions) | `positions.*` | **Authoritative** current holdings — prefer over REST trader-stats for bots |
+| [Search](/rest/search) | `/search` | Full-text market and event search, autocomplete |
+| [Sports](/rest/sports) | `/sports` | Live events, event markets, cross-platform matching |
+| [Trader Stats](/rest/trader-stats) | `/trader-stats` | Public trader profiles, performance, PnL history |
+| [Top Holders](/rest/top-holders) | `/top-holders` | Top token holders for markets |
+| [Providers](/rest/providers) | `/providers` | Provider configurations |
+
+See the [API Reference](/api-reference) for the full endpoint index with parameters and live try-it panels.
+
+## Real-Time Data
+
+Kairos exposes live data through two WebSocket streams — the Market Data stream (which also carries live crypto/oracle prices) and the Order Execution stream — plus REST endpoints for current and historical crypto/oracle data.
+
+| Feed | Endpoint | What you get | How |
+|------|----------|--------------|-----|
+| **Market Data Stream** | `wss://stream.kairos.trade` | Live orderbook (snapshots + deltas), best bid/ask/mid `price`, `trades`, and OHLC `candles` for prediction-market contracts | Protobuf; send a `SubscribeRequest` per `contract_id`, filter by `topics`. See [Market Data WebSocket](/websocket/market-data-websocket). |
+| **Order Execution Stream** | `wss://execution.kairos.trade/ws` | Real-time order status, fills, and position updates for your own orders | JSON frames. See [Order Execution WebSocket](/websocket/order-execution) and [Order Updates](/websocket/order-updates). |
+| **Crypto / oracle prices** | Live: `wss://stream.kairos.trade` · REST: `GET /markets/crypto` · `GET /markets/crypto/oracle-history` | Crypto prediction markets and their underlying **resolution prices**. Live ticks stream over the **Market Data WebSocket** with `provider: "oracle"`, `topics: ["price"]` (always on). Wire symbols encode the feed — bare `btc-usd` is Binance; `-polymarket-chainlink`, `-kalshi-cfb`, `-hyperliquid-mark`, and `-polymarket-twap*` are venue series. History is up to **1-second resolution** via oracle-history with an explicit `source` | WS for live, REST for current + history. See [Market Data WebSocket](/websocket/market-data-websocket#crypto-oracle-prices) and [Crypto oracle history](/rest/markets#crypto-oracle-history). |
+
+<Note>
+**Fee quotes** also stream — subscribe to `subscribe_fee_quote` on the order-execution socket for live per-order fee estimates. See [Fee Quote WebSocket](/websocket/fee-quote).
+</Note>
+
+## Response Format
+
+All responses are JSON. Successful responses return data directly:
+
+```json
+{
+  "markets": [...],
+  "count": 10,
+  "timestamp": "2024-01-03T15:30:00.000000+00:00"
+}
+```
+
+<Warning>
+**Error envelopes differ by service — do not assume one shape across both.**
+</Warning>
+
+- **Data API** (`data.kairos.trade`): `{ "detail": "Error message describing what went wrong" }`, or FastAPI's standard validation envelope on `422`.
+- **Order Execution API** (`execution.kairos.trade`): `{ "error": "...", "error_details": { "code": "...", "message": "...", "actions": [] } }` on most order-mutation endpoints; some auth/ownership/not-found responses return an empty body, so treat the status code as authoritative there. See [Orders — Errors](/rest/orders#errors).
+
+## Rate Limits
+
+### Data API (`data.kairos.trade`)
+
+| Endpoint | Limit |
+|----------|-------|
+| `/api/markets/discover/v2` | 200 requests/minute |
+| `/markets/batch-prices` | 200 requests/minute |
+| `/api/markets/trending` | 30 requests/minute |
+| `/markets/crypto`, `/markets/crypto/oracle-history` | 200 requests/minute |
+| `/search/markets`, `/search/markets-and-events` | 60 requests/minute |
+| `/search/simple` | 100 requests/minute |
+| `/search/suggest` | 200 requests/minute |
+| `/trader-stats/pnl-history/*`, `/trader-stats/positions/*`, `/trader-stats/trades/*` | `heavy` group: 10 requests/minute per trusted client IP by default |
+
+### Order Execution (`execution.kairos.trade`)
+
+| Limit | Value |
+|-------|-------|
+| Order submissions | 5 per second per user |
+| General requests | 100 per minute per client |
+| Failed auth attempts | 10 per minute per IP |
+
+### WebSocket (`stream.kairos.trade`)
+
+| Limit | Value |
+|-------|-------|
+| Max connections per user | 10 |
+| Max connections per IP | 50 |
+
+### Order Execution WebSocket (`execution.kairos.trade/ws`)
+
+| Limit | Value |
+|-------|-------|
+| Max connections per user | 10 |
+
+Exceeding connection limits returns `429 Too Many Requests` on upgrade.
+
+## Status Codes
+
+| Code | Description |
+|------|-------------|
+| 200 | Success |
+| 400 | Bad request - Invalid parameters |
+| 401 | Unauthorized - Missing or invalid authentication |
+| 403 | Forbidden - Insufficient permissions |
+| 404 | Not found - Resource doesn't exist |
+| 429 | Rate limit exceeded |
+| 500 | Internal server error |
+| 502 | Bad gateway - Provider API error |
+| 503 | Service unavailable - Cache not populated |
+
+## Support
+
+Contact your Kairos account representative for API access and support.

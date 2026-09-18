@@ -1,0 +1,997 @@
+---
+title: "Markets"
+description: "Market details, prices, metadata, tick sizes, outcomes, crypto contracts, and discovery"
+---
+
+Market lookups, batch pricing and metadata, discovery feeds, and crypto-specific endpoints. Reach for this page when you need to resolve a market identifier, read a current price, or build a browse or search surface.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+All paths are relative to `https://data.kairos.trade`.
+
+## Authentication
+
+Every endpoint on this page is marked with the auth mode it accepts and its rate limit, for example `x-kairos-auth: api-key` · 200 req/min.
+
+`x-kairos-auth: api-key` means you send three headers together:
+
+| Header | Description |
+|---|---|
+| `X-Client-Id` | Your client id |
+| `X-Api-Key` | Your API key |
+| `X-Api-Secret` | Your API secret |
+
+All three are required. `X-Client-Id` sent without both `X-Api-Key` and `X-Api-Secret` is a `401`, as are invalid credentials. API keys are IP-whitelisted: a key used from a non-whitelisted IP is a `403`. API-key callers bypass the `invite_only` gate that applies to session-authenticated callers.
+
+One endpoint — [equity/forex/commodity snapshot](#equityforexcommodity-snapshot) — uses `x-kairos-auth: session` instead and rejects API-key headers. See that section.
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell; the one session-authenticated example reads `KAIROS_SESSION_JWT`.
+
+## Price scales
+
+Price scale is the most common source of bugs on this page: some endpoints return a 0–1 decimal probability, one returns cents, and one discover endpoint mixes the two — its filters are cents while its response is a decimal. This table collects what each endpoint section states; the per-endpoint notes stay where they are.
+
+| Endpoint | Field | Scale |
+|---|---|---|
+| `POST /markets/batch-prices` | `price` | Venue-dependent, not normalized |
+| `GET /markets/outcomes` | `outcomes[].price` | 0–1 decimal (cache holds cents, handler divides by 100) |
+| `GET /markets/crypto` | `markets[].price` | 0–1 decimal, read from each venue's order book |
+| `GET /api/markets/discover/v2` | `min_price` / `max_price` request filters | Cents (0–100) |
+| `GET /api/markets/discover/v2` | `markets[].price` | 0–1 decimal (cache holds cents, response divides by 100) |
+| `GET /api/markets/discover/v2/ticker` | `markets[].price` | 0–1 decimal |
+| `GET /api/markets/discover/v2/breaking` | `markets[].price` | 0–1 decimal |
+| `GET /api/markets/discover/v2/expiring` | `markets[].price` | 0–1 decimal |
+| `GET /api/markets/trending` | `markets[].price` | 0–1 decimal |
+| `GET /api/markets/trending/ws` | `markets[].price` | Cents (0–100), the raw cached value |
+
+## Active markets snapshot
+
+```
+GET /markets/active
+```
+
+Cursor-paginated page of the canonical active-market snapshot for one provider — a live cache, not a historical catalogue. For ranked, filtered, or text-search results use [Discover](#discover-markets) instead.
+
+`x-kairos-auth: api-key` · 200 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | No | `polymarket` | 1–64 chars, active in ProviderConfig. Provider/exchange id |
+| `limit` | integer | No | `100` | 1–250. Page size |
+| `cursor` | string | No | — | ≤512 chars. Opaque cursor from the previous page's `next_cursor` |
+
+```bash
+curl "https://data.kairos.trade/markets/active?provider=polymarket&limit=100" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "provider": "polymarket",
+  "exchange_id": "polymarket",
+  "markets": [
+    {
+      "market_id": "2256391",
+      "condition_id": "0x...",
+      "title": "Will Example happen?",
+      "status": "open",
+      "outcomes": [{"outcome": "Yes", "token_id": "..."}],
+      "raw": { }
+    }
+  ],
+  "count": 1,
+  "next_cursor": "2256391",
+  "has_more": true,
+  "source": "market_metadata_cache"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `markets[].raw` | object | Full upstream provider payload as last captured |
+| `next_cursor` | string \| null | Pass back verbatim as `cursor` to page forward; null on the last page |
+| `source` | string | Always `market_metadata_cache` |
+
+Apart from `provider` and `source`, the body is the metadata cache's own page payload passed through unchanged.
+
+<Warning>
+**Gotcha:** `503` means the snapshot couldn't be read (cache not ready, or unreachable) — never an empty page. Do not treat it as "no active markets".
+</Warning>
+
+## Market details lookup
+
+```
+POST /markets/details
+```
+
+Looks up `market_id` / `condition_id` / `token_id` rows for a batch of `(market_id, provider_id)` pairs — `market_id` in the request matches any of the three identifiers. Unmatched markets are simply absent from the response; there's no `found: false` sentinel here (contrast with [batch metadata](#batch-market-metadata)).
+
+`x-kairos-auth: api-key` · 100 req/min (global default — no per-endpoint limit)
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `markets` | array | Yes | — | Non-empty, max 500 items. `{market_id, provider_id}` pairs |
+| `markets[].provider_id` | integer | Yes | — | Numeric provider ID (1=Kalshi, 2=Polymarket, 8=Predict.fun, 9=Hyperliquid) |
+
+```bash
+curl -X POST https://data.kairos.trade/markets/details \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"markets": [{"market_id": "965276", "provider_id": 8}]}'
+```
+
+### Response
+
+```json
+{
+  "markets": [
+    {
+      "market_id": "965276",
+      "provider_id": 8,
+      "event_id": "highest-temperature-in-houston-on-july-28-2026",
+      "name": "Will the highest temperature in Houston be between 94-95°F on July 28?",
+      "category": "weather",
+      "status": "open",
+      "condition_id": "0x34d6ab729226f6301afb0c4cff6cf07969fe78f4a78886c3c33c8031eb08b05a",
+      "token_id": "61175686385372568975810202161612597062927262451423587933926076170446750072562",
+      "token_ids": [
+        "61175686385372568975810202161612597062927262451423587933926076170446750072562",
+        "111952849914650302806938787892725463521522070802687323064727175213031898300393"
+      ],
+      "outcomes": ["Yes", "No"]
+    }
+  ]
+}
+```
+
+`token_ids` and `outcomes` are 1:1 lists of every on-chain CTF token this market has — CTF is the on-chain conditional-token contract each outcome share is minted under. Index 0 is YES / Up / first outcome, index 1 is NO / Down / second outcome, and so on for multi-outcome markets. The singular `token_id` is retained for back-compat and holds the first token only.
+
+> **Gotcha:** `token_ids` and `outcomes` are both empty when the market has no on-chain tokens yet (indexer lag). Check for a non-empty `token_ids` before submitting an order.
+
+> **Gotcha:** `markets[].market_id` in the response is the **canonical** market id, which is not necessarily the identifier you asked with — a Polymarket lookup by `condition_id` comes back keyed on the numeric Gamma id. Re-key using the returned `condition_id`/`token_id`/`token_ids` rather than assuming the request id round-trips.
+
+## Batch prices
+
+```
+POST /markets/batch-prices
+```
+
+Current price/volume/liquidity for up to 300 `(market_id, provider_id)` pairs, with responses briefly cached. Every reference must include a non-empty market identifier and known integer provider ID. Venues without batch-price support are skipped — their markets are simply absent, not an error.
+
+`x-kairos-auth: api-key` · 200 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `markets` | array | Yes | — | Non-empty, max 300 items. `{market_id, provider_id}` pairs |
+
+```bash
+curl -X POST https://data.kairos.trade/markets/batch-prices \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"markets": [{"market_id": "BTCUSD-24JAN05", "provider_id": 1}]}'
+```
+
+### Response
+
+Flat object keyed by the requested `market_id`, no wrapper:
+
+```json
+{
+  "BTCUSD-24JAN05": {
+    "price": 0.65,
+    "volume": "1.2M",
+    "liquidity": 50000.0
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `price` | number | Current venue reference price; scale is venue-dependent and not normalized |
+| `volume` | string \| null | Formatted (e.g. `"1.5M"`, `"500K"`) |
+| `liquidity` | number \| null | Venue liquidity figure; null when the venue doesn't report one |
+
+## Tick size
+
+```
+GET /markets/tick-size
+```
+
+The same authoritative tick grid the order executor validates against — tick size is the smallest price increment a venue accepts. This endpoint describes the grid, never snaps or rounds a price. It falls back to a narrow direct-venue lookup on a cache miss:
+
+- **polymarket** — a single flat range over `[0, 1]` (flips 0.01↔0.001 at the 0.96/0.04 extremes). Falls back to the Polymarket CLOB tick-size endpoint, which requires `asset_id`.
+- **kalshi** — the tapered `price_ranges` grid (`min_tick` = finest step). If only the deprecated flat `tick_size` field exists, returns one range with `synthetic: true`.
+- **predictfun** — no per-market dynamic tick endpoint. Returns `supported: false` with a `reason` (a `200`, not an error) — no grid is ever fabricated.
+
+Any provider besides kalshi/polymarket/predictfun is rejected with `400`.
+
+`x-kairos-auth: api-key` · 200 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | Yes | — | kalshi, polymarket, predictfun. Must also be active in ProviderConfig |
+| `contract_id` | string | Yes | — | Non-empty after trimming. Kalshi ticker or Polymarket condition id |
+| `asset_id` | string | No | — | Polymarket CLOB token id; required for the CLOB fallback |
+
+```bash
+curl "https://data.kairos.trade/markets/tick-size?provider=kalshi&contract_id=KXBTC15M-26JUL221600-00" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "provider": "kalshi",
+  "contract_id": "KXBTC15M-26JUL221600-00",
+  "ranges": [{"start": "0", "end": "1", "step": "0.001"}],
+  "min_tick": "0.001",
+  "source": "metadata_cache",
+  "synthetic": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `ranges`/`min_tick` | string(s) | Decimal strings, to avoid float precision loss |
+| `source` | string | `metadata_cache`, `polymarket_clob`, `kalshi_price_ranges`, or `kalshi_tick_size_deprecated` |
+
+On predict.fun the shape is instead `{"provider": "predictfun", "contract_id": "...", "supported": false, "reason": "..."}`.
+
+`502` means both the cache and the direct-venue fallback failed to resolve a tick.
+
+## Market metadata
+
+```
+GET /markets/metadata
+```
+
+Full metadata for one market — resolution rules, contract spec, images. Resolution order: (1) an indexed record, with a faster path for Polymarket; (2) on a miss, a live provider-API fetch (covers markets too new to be indexed, e.g. short-lived 15-minute crypto markets); (3) if the resolved document has **empty** `resolution_rules`, an extra provider-API call backfills rules/description without discarding the rest of the document.
+
+For polymarket/predictfun, a best-effort liquidity-rewards enrichment also mutates `extra` in place.
+
+`x-kairos-auth: api-key` · 100 req/min (global default — no per-endpoint limit)
+
+<Note>
+**Gotcha:** Only the primary indexed-record path populates `condition_id`, `event_id`, and `contract.settlement_ts`. The faster Polymarket path and every provider-API fallback leave those `null` — a null here does not mean the market lacks one.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `ticker` | string | Yes | — | Market ticker/ID |
+| `provider` | string | Yes | — | kalshi, polymarket, or any other active provider (e.g. predictfun, opinion) via the API-fallback path |
+
+```bash
+curl "https://data.kairos.trade/markets/metadata?ticker=BTCUSD-24JAN05&provider=kalshi" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "ticker": "BTCUSD-24JAN05",
+  "provider": "kalshi",
+  "name": "Will BTC be above $50K on Jan 5?",
+  "description": "...",
+  "resolution_rules": {"primary": "...", "secondary": null, "source": null},
+  "contract": {"tick_size": 0.01, "min_price": null, "max_price": null, "lot_size": null, "quote_currency": "USD", "settlement_ts": null, "expires_at": "2026-01-05T00:00:00Z"},
+  "images": {"icon": "https://...", "banner": "https://..."},
+  "external_url": null,
+  "condition_id": null,
+  "event_id": null,
+  "ctf_neg_risk": false,
+  "extra": { },
+  "active": true
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `active` | boolean | False if delisted/resolved and not tradable |
+| `extra` | object | Raw upstream payload plus enrichment: polymarket gets `clobRewards`/`rewardsMaxSpread`/`rewardsMinSize`; predictfun gets `rewards.current` |
+
+`404` only when no source — cache nor any provider API — has the market at all.
+
+## Batch market metadata
+
+```
+POST /markets/metadata/batch
+```
+
+Batch variant of [market metadata](#market-metadata), capped at 100 contracts. Contracts whose provider is hidden in admin are dropped first. Unless `titles_only: true`, three best-effort enrichment passes run after lookup (each swallows its own errors): API fallback for still-unfound markets, category inference from ticker/title patterns, and platform tag-icon enrichment. The single-market endpoint's Polymarket rewards enrichment is intentionally **not** run here — this feeds list views where the rewards badge doesn't render.
+
+`x-kairos-auth: api-key` · 100 req/min (global default — no per-endpoint limit)
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `contracts` | array | Yes | — | Non-empty, max 100 items. `{ticker, provider}` pairs |
+| `titles_only` | boolean | No | `false` | Skip the three enrichment passes |
+
+```bash
+curl -X POST https://data.kairos.trade/markets/metadata/batch \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"contracts": [{"ticker": "BTCUSD-24JAN05", "provider": "kalshi"}], "titles_only": false}'
+```
+
+### Response
+
+Keyed by requested ticker; every requested ticker appears, `found: false` for unresolved ones.
+
+```json
+{
+  "BTCUSD-24JAN05": {
+    "ticker": "BTCUSD-24JAN05",
+    "found": true,
+    "title": "Will BTC be above $50K on Jan 5?",
+    "provider": "kalshi",
+    "status": "open"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `tag_icon` | string \| null | Highest-precedence active platform-tag icon |
+| `yes_sub_title` / `no_sub_title` | string \| null | Custom binary side label; null falls back to "Yes"/"No" on the frontend |
+| `resolved_outcome` | string \| null | Winning side for resolved binary markets (`yes`, `no`, `void`, or null) |
+| `outcome_pair` | array \| null | The two real outcome labels for a non-Yes/No binary market, index-ordered |
+| `outcome_label` | string \| null | Short sibling-differentiating label in a multi-outcome event (Polymarket `groupItemTitle`, Kalshi `yes_sub_title`) |
+| `event_title` / `image` / `end_date` / `open_time` | string \| null | Event grouping, artwork, and schedule fields |
+
+<Warning>
+**Gotcha:** Contracts on a hidden provider also come back as `{"ticker": "...", "found": false}` — a settled answer, not a lookup failure, so don't retry them.
+</Warning>
+
+## Market outcomes
+
+```
+GET /markets/outcomes
+```
+
+Every outcome in the event that `market_id` belongs to, sourced from the discover cache. If the event can't be resolved and `provider=polymarket`, falls back to a live provider lookup; other providers get no such fallback and return the empty shape.
+
+`x-kairos-auth: api-key` · 100 req/min (global default — no per-endpoint limit)
+
+<Note>
+**Gotcha:** Outcome prices here are a **0–1 decimal probability**, not the platform's usual 0–100 cents scale. The cache stores cents and the handler divides by 100 before serving.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `market_id` | string | Yes | — | ≤128 chars. Market ID / ticker / token_id / slug |
+| `provider` | string | Yes | — | Active in ProviderConfig |
+| `all_ids` | string | No | — | ≤200 items, each ≤128 chars. Comma-separated extra ids to resolve into `event_groups`, for dropdown dedup |
+
+```bash
+curl "https://data.kairos.trade/markets/outcomes?market_id=570362&provider=polymarket" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "event_title": "BTC price events",
+  "provider": "polymarket",
+  "outcomes": [
+    {
+      "market_id": "570362",
+      "outcome_label": "Yes",
+      "price": 0.62,
+      "volume_total": 120000.0,
+      "volume_24h": 4200.0,
+      "volume_1h": 175.0,
+      "token_id": "...",
+      "condition_id": "0x...",
+      "image": null,
+      "icon": null,
+      "expiration": null
+    }
+  ],
+  "image": null,
+  "icon": null,
+  "category": null,
+  "is_grouped": true,
+  "matched_market_id": "570362",
+  "event_groups": {"570362": "12345"},
+  "event_titles": {"12345": "BTC price events"}
+}
+```
+
+On the populated path `is_grouped` is always `true`.
+
+<Warning>
+**Gotcha:** An unresolvable event is a `200` with the empty shape `{"event_title": null, "outcomes": [], "is_grouped": false, "event_groups": {…}, "event_titles": {…}}` — never a `404`.
+</Warning>
+
+## Crypto markets
+
+```
+GET /markets/crypto
+```
+
+The crypto up/down markets (BTC/ETH/SOL/XRP on Kalshi + Polymarket, plus DOGE/HYPE/BNB and predict.fun on some intervals) for one time window. `window_offset` shifts by whole windows of `interval` (0=current, -1=previous, +1=next). Past windows are cached immutably; current/future windows use a short cache.
+
+`x-kairos-auth: api-key` · 200 req/min
+
+<Note>
+**Gotcha:** `price` is a raw **0–1 decimal** probability read from each venue's order book.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `interval` | string | No | `15m` | `5m`, `15m`, `1h`. Trading interval |
+| `window_offset` | integer | No | `0` | −10000 to 10000. Windows from current |
+
+```bash
+curl "https://data.kairos.trade/markets/crypto?interval=15m&window_offset=0" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "markets": [
+    {
+      "symbol": "BTC",
+      "market_id": "KXBTC15M-26JUL221600-00",
+      "token_id": null,
+      "provider_id": 1,
+      "price": 0.47,
+      "is_settled": false
+    }
+  ],
+  "window_offset": 0,
+  "window_start_ms": 1784094000000,
+  "window_end_ms": 1784094900000
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `token_id` | string \| null | Polymarket/predict.fun CLOB token id ("Yes" token); absent for Kalshi |
+| `price` | number \| null | Null while a market has no orderbook yet; snapped to 0/1 once `is_settled` |
+| `window_start_ms` / `window_end_ms` | integer | Absolute epoch-ms bounds of the window this payload belongs to — verify against these instead of wall-clock alignment |
+
+## Crypto oracle history
+
+```
+GET /markets/crypto/oracle-history
+```
+
+Per-symbol resolution-price history over `[end_ms - minutes*60000, end_ms]`, for chart pre-population. Each request names **one** source so settlement feeds are never mixed. Binance gaps may be backfilled from Binance REST; venue-specific sources remain empty when their stored feed has a gap.
+
+`x-kairos-auth: api-key` · 200 req/min
+
+### Source identities
+
+Every source publishes under `provider: "oracle"` on the market-data WebSocket, so the **wire symbol** is the identity. Logical assets are `btc-usd`, `eth-usd`, `sol-usd`, `xrp-usd`, `doge-usd`, `hype-usd`, `bnb-usd`.
+
+| `source` | Wire symbol example | Origin | Notes |
+|---|---|---|---|
+| `binance` | `btc-usd` | Binance spot | Only series with external REST backfill |
+| `polymarket_chainlink` | `btc-usd-polymarket-chainlink` | Polymarket RTDS `crypto_prices_chainlink` | Live Chainlink ticks Polymarket/Predict.fun charts use; not a window PTB source |
+| `kalshi_cfbenchmarks` | `btc-usd-kalshi-cfb` | Kalshi CF Benchmarks raw indexes | **BTC and ETH only** — `sol-usd` and peers are rejected |
+| `hyperliquid_mark` | `btc-usd-hyperliquid-mark` | Hyperliquid mark | Live mark series; not a window PTB source |
+| `polymarket_twap30` | `btc-usd-polymarket-twap30` | Polymarket RTDS Chainlink TWAP | Legacy 1m window overlays |
+| `polymarket_twap60` | `btc-usd-polymarket-twap60` | Polymarket RTDS Chainlink TWAP | Legacy ≥5m window overlays |
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `symbols` | string | Yes | — | Source-specific wire symbols. Comma-separated, case-insensitive; for example `btc-usd` for Binance or `btc-usd-polymarket-chainlink` for Polymarket |
+| `source` | string | No | inferred | One of the sources in the table above. Symbols must belong to this source. Omission is supported for legacy clients and inferred from the wire symbols |
+| `minutes` | integer | No | `10` | 1–1440. Lookback window |
+| `full_resolution` | boolean | No | `false` | Raw 1-second history, no downsampling |
+| `end_ms` | integer | No | — | Epoch ms, must be > 0. Clamped to server "now"; omit for the live edge. For paginated backward loading |
+
+```bash
+curl "https://data.kairos.trade/markets/crypto/oracle-history?symbols=btc-usd-polymarket-chainlink&source=polymarket_chainlink&minutes=10" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+Keyed by symbol, ascending by timestamp:
+
+```json
+{
+  "btc-usd-polymarket-chainlink": [
+    { "price": 65432.10, "timestamp": 1784094262213 }
+  ]
+}
+```
+
+> **Gotcha:** Only Binance has external backfill. A gap in a venue series (`-polymarket-*`, `-kalshi-cfb`, `-hyperliquid-mark`) stays a gap — Binance klines are a different series and are never written under another source's contract id — so a symbol with nothing in the local store comes back as an empty array rather than being filled.
+
+> **Gotcha:** Mixing wire symbols from two sources in one request (or omitting `source` when the symbols do not identify exactly one) is a `400`, not a merged response.
+
+## Crypto price-to-beat
+
+```
+GET /markets/crypto/ptb
+```
+
+Oracle price from the requested **window** resolution source at the start of each window ("the price to beat"), nested `{window: {symbol: {...}}}`. Window starts align to clean ET boundaries. Symbols with no resolvable price are omitted rather than filled from a different source.
+
+`x-kairos-auth: api-key` · 200 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `windows` | string | No | `15m` | Each of `1m`, `5m`, `15m`, `1h`, `4h`, `1d`. Comma-separated |
+| `source` | string | No | inferred | `binance`, `kalshi_cfbenchmarks`, `polymarket_twap30`, or `polymarket_twap60`. ET-aligned window source only — `polymarket_chainlink` and `hyperliquid_mark` are rejected here. TWAP30 remains available for legacy 1m overlays; new market clients should pass their source explicitly |
+
+```bash
+curl "https://data.kairos.trade/markets/crypto/ptb?windows=5m&source=kalshi_cfbenchmarks" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "5m": {
+    "btc-usd": { "price": 65432.10, "timestamp_ms": 1710590401200, "game_start_ms": 1710590400000 }
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp_ms` | integer | Actual oracle sample time; may differ slightly from `game_start_ms` |
+| `game_start_ms` | integer | Epoch-ms start of the requested window |
+
+Symbols with no resolvable price for a window are omitted from that window's object, not returned as null.
+
+## Equity/forex/commodity snapshot
+
+```
+GET /markets/equity/snapshot
+```
+
+Last-known prices for a fixed allow-list of stock, ETF, forex, and commodity symbols, mapped to standard ticker symbols. A shared cache holds all previously-fetched symbols; served straight from it only if every requested symbol is present. Otherwise missing symbols are fetched and merged into the cache, and the response returns **only the freshly-fetched subset** with `cached: false` (never a merge of cached + fresh in one response). Returns the last regular-session print even when markets are closed.
+
+`x-kairos-auth: session` · 200 req/min
+
+<Note>
+**Gotcha: auth differs from every other endpoint on this page.** This route accepts a first-party session JWT or the internal admin secret, and does **not** accept the `X-Client-Id`/`X-Api-Key`/`X-Api-Secret` headers the rest of `/markets/*` accepts. An API key clears the router's invite gate and is then rejected by the route's own auth dependency with `401`.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `symbols` | string | Yes | — | Subset of the supported allow-list (AAPL, TSLA, MSFT, SPY, QQQ, EURUSD, XAUUSD, WTI, …). Comma-separated, case-insensitive |
+
+```bash
+curl "https://data.kairos.trade/markets/equity/snapshot?symbols=AAPL,TSLA,EURUSD" \
+  -H "Authorization: Bearer $KAIROS_SESSION_JWT"
+```
+
+### Response
+
+```json
+{
+  "prices": {
+    "AAPL": {"symbol": "AAPL", "price": 195.42, "previousClose": 193.10, "currency": "USD", "marketState": "REGULAR", "timestamp": 1747000000000}
+  },
+  "cached": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `cached` | boolean | True only if every requested symbol was already cached and `prices` is the full cached set |
+| `marketState` | string | Upstream session state (e.g. `REGULAR`, `CLOSED`); `UNKNOWN` when not reported |
+| `timestamp` | integer | Epoch **ms** (upstream seconds ×1000) |
+
+A symbol whose upstream fetch fails is dropped from `prices` — the request still returns `200`, so check for the key rather than assuming every requested symbol is present.
+
+## Discover markets
+
+```
+GET /api/markets/discover/v2
+```
+
+Paginated, filtered, event-grouped market list backed by a periodically-refreshed discover cache. Cacheable requests (no `search`/`min_price`/`max_price`/`min_volume_1h`/`market_ids`/`tag_ids`) are served from cache; requests with any of those filters always run fresh and are never cached. Tag/subcategory filters that resolve to zero markets short-circuit to an empty payload; an empty tag-filtered result also gets one fallback query so populated subtopics never render empty.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `offset` | integer | No | `0` | 0–5000. Upper bound matches the candidate window `total` is derived from, so real pagination never reaches it |
+| `limit` | integer | No | `50` | 1–200 |
+| `sort_by` | string | No | `volume_1h` | `volume`, `volume_24h`, `volume_1h`, `price`, `newest`, `liquidity`, `rewards` |
+| `sort_order` | string | No | `desc` | `asc`/`desc` |
+| `provider` | string | No | — | Active provider or `all` |
+| `category` | string | No | — | `all`, `politics`, `crypto`, `sports`, `esports`, `finance`, `tech`, `world`, `weather`, `culture`, `elections`, `geopolitics`, `economy`, `climate & science`. Case-insensitive. `elections`, `geopolitics`, `economy`, and `climate & science` are display aliases remapped server-side to politics / world / finance / weather respectively; `culture` is a category in its own right, not an alias |
+| `search` | string | No | — | ≤128 chars. Disables response caching |
+| `min_price` / `max_price` | number | No | — | 0–100 (cents). Disables caching |
+| `min_volume_1h` | number | No | — | ≥0. Disables caching |
+| `market_ids` | string | No | — | Comma-separated, max 500 items, ≤128 chars each. Disables caching |
+| `tag_ids` | string | No | — | Comma-separated, max 50 items, valid UUIDs. AND-intersected; disables caching |
+| `tag_slug` | string | No | — | `^[a-z0-9][a-z0-9-]{0,63}$`. Single platform-tag slug |
+| `subcategory` | string | No | — | `^[a-z0-9][a-z0-9-]{0,63}$`. Also accepts `__tournament:<uuid>`, which returns an empty payload rather than 400ing |
+| `expiration_after` / `expiration_before` | string | No | — | ISO 8601. Expiration window bounds |
+| `zipper` | boolean | No | `false` | Interleave results across providers instead of a flat sort |
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2?category=crypto&limit=50" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "markets": [
+    {
+      "id": "570362",
+      "title": "Will BTC hit $100K?",
+      "price": 0.62,
+      "volume24h": 5400.0,
+      "provider": "polymarket",
+      "status": "open",
+      "isGrouped": false
+    }
+  ],
+  "total": 1,
+  "offset": 0,
+  "limit": 50,
+  "timestamp": "2026-07-22T12:00:00Z"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `markets[].price` | number | **0–1 decimal** — the cache holds cents and the response divides by 100 |
+| `markets[].isGrouped` | boolean | True: `eventTitle` + `outcomes[]` populated, `outcomeLabel`/`token_id`/`condition_id` absent. False: the reverse |
+| `timestamp` | string | ISO time of the underlying cache build; empty string on the fallback/empty-filter short-circuit paths |
+
+<Warning>
+**Gotcha:** the response `price` is a 0–1 decimal, but the `min_price`/`max_price` filters you send are in **cents (0–100)**. The two ends of this endpoint do not use the same scale.
+</Warning>
+
+## Discover ticker feed
+
+```
+GET /api/markets/discover/v2/ticker
+```
+
+Compact ticker-bar feed of top active markets by 1h volume. Grouped (multi-outcome) markets and parlays are excluded.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `30` | 1–60 |
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2/ticker?limit=30" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+`markets[]` (`id`, `title`, `provider`, `price` — 0–1 decimal, `volume1h`, `token_id`), `count`, `timestamp`.
+
+## Discover breaking markets
+
+```
+GET /api/markets/discover/v2/breaking
+```
+
+Interleaves the biggest 24h price movers, top 1h-volume, and top 24h-volume markets (deduped) for the Pulse rail. Only markets priced strictly between 10 and 90 cents, open/active, with ≥10 in 1h volume, no parlays, and a resolvable trade-history identifier are eligible; movers additionally need ≥2% 24h price change.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `25` | 1–50 |
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2/breaking?limit=25" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+`markets[]` (`id`, `ticker`, `title`, `provider`, `price` — 0–1 decimal, `volume1h`, `priceChange24hSigned`, `token_id`, `condition_id`, `image`, `icon`, `category`), `count`, `timestamp`.
+
+## Discover expiring markets
+
+```
+GET /api/markets/discover/v2/expiring
+```
+
+Markets expiring soonest with actionable prices (strictly between 0.5 and 99.5 cents). Backed by a short-lived (15s) Redis response cache.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `7` | 1–20 |
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2/expiring?limit=7" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+`markets[]` (`id`, `ticker`, `title`, `provider`, `price` — 0–1 decimal, `volume1h`, `volume24h`, `volume`, `expiration`, `token_id`, `condition_id`, `category`, `image`, `icon`, `isGrouped`), `count`, `timestamp`.
+
+## Discover subcategories
+
+```
+GET /api/markets/discover/v2/subcategories
+```
+
+Available subcategories (subtopics) for a topic category, each with a market count. Served straight from a cron-built Redis index (`discover:subcats:<category>`) — the endpoint does no tag resolution of its own. The frontend display aliases (`elections`, `geopolitics`, `economy`, `climate & science`) are remapped to their canonical category before the index lookup.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `category` | string | Yes | — | e.g. `crypto`, `sports`, `politics`; case-insensitive. Topic tag slug |
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2/subcategories?category=crypto" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{"category": "crypto", "subcategories": [{"name": "Bitcoin", "slug": "bitcoin", "count": 42}]}
+```
+
+`category` echoes back the requested (lowercased) value, not the canonical one it was aliased to. `count` is approximate and may run slightly higher than the post-grouping total shown on the cards page.
+
+<Note>
+**Gotcha:** An unknown category is a `503`, not a `404` — the endpoint can't distinguish "no such topic" from "the cron hasn't built that index yet".
+</Note>
+
+## Discover search index
+
+```
+GET /api/markets/discover/v2/search-index
+```
+
+Every valid market, grouped by event, in a compact shape for client-side instant search. Results are cached after the first build to keep subsequent requests fast.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover/v2/search-index" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+`markets[]` (grouped rows carry `outcomes[]`; single rows carry `token_id`), `total`, `timestamp`.
+
+## Trending markets
+
+```
+GET /api/markets/trending
+```
+
+Trending markets ranked by 1-hour volume. Not cached at the router level.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `10` | 1–50 |
+| `provider` | string | No | — | Not validated. Omit or `all` for every provider; an unknown value yields an empty list, not a `400` |
+
+```bash
+curl "https://data.kairos.trade/api/markets/trending?limit=10" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "markets": [
+    {
+      "id": "570362",
+      "ticker": "570362",
+      "title": "Will BTC hit $100K?",
+      "price": 0.62,
+      "volume": 120000.0,
+      "volume1h": 5400.0,
+      "provider": "polymarket",
+      "outcomeLabel": "Yes",
+      "event_id": "12345"
+    }
+  ],
+  "count": 1,
+  "timestamp": "2026-07-22T12:00:00Z"
+}
+```
+
+`price` is a **0–1 decimal**. `timestamp` is the server time the response was built, not a cache-build time.
+
+## Trending markets (WebSocket subscription list)
+
+```
+GET /api/markets/trending/ws
+```
+
+Trending market IDs formatted for WebSocket subscription — a lighter payload than [trending markets](#trending-markets), for seeding a subscription list rather than rendering a list view. Ranked by **24-hour** volume, unlike [trending markets](#trending-markets), which ranks by 1h volume.
+
+`x-kairos-auth: api-key` · 60 req/min. **Not present in the OpenAPI spec** — no live-tester link for this one.
+
+<Note>
+**Gotcha:** `price` here is **cents (0–100)**, the raw cached value — this is the one endpoint on this page that does *not* divide by 100. `/api/markets/trending` returns the same field as a 0–1 decimal.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `20` | 1–300 |
+| `provider` | string | No | — | Not validated. Omit or `all` for every provider; an unknown value yields an empty list, not a `400` |
+
+```bash
+curl "https://data.kairos.trade/api/markets/trending/ws?limit=20" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "markets": [{"id": "570362", "symbol": "570362", "title": "Will BTC hit $100K?", "price": 62.0, "volume24h": 5400.0, "provider": "polymarket"}],
+  "count": 1,
+  "timestamp": "2026-07-22T12:00:00Z"
+}
+```
+
+## Kalshi live sports (discover)
+
+```
+GET /api/sports/kalshi-live
+```
+
+Kalshi sports events matched against live Polymarket games. Reads a cached set of Kalshi sports events and, if `games` is supplied, matches each `AWAY:HOME[:league]` triple's team codes against each event's ticker suffix, grouping and sorting matches by total volume descending. Documented here alongside the rest of this page's crypto/discovery endpoints.
+
+`x-kairos-auth: api-key` · 60 req/min
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `games` | string | No | — | Comma-separated `AWAY:HOME[:LEAGUE]` triples, e.g. `ATL:CLE:nba,DET:MIN:mlb`. Omitted → all cached events with `matched: []`. Entries with fewer than two colon-separated parts are skipped silently |
+
+```bash
+curl "https://data.kairos.trade/api/sports/kalshi-live?games=ATL:CLE:nba,DET:MIN:mlb" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "events": [ ],
+  "matched": [
+    {"away": "ATL", "home": "CLE", "league": "nba", "kalshi_events": [ ], "total_volume": 12345.6, "total_markets": 42}
+  ]
+}
+```
+
+An unpopulated cache is a `200` with `{"events": [], "matched": []}`, not an error.
+
+## Errors
+
+Every error on this page is `{ "detail": "<message>" }`, except `429`, which is `{ "error": "Rate limit exceeded: <limit>" }` and carries `Retry-After` / `X-RateLimit-*` headers. Unhandled failures are `500 {"detail": "An internal error occurred. Please try again later."}`.
+
+This service has no separate machine-readable code field, so the Code column below holds the example `detail` message you'll see.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 400 | `Invalid provider: foo` | `provider` not active in ProviderConfig (`/active`, `/tick-size`, `/metadata`, `/outcomes`) | Send a provider that is active in ProviderConfig. Retrying unchanged returns the same error |
+| 400 | `Provider 'hyperliquid' has no per-market tick grid. Supported: kalshi, polymarket (predictfun is static).` | `/tick-size` with an active provider that has no per-market grid | Only call `/tick-size` for kalshi, polymarket, or predictfun |
+| 400 | `missing markets array` · `'markets' array required` · `'contracts' array required` | Missing or non-array `markets` / `contracts` body key on the POST endpoints | Send the body key as a non-empty array and resend |
+| 400 | `Invalid batch prices request` | Batch over its cap — 500 for `/details`, 300 for `/batch-prices`, 100 for `/metadata/batch` — or a malformed `{market_id, provider_id}` entry | Split the batch to the endpoint's cap and check every entry has a non-empty market identifier and an integer provider ID |
+| 400 | `market_id is required` · `market_id is too long` · `all_ids has too many items` | Empty or oversized `/outcomes` identifiers | Send a non-empty `market_id` of ≤128 chars and at most 200 `all_ids` entries |
+| 400 | `Invalid interval: 30m. Must be one of: ['15m', '1h', '5m']` | `interval` outside `5m`/`15m`/`1h`; `window` outside `1m`/`5m`/`15m`/`1h`/`4h`/`1d`; symbol outside the oracle or equity allow-list; empty `symbols`/`windows`; `end_ms <= 0` | Pick a value from the allow-list in that endpoint's request table. Deterministic — retrying unchanged returns the same error |
+| 400 | `Invalid oracle source: …` · `Invalid window PTB source: …` · `… does not support sol-usd` · `Symbols do not identify exactly one oracle source` | Unknown `source`, a contract-tick series passed to `/crypto/ptb`, Kalshi CFB asked for an unsupported asset, or mixed-source wire symbols on `/crypto/oracle-history` | Pass one source from that endpoint's request table with matching wire symbols. Deterministic |
+| 400 | `Invalid sort_by: foo. Must be one of: [...]` · `tag_ids must contain valid UUIDs` | Discover validation — `sort_by`, `sort_order`, `category`, `provider`, `tag_slug`/`subcategory` slug shape, non-ISO `expiration_after`/`expiration_before`, over-long `search`, oversized `market_ids`/`tag_ids` | Fix the parameter against the [Discover markets](#discover-markets) request table and resend |
+| 401 | `Authentication required (JWT token / API key / admin secret)` · `Invalid API credentials` | No JWT / API key / admin secret, or invalid API credentials. `X-Client-Id` sent without both `X-Api-Key` and `X-Api-Secret` is also `401` | Send all three of `X-Client-Id`, `X-Api-Key`, and `X-Api-Secret`. On `/markets/equity/snapshot`, send a session JWT instead — API keys are rejected there |
+| 403 | `IP not whitelisted` | API key used from a non-whitelisted IP | Call from a whitelisted IP, or have the key's whitelist updated. Retrying from the same IP fails identically |
+| 403 | `Invite required` | Session-authenticated caller who hasn't been invited, while the `invite_only` flag is on. API-key and admin callers bypass this gate | Use API-key auth, or get the account invited |
+| 404 | `Market not found: <ticker>` | `/metadata` only — no indexed record and no provider API has the market | Check the `ticker`/`provider` pair. No source has this market, so retrying will not find it |
+| 413 | `Request body too large` | Request body over the service-wide size cap (POST endpoints) | Split the request into smaller batches |
+| 422 | — | FastAPI parameter validation — out-of-range `limit`/`offset`/`minutes`/`window_offset`, non-integer where an integer is required | Bring the parameter inside the range in that endpoint's request table |
+| 429 | `API key data rate limit exceeded` (the per-key case; body is `detail`-shaped) | Per-endpoint group limit, or a per-API-key `data` override ceiling | Back off and retry; `Retry-After` says how long, and `X-RateLimit-*` gives the live ceiling. A `429` does not consume quota |
+| 500 | `Failed to fetch details` · `Batch fetch failed` · `Metadata fetch failed` · `Failed to fetch crypto markets` · `Failed to fetch price-to-beat values` · `Internal server error` | ClickHouse/Redis/upstream failure inside a handler | Retry; the request itself is valid. Report to support with the response body if it persists |
+| 502 | `Could not resolve tick size: <reason>` | `/tick-size` only — both the metadata cache and the direct-venue fallback failed | Retry. For the Polymarket CLOB fallback, supply `asset_id` — it is required there |
+| 503 | `Active market snapshot is temporarily unavailable` · `Subcategory index temporarily unavailable` · `Service temporarily unavailable` | `/active` snapshot unreadable; `/discover/v2/subcategories` index missing or category unknown; discover service reports its cache unpopulated | Retry — never read this as an empty result set. On `/subcategories` also confirm the category is real; an unknown category returns this same `503` |
+
+Rate limits above are the **group defaults**; admin-managed tiers can raise or lower any group at runtime without a deploy, so treat the documented numbers as the baseline and the `X-RateLimit-*` response headers as authoritative. Endpoints marked "global default" have no per-endpoint limit and are not group-tunable. A `429` does not consume quota.
+
+Note the endpoints on this page that return an empty `200` instead of an error: `/markets/outcomes` (unresolvable event), `/markets/metadata/batch` (`found: false`), `/markets/batch-prices` (venues without batch-price support omitted), `/api/sports/kalshi-live` (cold cache), and both trending endpoints (empty ranked set).

@@ -1,0 +1,432 @@
+---
+title: "Synthetic Book Stream"
+description: "Create a weighted formula and consume its live snapshot and delta stream"
+---
+
+This tutorial connects a client to a live Synthetic Book stream, subscribes to
+one canonical definition, decodes its initial snapshot, applies deltas, and
+recovers safely after a sequence gap. Reach for it when you want a weighted
+package of prediction-market legs — a spread, a basket, a relative-value pair —
+priced as one book instead of assembling the legs yourself.
+
+For formula semantics and worked examples, read the
+[Synthetic Books guide](/guides/synthetic-books) first.
+
+## What you need
+
+- A canonical ID such as `syn_0123456789abcdef` from the Synthetic Books
+  definition workflow.
+- Kairos API credentials for authenticated access, or access to the bounded
+  anonymous tier in an environment where it is enabled.
+- The public [WebSocket control schema](/websocket/protobuf-reference) and
+  [synthetic book schema](https://app.kairos.trade/proto/kairos/synthetic/v1/synthetic.proto).
+
+The stream endpoint is:
+
+```text
+wss://stream.kairos.trade
+```
+
+The public WebSocket does not accept raw formulas and does not create synthetic
+books. Formula creation is currently available only to provisioned Synthetic
+Books integrations. Your onboarding materials provide the definition API base
+URL and credentials. If you do not have them, request access before implementing
+the first step below.
+
+## 1. Craft the formula
+
+A definition is a weighted sum:
+
+```text
+S = w1*A + w2*B + ... + wn*N
+```
+
+Submit the definition to the provisioned `POST /v1/synthetics` endpoint. This
+request creates a ten-level decomposed book for `A - B`:
+
+```json
+{
+  "legs": [
+    {
+      "venue": "polymarket",
+      "contract_id": "<market-id-a>",
+      "token_id": "<outcome-token-id-a>",
+      "weight": "1"
+    },
+    {
+      "venue": "kalshi",
+      "contract_id": "<market-ticker-b>",
+      "outcome_index": 0,
+      "weight": "-1"
+    }
+  ],
+  "output_mode": "decomposed_l2",
+  "depth": 10,
+  "classification": "relative_value"
+}
+```
+
+Use market and outcome identifiers returned by Kairos market metadata. A
+positive weight buys that outcome when buying the synthetic; a negative weight
+sells it. Always encode `weight` as a decimal string so values such as
+`"0.333333333"` are represented exactly.
+
+Choose an output mode based on what your client needs:
+
+| `output_mode`   | Output                                                   |
+| --------------- | -------------------------------------------------------- |
+| `bbo`           | Best synthetic bid and ask only                          |
+| `aggregated_l2` | Price levels with equivalent construction paths combined |
+| `decomposed_l2` | Price levels plus the source actions that construct them |
+
+The response includes the canonical ID and a definition-subscription handle:
+
+```json
+{
+  "synthetic_id": "syn_0123456789abcdef",
+  "subscription_id": 4831,
+  "created": true,
+  "expires_at_ms": 1787202600000,
+  "ttl_ms": 600000
+}
+```
+
+The value above is illustrative. Use the ID returned by the service; do not hash
+the definition or construct the ID yourself. Refresh the handle before
+`expires_at_ms` with
+`POST /v1/synthetics/subscriptions/{subscription_id}/refresh`. When the caller
+no longer needs the definition, release its handle with
+`DELETE /v1/synthetics/subscriptions/{subscription_id}`. These control requests
+use the authentication supplied with your provisioned definition endpoint.
+
+## 2. Compile the protobuf schemas
+
+Download [the control schemas](/websocket/protobuf-reference#getting-the-proto-files) and
+the [synthetic schema](https://app.kairos.trade/proto/kairos/synthetic/v1/synthetic.proto), preserving
+their directory paths. For Python:
+
+```bash
+python -m pip install protobuf grpcio-tools websocket-client
+
+mkdir -p generated
+
+python -m grpc_tools.protoc \
+  --proto_path=proto \
+  --python_out=generated \
+  proto/kairos/v1/common.proto \
+  proto/kairos/v1/websocket_control.proto \
+  proto/kairos/synthetic/v1/synthetic.proto
+```
+
+Add `generated` to `PYTHONPATH`, or package the generated modules with your
+application.
+
+## 3. Connect and authenticate
+
+Programmatic clients should send all three API-key headers during the WebSocket
+upgrade:
+
+```text
+X-Client-Id: kairos_ck_...
+X-Api-Key: <api key>
+X-Api-Secret: <api secret>
+```
+
+Browser clients use a session JWT in `Sec-WebSocket-Protocol`. For details and
+the anonymous public protocol, see [Market Data Stream authentication](/websocket/market-data-websocket#connecting).
+
+For example, a Python client using an enabled anonymous tier can open the same
+endpoint with:
+
+```python
+ws = websocket.create_connection(
+    "wss://stream.kairos.trade",
+    subprotocols=["kairos.marketdata.public.v1"],
+)
+```
+
+Never put credentials in query parameters, source control, or logs.
+
+## 4. Subscribe to the synthetic ID
+
+Send a binary `SubscribeRequest` using the ordinary control-message envelope:
+
+```text
+[0x10] [kairos.v1.SubscribeRequest protobuf]
+```
+
+Set the fields exactly as follows:
+
+```text
+contract_id: "syn_0123456789abcdef"
+provider: "synthetic"
+topics: ["synthetic"]
+```
+
+The ID must match `syn_` followed by 16 lowercase hexadecimal characters. The
+`synthetic` topic must be named explicitly; an empty topic list does not select
+it. An accepted request produces `SubscribedResponse` (`0x14`). A cached
+snapshot may arrive immediately, so dispatch every frame by tag instead of
+waiting for the acknowledgment before reading data.
+
+## 5. Decode snapshots and deltas
+
+Synthetic data frames have a two-byte header:
+
+```text
+[1-byte type tag] [1-byte version] [protobuf payload]
+```
+
+| Tag    | Version | Payload                                 |
+| ------ | ------- | --------------------------------------- |
+| `0x50` | `0x01`  | `kairos.synthetic.v1.SyntheticSnapshot` |
+| `0x52` | `0x01`  | `kairos.synthetic.v1.SyntheticDelta`    |
+
+Control frames such as `SubscribedResponse` still use their one-byte header.
+Ignore unknown tags and unsupported versions so future additions do not break
+the connection.
+
+This complete Python client subscribes with API-key credentials and maintains a
+price-keyed local book:
+
+```python
+import os
+import websocket
+
+from kairos.v1 import websocket_control_pb2
+from kairos.synthetic.v1 import synthetic_pb2
+
+URL = "wss://stream.kairos.trade"
+SYNTHETIC_ID = os.environ["KAIROS_SYNTHETIC_ID"]
+
+headers = [
+    f"X-Client-Id: {os.environ['KAIROS_CLIENT_ID']}",
+    f"X-Api-Key: {os.environ['KAIROS_API_KEY']}",
+    f"X-Api-Secret: {os.environ['KAIROS_API_SECRET']}",
+]
+ws = websocket.create_connection(URL, header=headers)
+
+def send_subscribe():
+    request = websocket_control_pb2.SubscribeRequest(
+        contract_id=SYNTHETIC_ID,
+        provider="synthetic",
+        topics=["synthetic"],
+    )
+    ws.send_binary(b"\x10" + request.SerializeToString())
+
+send_subscribe()
+
+book = None
+subscribed = False
+
+def decimal_value(value, exponent):
+    return value / (10 ** exponent)
+
+def accept_snapshot(snapshot):
+    global book
+    if book and snapshot.ownership_epoch < book["epoch"]:
+        return
+    book = {
+        "sequence": snapshot.synthetic_sequence,
+        "epoch": snapshot.ownership_epoch,
+        "status": snapshot.status,
+        "price_exponent": snapshot.price_unit_exponent,
+        "qty_exponent": snapshot.qty_unit_exponent,
+        "bids": {level.price_nano: level for level in snapshot.bids},
+        "asks": {level.price_nano: level for level in snapshot.asks},
+    }
+    best_bid = max(book["bids"], default=None)
+    best_ask = min(book["asks"], default=None)
+    display_bid = (decimal_value(best_bid, book["price_exponent"])
+                   if best_bid is not None else None)
+    display_ask = (decimal_value(best_ask, book["price_exponent"])
+                   if best_ask is not None else None)
+    print("snapshot", book["sequence"], display_bid, display_ask)
+
+def apply_delta(delta):
+    global book
+    if book is None or delta.ownership_epoch < book["epoch"]:
+        return
+    if (delta.ownership_epoch == book["epoch"] and
+            delta.synthetic_sequence <= book["sequence"]):
+        return  # Duplicate or stale delivery after replay
+    if (delta.ownership_epoch != book["epoch"] or
+            delta.previous_sequence != book["sequence"]):
+        book = None
+        print("sequence gap; requesting a new snapshot")
+        send_subscribe()
+        return
+    for change in delta.changes:
+        if change.side == synthetic_pb2.BOOK_SIDE_BID:
+            levels = book["bids"]
+        elif change.side == synthetic_pb2.BOOK_SIDE_ASK:
+            levels = book["asks"]
+        else:
+            book = None
+            print("invalid side; requesting a new snapshot")
+            send_subscribe()
+            return
+        if change.qty_nano == 0:
+            levels.pop(change.price_nano, None)
+        else:
+            levels[change.price_nano] = change
+    book["sequence"] = delta.synthetic_sequence
+    book["status"] = delta.status
+    book["price_exponent"] = delta.price_unit_exponent
+    book["qty_exponent"] = delta.qty_unit_exponent
+    print("delta", book["sequence"], len(book["bids"]), len(book["asks"]))
+
+while True:
+    frame = ws.recv()
+    if not isinstance(frame, bytes) or not frame:
+        continue
+    tag = frame[0]
+    if tag == 0x50 and len(frame) >= 2 and frame[1] == 1:
+        snapshot = synthetic_pb2.SyntheticSnapshot()
+        snapshot.ParseFromString(frame[2:])
+        accept_snapshot(snapshot)
+    elif tag == 0x52 and len(frame) >= 2 and frame[1] == 1:
+        delta = synthetic_pb2.SyntheticDelta()
+        delta.ParseFromString(frame[2:])
+        apply_delta(delta)
+    elif tag == 0x14:
+        response = websocket_control_pb2.SubscribedResponse()
+        response.ParseFromString(frame[1:])
+        subscribed = True
+        print("subscribed", response.contract_id)
+    elif tag == 0x17:
+        error = websocket_control_pb2.ErrorResponse()
+        error.ParseFromString(frame[1:])
+        if not subscribed:
+            raise RuntimeError(f"{error.action}: {error.message}")
+        print("stream warning", error.action, error.message)
+```
+
+The example keeps nano-unit integers as dictionary keys. Convert only for
+display using the exponent carried by the frame; both exponents are currently 9. Integer keys avoid floating-point collisions between price levels.
+
+## 6. Apply deltas safely
+
+A snapshot replaces the entire local book. A delta applies only when:
+
+1. Its `ownership_epoch` equals the snapshot epoch you currently hold.
+2. Its `previous_sequence` equals your current `synthetic_sequence`.
+3. Its `synthetic_sequence` is greater than the current sequence.
+
+Ignore a delta from the current epoch when its `synthetic_sequence` is less
+than or equal to the sequence already applied. A replay can briefly overlap
+with live delivery, so receiving the same delta twice is not a sequence gap.
+Recover only when a **newer** delta does not connect to the current sequence, or
+when a higher ownership epoch arrives without its snapshot.
+
+Each `SyntheticLevelChange` is addressed by side and `price_nano`. A zero
+`qty_nano` removes that price; a positive quantity replaces the complete level.
+In decomposed mode, replace the recipes with the recipes on the change as well.
+
+`InputVersionChange.leg_index` addresses the corresponding leg in the canonical
+definition echoed by the snapshot. Apply those sparse changes if your client
+displays or validates source lineage.
+
+<Note>
+**Gotcha: a failed check has no tolerance — resync fully.** If any sequence
+or epoch check fails, discard the local book and send the same
+`SubscribeRequest` again. That requests a cached snapshot and its contiguous
+deltas without consuming another subscription slot. If no complete replay is
+available, wait for the next snapshot. Never apply a delta to an old
+baseline.
+</Note>
+
+The gateway also fences the stream on your behalf. A delta whose
+`previous_sequence` does not chain onto the frame the gateway holds is
+**dropped rather than forwarded**, as is a delta from a lower `ownership_epoch`
+and any duplicate redelivery. So a gap upstream shows up as silence, not as a
+broken chain, and it ends at the next snapshot — the producer snapshots every
+64 deltas, and the gateway's replay buffer holds at most 256. While the chain
+is broken, a re-subscribe replays nothing at all until that snapshot
+re-anchors it; a snapshot plus a chain with a hole would leave you
+confidently wrong.
+
+The gateway drops frames that fail validation before they ever reach you:
+a mismatched `synthetic_id`, a zero `synthetic_sequence`, a
+`price_unit_exponent` / `qty_unit_exponent` other than 9, an empty
+`publisher_instance_id`, a non-monotonic or crossed ladder, a non-positive
+quantity on a snapshot level, a negative `qty_nano` on a change, or a change
+whose `side` is neither `BOOK_SIDE_BID` nor `BOOK_SIDE_ASK`.
+
+## 7. Decide whether the quote is usable
+
+Only treat levels as executable when `status` is
+`MATERIALIZATION_STATUS_EXECUTABLE`. Empty ladders with `NO_LIQUIDITY`, and all
+non-live statuses, are not zero-priced opportunities.
+
+For execution-aware clients:
+
+- Reject or revalidate recipes after `valid_until_ms`.
+- Check `max_input_age_ms` and `cross_venue_skew_ms` against your own policy.
+- Read the source action on each recipe leg; do not infer it from the sign of
+  the formula at execution time.
+- Include fees, balances, allowances, and partial-fill risk before submitting
+  source orders.
+
+## 8. Unsubscribe and reconnect
+
+To stop the stream, send:
+
+```text
+[0x11] [kairos.v1.UnsubscribeRequest protobuf]
+```
+
+with the same `contract_id` and `provider: "synthetic"`. The server responds
+with `UnsubscribedResponse` (`0x15`).
+
+After any disconnect, clear the local book, reconnect with exponential backoff
+and jitter, and send a fresh subscription. Do not carry a snapshot or sequence
+across connections.
+
+## Errors and close codes
+
+Subscribe rejections arrive as `ErrorResponse` (`0x17`) with
+`action: "subscribe"`. The ones you are most likely to hit here are
+`synthetic requires a canonical synthetic id (syn_ followed by 16 hex digits)`,
+`Subscription limit exceeded: max N subscriptions per connection`, and
+`Subscription limit exceeded: too many active subscriptions for this account`.
+The connection stays open — only the offending request is dropped.
+
+The close codes you will see on this stream:
+
+| Close code | When it happens | What to do |
+|---|---|---|
+| `4002` | An anonymous session reached its one-hour lifetime | Reconnect as-is; the tier is time-boxed. Clear the local book first. |
+| `4003` | The anonymous admission lease was lost (fleet capacity) | Reconnect with backoff; consider authenticating. |
+
+The full catalogue of `ErrorResponse` messages, upgrade-time rejections, and
+every close code is on
+[Market Data Stream → Errors & Disconnection](/websocket/market-data-websocket#errors-disconnection).
+
+## Stream limits
+
+Formula limits are listed in the [Synthetic Books guide](/guides/synthetic-books#current-limits).
+The WebSocket limits apply independently:
+
+| Tier          | Relevant limits                                                                                                                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Anonymous     | Up to 2 connections per source IP, 3 subscribed IDs per connection, 10 inbound control messages per second, and a 1-hour connection lifetime (close code `4002`). Fleet capacity also applies (close code `4003` if the admission lease is lost). |
+| Authenticated | Server defaults are 100 connections per user, 100 subscriptions per connection, 2000 active subscriptions per account, and 50 inbound messages per second. An API key may carry its own connection and subscription overrides. |
+
+One synthetic ID counts as one subscription even though the stream contains
+both snapshots and deltas. Re-subscribing to the same provider and ID does not
+consume another subscription slot.
+
+For all connection limits, error frames, close codes, and reconnect behavior,
+see [Market Data Stream](/websocket/market-data-websocket#connection-limits).
+
+## Troubleshooting
+
+| Symptom                                       | Likely cause                                                                                                    | Action                                                                   |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `synthetic requires a canonical synthetic id` | The ID is malformed or was derived locally                                                                      | Use the lowercase `syn_` ID returned by definition creation              |
+| Acknowledgment but no snapshot                | The definition is not materialized yet, its source books are pending, or no complete cached replay is available | Keep listening for the next snapshot and verify the definition lifecycle |
+| Snapshot has no levels                        | Read `status`; a source may be missing, not live, or have no required-side liquidity                            | Do not treat an empty ladder as a price                                  |
+| Delta sequence does not connect               | The local baseline is incomplete                                                                                | Discard it and resubscribe for a new snapshot                            |
+| Values look one billion times too large       | Nano-unit integers were displayed directly                                                                      | Divide by `10 ** price_unit_exponent` or `10 ** qty_unit_exponent`       |
+| `ErrorResponse` with `action: "subscribe"`    | Invalid request or a subscription quota was reached                                                             | Read `message`, correct the request, or release another subscription     |

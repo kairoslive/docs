@@ -1,0 +1,103 @@
+---
+title: "Positions, orders, and fills"
+description: "Private trading state, immutable events, and idempotent projections"
+---
+
+> **⚠ Nothing on this page is callable**
+>
+> **Design preview.** Private perps data and execution are not currently
+> available from Kairos. The canonical v2 schema defines **no** order, fill, or
+> position message; the only position concept it carries is the `PositionSide`
+> enum used by public liquidation events, which are themselves unpublished.
+>
+> The public perpetual market-data surface is live in production behind
+> `PERPETUALS_PUBLIC_API_ENABLED`, but enabling that flag did **not** make this
+> page callable in any environment. See
+> [Overview](/perpetuals/overview).
+
+This page describes how Kairos intends to model private trading state for
+perpetuals: position episodes, immutable order and fill events, and the
+projections built from them.
+
+Orders, fills, and positions describe different facts. Kairos stores immutable
+venue events for audit and builds current projections for fast reads.
+
+## Position episodes
+
+A position episode begins when exposure moves from flat to non-zero and ends
+when it returns to flat. A later position in the same instrument is a new
+episode. This allows realized PnL, funding, fees, and liquidations to be tied to
+the exposure that produced them.
+
+A position can include:
+
+- signed native quantity and explicit unit
+- long, short, or venue-specific side representation
+- entry, mark, and liquidation prices by type
+- unrealized and realized PnL
+- leverage and margin mode
+- isolated collateral where applicable
+- venue and Kairos position identifiers
+- authoritative observation time and revision
+
+One-way and hedge-mode accounts are not forced into the same key. If a venue
+allows simultaneous long and short legs, the side or venue leg is part of
+identity.
+
+## Orders
+
+The current order projection contains the latest accepted state. An immutable
+order-event history records submissions, acknowledgements, amendments,
+cancellations, rejections, expirations, and other venue transitions.
+
+Order fields include exact price and quantity, side, type, time in force,
+reduce-only state, client and venue IDs, filled quantity, and rejection detail
+when present. Venue-only instructions remain namespaced extensions until a
+common semantic is proven.
+
+Client order IDs and idempotency keys are scoped to the trading account.
+Retries reuse the same idempotency identity.
+
+<Note>
+**A timeout is an unknown outcome, not proof that the venue rejected the
+order.** Resolve it by reading state back, not by assuming failure.
+</Note>
+
+## Fills
+
+Fills are immutable execution facts. They include:
+
+- account and instrument
+- order and trade identifiers where available
+- exact price, native quantity, and unit
+- liquidity role when supplied
+- fee amount and fee asset
+- realized PnL attribution when supplied
+- event and receive times
+
+Private fills are not reconstructed from public trades. Public and private
+identifiers may be linked only when the venue provides a reliable relationship.
+
+<Note>
+**The Hyperliquid HyperCore fills Kairos already decodes are *public*
+prints, not account fills.** They carry no account, no liquidity role, no
+fee, and no realized PnL, and their liquidation attribution is recorded as
+`unknown`. They belong to the
+[trade model](/perpetuals/trades-and-candles#hyperliquid-perpetual-trades-today),
+not to this page. Do not mistake them for private execution data.
+</Note>
+
+## Atomic projections
+
+One private event may affect an order, position, balance, ledger, and cursor.
+Those effects form one projection bundle. The cursor advances only if every
+required write succeeds. Redelivery is idempotent; conflicting content for the
+same immutable identity is surfaced rather than overwritten.
+
+## Nullable venue fields
+
+Not every venue publishes every value. Missing liquidation price, liquidity
+role, or realized PnL remains absent. A client that requires a field must check
+its presence and calculation source before using it.
+
+Next: [Risk and liquidations](/perpetuals/risk-and-liquidations).

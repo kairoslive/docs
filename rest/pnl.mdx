@@ -1,0 +1,365 @@
+---
+title: "PnL"
+description: "Realized and unrealized PnL across providers, per-user, per-wallet, and per-market"
+---
+
+Realized and unrealized profit and loss across Polymarket, Kalshi, Predict.fun, Opinion, and Hyperliquid.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+<Note>
+**Looking for current positions / open holdings?** Use the RPC API's [`positions.getPositions`](/rpc/positions). The endpoints below are historical and aggregated PnL analytics, not real-time position state.
+</Note>
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+## Two pipelines
+
+Which endpoint you call decides which backend answers, and the two backends cover different venues. Pick the pipeline first, then the endpoint.
+
+- **`/pnl/{user_id}`** — the legacy aggregator. Fans out per-provider to each venue's own data source (including Kalshi's REST API directly), merges the results. This is the only path that covers Kalshi, since Kalshi's user ids are internal and non-public. (One exception: when only `polymarket_wallet` is supplied and the `native_pnl_pipeline` flag is on, this route serves from the materialized-view pipeline and falls back to the aggregator only if that returns nothing.)
+- **`/pnl/hover/...`** and **`/pnl/wallet-totals/...`** — the newer wallet-address-keyed materialized-view pipeline. Covers `polymarket`, `opinion`, `predictfun` only — Kalshi and Hyperliquid are rejected with `400` on both.
+
+| Provider | `/pnl/{user_id}` (aggregator) | `/pnl/hover/...` and `/pnl/wallet-totals/...` (MV pipeline) |
+|---|---|---|
+| `polymarket` | Yes | Yes |
+| `opinion` | Yes | Yes |
+| `predictfun` | Yes | Yes |
+| `kalshi` | Yes — the only path that covers Kalshi | No — rejected with `400` |
+| `hyperliquid` | Yes — the only path that covers Hyperliquid | No — rejected with `400` |
+
+The aggregator is keyed by Kairos user id and wallet parameters; the MV pipeline is keyed by a wallet address in the URL path.
+
+## Authentication
+
+Every `/pnl/*` route accepts **either** a JWT (`Authorization: Bearer <token>`) **or** an API key (`X-Client-Id`/`X-Api-Key`/`X-Api-Secret`, scope `position:read`). Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+Every `/pnl/*` route is behind the server-side invite gate. Admin-secret and
+API-key callers bypass it; a JWT session belonging to an uninvited user gets
+`403 Invite required` while invite-only mode is on.
+
+API-key requests are also subject to
+[platform access](/guides/authentication#platform-access).
+`/pnl/providers` checks every provider it would return. `/pnl/{user_id}` checks
+the explicit provider filter or the providers implied by supplied wallets.
+Hover and wallet-total routes check their path provider. Multi-provider checks
+fail the whole request if any provider is disabled.
+
+## List providers
+
+```
+GET /pnl/providers
+```
+
+The PnL providers this deployment can report on. Call it before hard-coding a provider filter.
+
+**Auth:** JWT or API key; API keys require `position:read`.
+
+Providers are discovered dynamically from the `pnl_providers` registry, not a
+hardcoded list. For API-key callers, the endpoint checks every provider it
+would return; if any provider is disabled, the entire request returns `403`.
+JWT/admin callers bypass the platform gate.
+
+### Request
+
+No parameters.
+
+```bash
+curl https://data.kairos.trade/pnl/providers \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+[
+  { "name": "polymarket", "description": "Polymarket prediction market PnL" },
+  { "name": "kalshi", "description": "Kalshi prediction market PnL" },
+  { "name": "hyperliquid", "description": "hyperliquid PnL provider" }
+]
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Provider identifier |
+| `description` | string | Human-readable provider description |
+
+## Get user PnL
+
+```
+GET /pnl/{user_id}
+```
+
+Merged PnL for the authenticated caller across every venue implied by the wallets they supply. This is the only endpoint that reports Kalshi or Hyperliquid PnL.
+
+**Auth:** accepts **either** a JWT (`Authorization: Bearer <token>`, `sub` claim) **or** an API key (`X-Client-Id`/`X-Api-Key`/`X-Api-Secret`, scope `position:read`).
+
+**The path `user_id` must match the authenticated caller's own id** — JWT `sub` for session auth, or the API key's linked `user_id`. Any mismatch returns `403`; this endpoint can only ever return the caller's own PnL.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `user_id` (path) | string | Yes | — | ≤128 chars. Kairos internal user id; must match caller's own id. |
+| `polymarket_wallet` | string | No* | — | Ethereum address, ≤128 chars. Polymarket wallet. |
+| `kalshi_wallet` | string | No* | — | ≤128 chars. Kalshi user id (opaque, not a wallet address). |
+| `hyperliquid_wallet` | string | No* | — | Ethereum address, ≤128 chars. Hyperliquid EVM address (also the deposit/trade address HIP-4 positions key off). |
+| `provider` | string[] | No | All providers implied by the supplied wallets | Up to 16, repeatable. Filter to specific provider(s). |
+| `limit` | integer | No | `500` | 1–500. Records per page. |
+| `offset` | integer | No | `0` | 0–10000. Records to skip. |
+
+*At least one of `polymarket_wallet`, `kalshi_wallet`, or `hyperliquid_wallet` is required.
+
+```bash
+curl "https://data.kairos.trade/pnl/usr_9f3c2a1b?polymarket_wallet=0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b&provider=polymarket&limit=100" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+A `provider` value must be both a registered venue **and** a registered PnL
+provider (`polymarket`, `kalshi`, `opinion`, `predictfun`, `hyperliquid`). A
+venue that exists but has no PnL provider fails at the service layer and
+returns `400 Invalid PnL request parameters`.
+
+<Note>
+**Gotcha:** per-provider fetch failures are swallowed, not surfaced. If one venue's upstream errors out, the aggregator logs it, drops that venue, and still returns `200` with the remaining providers merged — a provider missing from `summary.by_exchange` means "no data or fetch failed", not "zero PnL". Compare the returned keys against the providers you asked for before showing a user a total.
+</Note>
+
+Hyperliquid PnL is available only through this aggregate endpoint. Open HIP-4
+positions and unrealized PnL use Hyperliquid account balances and mark prices;
+historical fills use Kairos trade history. Realized PnL and fee fields are
+currently reported as zero for Hyperliquid.
+
+### Response
+
+```json
+{
+  "user_id": "usr_9f3c2a1b",
+  "summary": {
+    "user_id": "usr_9f3c2a1b",
+    "total_realized_pnl": 1875.1,
+    "total_fees": 18.2,
+    "total_cost_basis": 12400.0,
+    "total_winning_positions": 25,
+    "total_losing_positions": 11,
+    "by_exchange": {
+      "polymarket": {
+        "provider": "polymarket",
+        "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+        "total_realized_pnl": 1250.4382,
+        "total_fees": 12.5,
+        "total_cost_basis": 8400.0,
+        "winning_positions": 18,
+        "losing_positions": 9
+      }
+    }
+  },
+  "records": [
+    {
+      "provider": "polymarket",
+      "market_id": "0xabc123condition",
+      "timestamp": "2026-07-20T09:14:02+00:00",
+      "realized_pnl": 24.15,
+      "fees": 0.35
+    }
+  ],
+  "filters_applied": { "providers": null, "start": null, "end": null },
+  "total": 143,
+  "has_more": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `summary` | object | Merged PnL summary across all requested wallets/providers |
+| `summary.by_exchange` | object | Keyed by provider name, see below |
+| `records` | array | Individual merged PnL records, sliced to `[offset, offset+limit)` |
+| `records[].timestamp` | string | ISO 8601; empty string if the underlying record has none |
+| `filters_applied` | object | Echoes the effective filters used (wallets, providers, etc.) |
+| `total` | integer | Records the aggregator saw before pagination slicing. The merged, timestamp-sorted record list is truncated to `min(limit+offset, 1000)` before slicing, so this is a page-scoped ceiling — **not an authoritative full-history count** |
+| `has_more` | boolean | `true` only when the aggregator definitively saw more records than this page returned |
+
+**`by_exchange[provider]` object:**
+
+| Field | Type | Description |
+|---|---|---|
+| `provider` | string | Provider name |
+| `wallet_address` | string | Wallet address used |
+| `total_realized_pnl` | float | Realized PnL for provider (USD) |
+| `total_fees` | float | Fees paid on provider (USD) |
+| `total_cost_basis` | float | Cost basis for provider (USD) |
+| `winning_positions` / `losing_positions` | integer | Position counts |
+
+<Warning>
+**Gotcha:** `total` is a page-scoped ceiling, not a full-history count. The record list is truncated to `min(limit+offset, 1000)` before slicing, so do not drive a pagination widget or a "N trades all-time" figure off it. Use `has_more` to decide whether to fetch another page.
+</Warning>
+
+## Hover PnL (wallet × market)
+
+```
+GET /pnl/hover/{provider_id}/{wallet}/{contract_id}
+```
+
+**Auth:** JWT or API key; API keys require `position:read`.
+
+Live PnL for a single wallet on a single market, read directly from the materialized-view pipeline — fast regardless of how far back the wallet's earliest trade goes. Returns one row per token held (e.g. YES + NO on a binary market) plus aggregate totals.
+
+**Only `polymarket`, `opinion`, and `predictfun` are supported — `kalshi` and `hyperliquid` are rejected with `400`.** Use `/pnl/{user_id}` for those providers instead.
+
+<Note>
+**Gotcha:** this route **returns a well-formed zero payload, not an error, when the `native_pnl_pipeline` feature flag is off.** While the pipeline's backfill is ramping, expect `tokens: []` and all totals `0.0` rather than a 404 — this is the same "no data" state the frontend renders gracefully. A `200` here is not proof the wallet holds nothing.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider_id` (path) | string | Yes | — | `polymarket`\|`opinion`\|`predictfun`. MV-pipeline provider. |
+| `wallet` (path) | string | Yes | — | ≤128 chars. Wallet address (trimmed, length-checked, not format-validated). |
+| `contract_id` (path) | string | Yes | — | ≤128 chars. Market/condition id. |
+
+```bash
+curl https://data.kairos.trade/pnl/hover/polymarket/0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b/0xabc123condition \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "provider_id": "polymarket",
+  "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "contract_id": "0xabc123condition",
+  "tokens": [
+    {
+      "token_id": "10723948572...4",
+      "outcome": "YES",
+      "balance": 150.0,
+      "avg_entry_price": 0.42,
+      "cost_basis_usd": 63.0,
+      "realized_pnl_usd": 0.0,
+      "mark_price": 0.55,
+      "position_value_usd": 82.5,
+      "unrealized_pnl_usd": 19.5
+    }
+  ],
+  "total_unrealized_pnl_usd": 19.5,
+  "total_realized_pnl_usd": 0.0,
+  "total_position_value_usd": 82.5
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `wallet_address` | string | Echoed lower-cased (the raw value as supplied when the pipeline flag is off) |
+| `tokens` | array | Per-token PnL rows, see below |
+| `total_unrealized_pnl_usd` | float | Aggregate unrealized PnL across all tokens |
+| `total_realized_pnl_usd` | float | Aggregate realized PnL across all tokens |
+| `total_position_value_usd` | float | Aggregate mark-to-market value |
+
+**Token row:**
+
+| Field | Type | Description |
+|---|---|---|
+| `balance` | float | Shares held (token units, not USD) |
+| `avg_entry_price` | float | 0–1 scale |
+| `mark_price` | float | Current mark price, 0–1 scale (the underlying cents price divided by 100); `0.0` when no mark is available |
+| `position_value_usd` | float | `balance * mark_price` |
+| `unrealized_pnl_usd` | float | `position_value_usd - cost_basis_usd` |
+
+## Wallet totals
+
+```
+GET /pnl/wallet-totals/{provider_id}/{wallet}
+```
+
+Whole-wallet PnL totals for one provider, in a single point lookup.
+
+**Auth:** JWT or API key; API keys require `position:read`.
+
+<Note>
+**Gotcha:** this route **reads from an hourly-refreshed snapshot, not a live scan** — a fast point lookup, but figures can lag reality by up to an hour. For a single active market where freshness matters more than cost, use `/pnl/hover/...` instead, which reads live data. Render `snapshot_ts` so the user can see how stale the number is.
+</Note>
+
+Same provider restriction and feature-flag-gated zero payload as `/pnl/hover` above (only `polymarket`/`opinion`/`predictfun`; `kalshi` and `hyperliquid` rejected with `400`).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider_id` (path) | string | Yes | — | `polymarket`\|`opinion`\|`predictfun`. MV-pipeline provider. |
+| `wallet` (path) | string | Yes | — | ≤128 chars. Wallet address. |
+
+```bash
+curl https://data.kairos.trade/pnl/wallet-totals/polymarket/0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "provider_id": "polymarket",
+  "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "total_unrealized_pnl_usd": 340.2,
+  "total_realized_pnl_usd": 1250.4382,
+  "total_position_value_usd": 980.0,
+  "total_cost_basis_usd": 640.0,
+  "market_count": 12,
+  "token_count": 19,
+  "snapshot_ts": "2026-07-22T13:00:00Z"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `market_count` | integer | Distinct markets with open positions |
+| `token_count` | integer | Distinct tokens with non-zero balance |
+| `wallet_address` | string | Echoed lower-cased (the raw value as supplied when the pipeline flag is off) |
+| `snapshot_ts` | string | Timestamp of the snapshot row — use to render "as of N minutes ago". Current ISO 8601 UTC when the pipeline flag is off, and the **empty string** when the wallet has no snapshot row yet (all totals `0`, `200` not `404`) |
+
+## Numeric precision
+
+<Warning>
+**Gotcha:** monetary fields on this page are JSON floats (USD), not decimal strings — this differs from [Trader Stats](/rest/trader-stats), which returns PnL as decimal strings for precision. Parse accordingly, and do not compare a figure from this page byte-for-byte against one from Trader Stats.
+</Warning>
+
+## Errors
+
+Errors are returned as a FastAPI `HTTPException` body:
+
+```json
+{ "detail": "<message>" }
+```
+
+`429` from the shared rate limiter is the one exception — it uses
+`{ "error": "Rate limit exceeded: <limit>" }` plus `X-RateLimit-*` and
+`Retry-After` headers.
+
+The Code column holds the exact `detail` string where this page documents one, otherwise `—`.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | — | Missing/oversized `user_id`, `wallet`, or `contract_id`; invalid Ethereum address for `polymarket_wallet`/`hyperliquid_wallet`; unknown `provider`/`provider_id` value, `provider_id` over 32 chars, or more than 16 `provider` items; no wallet param supplied at all on `/pnl/{user_id}`; `kalshi` or `hyperliquid` as `provider_id` on `/pnl/hover` or `/pnl/wallet-totals` | Fix the parameter and resend — deterministic, retrying unchanged returns the same error. For `kalshi`/`hyperliquid`, switch to `/pnl/{user_id}`; the MV routes will never serve them. |
+| `400` | `Invalid PnL request parameters` | A `provider` that is a registered venue but not a registered PnL provider | Call `GET /pnl/providers` and filter to a provider from that list. |
+| `401` | — | Missing or invalid auth credentials; `X-Client-Id` sent without both `X-Api-Key` and `X-Api-Secret`; revoked, expired, or malformed JWT | Send all three API-key headers, or a valid JWT. Do not retry unchanged. |
+| `403` | — | On `/pnl/{user_id}`, `user_id` does not match the authenticated caller | Do not retry — this endpoint can only ever return the caller's own PnL. Use the JWT `sub` or the API key's linked `user_id` as the path segment. |
+| `403` | `API access is disabled for <provider>` | On any PnL route, the API key is missing `position:read` or platform API access is disabled. Platform denials use `API access is disabled for <provider>` and may append an operator reason. | Not retryable as sent. Add `position:read` to the key, or drop the disabled provider from your `provider` filter — a multi-provider check fails the whole request if any one provider is disabled. |
+| `403` | `Invite required` | A JWT session that has not passed the invite gate (admin-secret and API-key callers bypass it) | Do not retry — the session needs an invite while invite-only mode is on. An API key bypasses the gate. |
+| `403` | `IP not whitelisted` | The API credential has an `ipWhitelist` the caller's trusted client IP is not in | Call from a whitelisted IP, or have the credential's `ipWhitelist` updated. |
+| `422` | — | FastAPI parameter validation failure (e.g. `limit`/`offset` out of range) | Fix the parameter and resend — `limit` is 1–500 and `offset` is 0–10000. |
+| `429` | `Rate limit exceeded: <limit>` | The global default of 100 requests/minute, keyed by trusted client IP (the default limit runs in middleware ahead of auth, so it is not per-credential). API credentials carrying a `data` rate-limit override additionally return `429 API key data rate limit exceeded`, keyed per credential | Back off and retry; `Retry-After` says how long. The default limit is per-IP, so extra credentials will not raise it. |
+| `500` | `Error fetching hover PnL` / `Error fetching wallet totals` | Any failure in the ClickHouse read behind those two routes | Safe to retry. Report to support with the response body if it persists. |
+| `500` | `An internal error occurred. Please try again later.` | Unhandled exception on any other route; also `Authentication not configured` when JWT/admin config is missing | Report to support with the response body. `Authentication not configured` is a deployment problem, not a request problem — retrying will not clear it. |
+| `503` | `Unable to verify platform API access` | Platform access could not be read or parsed | Safe to retry. Report to support with the response body if it persists. |

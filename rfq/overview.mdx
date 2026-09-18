@@ -1,0 +1,108 @@
+---
+title: "Overview"
+description: "Create cross-venue RFQs or quote venue-originated flow through one normalized API"
+---
+
+This page introduces the Kairos RFQ Network: the two roles you can play on it,
+where to connect, and the consistency rules that govern every request. Read it
+before you write any integration code, then continue to
+[REST and streaming](/rfq/rest-and-streaming) or the [FIX protocol](/rfq/fix) for the
+endpoint and message contracts.
+
+The Kairos RFQ Network is an API-first service for firm, two-way, partial, and
+multi-leg [requests for quote](/learn/glossary). There is no RFQ user
+interface: clients connect through REST, WebSocket, or FIX.
+
+## Two ways to use the network
+
+### Request liquidity
+
+Submit one normalized RFQ to Kairos. Kairos selects the venue-adjacent gateway,
+fans the request out through enabled venue-native RFQ rails, normalizes the
+responses, and returns the quotes to you.
+
+`User → Kairos → venue RFQ systems → venue market makers → Kairos → User`
+
+<Note>
+**Gotcha: requester-side fanout is not live yet.** Venue submission is enabled
+only after each adapter completes venue certification, and no venue reports
+`requester_rfq` today. A `venues` entry therefore comes back as an `excluded`
+target with a reason rather than a live fanout. Read the runtime capability
+matrix at `/v1/venues/capabilities` before selecting a venue; Kairos does not
+synthesize RFQs from order books.
+</Note>
+
+### Provide liquidity
+
+Market makers receive a normalized stream of open RFQs discovered on supported
+venues. A response retains its `origin_venue` and `origin_rfq_id`, allowing
+Kairos to route the quote back to the exact native request.
+
+`Venue RFQs → Kairos aggregation → Market maker → Kairos → originating venue`
+
+The initial Kalshi integration listens over FIX rather than WebSocket. It
+reports `responder_rfq: true`, `two_way: false`, `partials: false`, and `USD`
+only.
+
+<Note>
+**Gotcha: a maker quote is recorded but not yet relayed.** Native maker quote
+submission remains disabled until venue conformance testing is complete, so a
+quote you post against a venue-originated RFQ is stored by Kairos and does not
+reach the venue. `polymarket`, `opinion`, `predictfun`, and `polymarket_us`
+are registered but disabled pending adapter conformance.
+</Note>
+
+## Where to connect
+
+| Transport | Hostname | Covered in |
+|---|---|---|
+| REST + WebSocket, global | `https://rfq.kairos.trade` | [REST and streaming](/rfq/rest-and-streaming) |
+| REST + WebSocket, US East | `https://us-east-1.rfq.kairos.trade` | [REST and streaming](/rfq/rest-and-streaming) |
+| FIX | `fix.kairos.trade` | [FIX protocol](/rfq/fix) |
+
+The public API is active-active — submit to either hostname. FIX clients connect
+to the separate `fix.kairos.trade` edge rather than to these hostnames.
+
+### Regional routing
+
+`priority_venue` requests routing through the region closest to the selected
+venue and fixes the RFQ's `home_region`. If it is omitted, Kairos uses the
+ingress gateway region. It must name a venue Kairos knows and, when `venues` is
+also supplied, must be one of them; otherwise the request is rejected as
+invalid.
+
+## Consistency and safety
+
+These five rules hold across REST, WebSocket, and FIX.
+
+**1. Every mutation requires an idempotency key.**
+
+<Warning>
+**Gotcha: the key is the whole contract — the body is never fingerprinted.**
+Idempotency is keyed on `(principal, operation, key)`. Replaying a key returns
+the resource the first call created and never performs a second mutation. A
+replay carrying a *different body* still returns the original resource, with no
+error and no update. Treat a key as bound to exactly one command, and generate
+a fresh one for every distinct intent.
+</Warning>
+
+**2. Quotes carry a revision and a per-side expiry** that may not outlive the
+RFQ.
+
+**3. Acceptance is a reservation, not a fill.** It atomically binds revision,
+side, quantity, expected price, and the immutable mapping snapshot, and reserves
+the quantity on both the RFQ and the price level. The acceptance starts at
+`pending_routing` and settles asynchronously.
+
+**4. WebSocket events support cursor-based replay** and may be processed
+idempotently after reconnect.
+
+**5. Cross-venue mapping is a routing hint,** not a guarantee that contract
+rules or settlement terms are equivalent.
+
+## Next
+
+- [REST and streaming](/rfq/rest-and-streaming) — authentication, scopes, every
+  endpoint, lifecycle states, errors, and the replayable event stream.
+- [FIX protocol](/rfq/fix) — session setup, application messages, extension tags,
+  and reject codes.

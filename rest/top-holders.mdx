@@ -1,0 +1,141 @@
+---
+title: "Top Holders"
+description: "Largest token holders per market outcome, by provider"
+---
+
+Largest holders of each outcome token for one or more markets. Use it to render a holder leaderboard beside a market.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+## Authentication
+
+`x-kairos-auth: api-key`. Send the API-key triple (`X-Client-Id`, `X-Api-Key`,
+`X-Api-Secret`), a first-party session JWT, or an `X-Admin-Secret`. Sending no
+credentials returns `401 Authentication required (JWT token / API key / admin secret)`.
+No API-key scope is required — any active credential can read holders.
+
+Session-JWT callers additionally pass the invite gate (`403 Invite required` if they
+haven't); API-key and admin-secret callers bypass it.
+
+Rate-limited by the `heavy` group at 10 requests/minute (keyed by authenticated user id
+when a JWT session is present, otherwise by trusted client IP). Live upstream reads share
+this budget with `/search-traders` and `/trader-stats/*`. An API key with a per-credential
+`data` override is also checked against that absolute ceiling.
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and
+`KAIROS_API_SECRET` in your shell.
+
+## Top holders
+
+```
+GET /top-holders
+```
+
+Returns the largest holders per outcome token for the markets you name.
+
+**Auth:** API key, JWT, or `X-Admin-Secret` (no scope). **Rate limit:** `heavy` group,
+10 requests/minute.
+
+This is a live upstream read (e.g. Polymarket's data-api holders endpoint) — no
+local cache sits in front of it.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `market` | string | Yes | — | Comma-separated, ≤50 IDs, ≤128 chars each. Market IDs, token IDs, or 0x condition IDs. |
+| `provider` | string | No | `polymarket` | A registered provider with a top-holders client. Venue to query. |
+| `limit` | integer | No | `20` | 1–20. Max holders per token. |
+| `minBalance` | integer | No | `1` | 0–999999. Minimum token balance to include. |
+
+```bash
+curl "https://data.kairos.trade/top-holders?market=0xabc123,0xdef456&provider=polymarket&limit=10" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**`market` accepts up to 50 comma-separated IDs, 128 characters each** — an empty value, more
+than 50 IDs, or an oversized ID all return `400`. Omitting `market` entirely is a schema
+failure, so that returns `422`, not `400`.
+
+<Note>
+**Gotcha:** an empty `market` and a missing `market` fail differently. `market=` is `400`; leaving the parameter off entirely is `422`.
+</Note>
+
+For `polymarket`, non-`0x` IDs are first resolved to condition IDs via the market metadata
+cache and ClickHouse. **IDs that don't resolve are skipped silently**; if none resolve the
+response is an empty array with `200`, not a `404`.
+
+<Note>
+**Gotcha:** unresolvable IDs are dropped without any signal. Compare the `token` values you get back against the ids you sent — a short array does not mean a short holder list, it may mean ids were skipped, and an all-unresolvable request is an empty `200`.
+</Note>
+
+`provider` is validated against the registered venue list, but only venues with a
+top-holders client (`polymarket`, `opinion`, `predictfun`) can actually be served — any
+other registered venue returns `400 Invalid top holders request parameters`.
+
+### Response
+
+The body is a bare array, one entry per requested market/token combination the provider
+returned — not wrapped in an object.
+
+```json
+[
+  {
+    "token": "10723948572...4",
+    "holders": [
+      {
+        "proxyWallet": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+        "amount": 15230.5,
+        "outcomeIndex": 0,
+        "displayUsernamePublic": true,
+        "verified": true,
+        "name": "whale_trader_99",
+        "pseudonym": "SilentOwl-4821",
+        "bio": "Prediction market degen.",
+        "profileImage": "https://cdn.polymarket.com/avatars/abc.png",
+        "profileImageOptimized": "https://cdn.polymarket.com/avatars/abc-opt.png"
+      }
+    ]
+  }
+]
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `token` | string | Outcome token id |
+| `amount` | float | Token balance in shares, not USD |
+| `outcomeIndex` | integer | 0 = first outcome, 1 = second, ... |
+| `displayUsernamePublic` | boolean | Whether the holder opted to publicly display their username |
+| `verified` | boolean | Whether the holder has a verified badge |
+| `name`, `pseudonym`, `bio`, `asset`, `profileImage`, `profileImageOptimized` | string | Only present when the provider supplies them |
+
+<Note>
+**Gotcha:** `amount` is shares, not dollars. Multiply by the outcome token's price to get a USD figure.
+</Note>
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`, except the local rate limiter's `429`,
+which uses `{ "error": "Rate limit exceeded: <limit>" }`.
+
+The Code column holds the exact `detail` string where this endpoint documents one, otherwise `—`.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 400 | — | Empty/whitespace `market`, more than 50 IDs, an oversized ID, or a `provider` that is not a registered venue | Fix the parameter and resend — deterministic, retrying unchanged returns the same error. |
+| 400 | `Invalid top holders request parameters` | A registered venue with no top-holders client | Use `polymarket`, `opinion`, or `predictfun` — only those have a top-holders client. |
+| 401 | — | Missing/invalid credentials; a partial API-key triple (`X-Client-Id` without key/secret); or an `X-Admin-Secret` that fails verification and falls through to JWT auth | Send a JWT, all three API-key headers together, or a valid admin secret. |
+| 403 | `Invite required` | A JWT session that has not passed the invite gate (API-key and admin callers bypass this) | Do not retry — the session needs an invite while invite-only mode is on. |
+| 404 | `Resource not found: <ids>` | Upstream provider reports the market/token does not exist | Check the ids against the provider. Note that ids Kairos cannot resolve locally are skipped silently instead, yielding an empty `200`. |
+| 422 | — | Request failed schema validation — `market` omitted entirely, or `limit`/`minBalance` outside their ranges | Fix the parameter and resend — deterministic, retrying unchanged returns the same error. |
+| 429 | `Rate limit exceeded: <limit>` / `Rate limit exceeded` / `API key data rate limit exceeded` | `heavy` group (10/minute), an upstream provider rate limit (`{ "detail": "Rate limit exceeded" }` with upstream `Retry-After`), or a per-credential `data` ceiling | Back off and retry; `Retry-After` says how long. Local limiter `429`s use an `error` key; the other two use `detail`. |
+| 500 | `An internal error occurred. Please try again later.` | Unhandled exception | Report to support with the response body. |
+| 502 | `Provider error: ...` | Upstream connection failure, timeout, non-2xx response, or unparseable JSON | Safe to retry; the failure is upstream, not in your request. |

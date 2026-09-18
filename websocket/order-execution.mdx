@@ -1,0 +1,575 @@
+---
+title: "Order Execution"
+description: "Submit and cancel orders via WebSocket"
+---
+
+Submit orders, cancel orders, and manage trades over the order execution WebSocket. This is the recommended path for programmatic trading when you need real-time feedback: commands and the resulting fill/status events travel on one connection.
+
+A machine-readable AsyncAPI 3.1 contract for this surface — every command, every
+server event, the close codes and the limits — lives at
+`services/order_execution/spec/execution-ws.asyncapi.yaml`.
+
+## Connection
+
+This uses the same WebSocket connection as [Order Updates](/websocket/order-updates):
+
+```
+wss://execution.kairos.trade/ws
+```
+
+See [Order Updates - Connecting](/websocket/order-updates#connecting) for authentication details and connection setup. Once connected, you can send commands as JSON text frames.
+
+```javascript
+import WebSocket from "ws";
+
+const ws = new WebSocket("wss://execution.kairos.trade/ws", {
+  headers: {
+    "X-Client-Id": process.env.KAIROS_CLIENT_ID,
+    "X-Api-Key": process.env.KAIROS_API_KEY,
+    "X-Api-Secret": process.env.KAIROS_API_SECRET,
+  },
+});
+
+const requestId = crypto.randomUUID();
+
+ws.on("open", () => {
+  ws.send(JSON.stringify({
+    type: "submit_order",
+    request_id: requestId,
+    payload: {
+      exchange_id: "polymarket",
+      market_id: "570362",
+      outcome: "Yes",
+      side: "buy",
+      kind: "limit",
+      quantity: "100",
+      price: "0.45",
+      time_in_force: "GTC",
+      client_order_id: "my-order-1",
+    },
+  }));
+});
+
+ws.on("message", (data) => {
+  const msg = JSON.parse(data.toString());
+  if (msg.request_id !== requestId) return; // status/fill events arrive too
+  if (msg.type === "order_response") {
+    // "queued" means accepted into the pipeline, NOT filled
+    console.log("accepted", msg.result.order_id, msg.result.status);
+  } else if (msg.type === "order_error") {
+    console.error(msg.status, msg.error_details?.code, msg.error);
+  }
+});
+```
+
+For API-key connections, each provider command checks both its required scope and [platform access](/guides/authentication#platform-access). A disabled provider returns an `order_error` frame with status `403`; if platform access cannot be verified, the status is `503`. Commands that preserve the structured error include `error_details.code: "AUTH_INSUFFICIENT_SCOPE"` or `"INTERNAL_ERROR"` respectively. Status-only command handlers, including `cancel_batch_orders`, may omit `error_details`. The connection remains open in every case.
+
+[Fee-quote subscriptions](/websocket/fee-quote) use the same platform gate but return a message-only `fee_quote_error` frame instead of `order_error`.
+
+---
+
+## Commands
+
+Each financial command includes a `type` field and a required string
+`request_id` for correlating responses. Control messages such as `ping` have
+their own smaller envelope.
+
+| Command | Description |
+|---------|-------------|
+| `submit_order` | Submit a new order |
+| `cancel_order` | Cancel a single order by ID |
+| `cancel_all_orders` | Cancel all orders on an exchange |
+| `cancel_batch_orders` | Cancel selected orders by ID |
+| `redeem` | Redeem a resolved position |
+| `ctf_split` / `ctf_merge` | Split or merge conditional tokens |
+| `submit_signed_order` | Submit an externally signed order |
+| `warm_market` | Pre-warm market subscriptions before execution |
+| `ping` | Keepalive / latency check (see [Order Updates - Keepalive](/websocket/order-updates#keepalive)) |
+
+### submit_order
+
+Submit a new order via WebSocket. Uses the same payload as `POST /orders` but without CSRF/service token requirements (authentication is established at connection time).
+
+```json
+{
+  "type": "submit_order",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "exchange_id": "polymarket",
+    "market_id": "570362",
+    "outcome": "Yes",
+    "side": "buy",
+    "kind": "limit",
+    "quantity": "100",
+    "price": "0.45",
+    "time_in_force": "GTC",
+    "client_order_id": "my-order-1"
+  }
+}
+```
+
+**Payload fields:**
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | Registered exchange ID, including `"polymarket"`, `"kalshi"`, `"predictfun"`, `"opinion"`, or `"hyperliquid"`. `"kalshi_offchain"` is a deprecated alias of `"kalshi"` and is still accepted. |
+| `market_id` | string | Yes | — | Market/contract identifier. For Hyperliquid, use the numeric HIP-4 outcome ID. |
+| `side` | string | Yes | — | `"buy"` or `"sell"` |
+| `kind` | string | Yes | — | `"market"` or `"limit"` |
+| `quantity` | string | Yes | — | Number of contracts (must be > 0) |
+| `outcome` | string | Conditional | — | Executable outcome label/side (e.g., `"Yes"`, `"No"`, or a provider-specific outcome name). For Kalshi, the only valid values are `"Yes"` or `"No"`; display labels from the Kalshi market response are not valid order sides. Required for Hyperliquid. |
+| `token_id` | string | Conditional | — | Optional execution token identifier. Hyperliquid requires the selected side coin (`#<10 * market_id + side_index>`) to select side 1. |
+| `price` | string | Yes | — | Executable price in the selected outcome's own terms, between 0.01 and 1.00. Limit orders use the resting limit price. Market orders must use the live same-outcome quote: ask for buys, bid for sells. For Kalshi `No`, send the displayed/economic `No` price; do not complement it client-side. |
+| `time_in_force` | string | No | — | `"GTC"`, `"FOK"`, `"IOC"`, `"FAK"`, or `"GTD"` — see [Time in force](/learn/time-in-force) |
+| `expiration_minutes` | integer | GTD only | — | Minutes until expiration |
+| `client_order_id` | string | No | — | Your idempotency key |
+| `max_slippage_cents` | integer | No | — | Max acceptable slippage in cents (1-99) |
+| `max_retries` | integer | No | — | Max retry attempts for transient failures |
+| `bot_id` | string | No | — | Bot identifier for copy trading |
+
+<Note>
+**Hyperliquid needs three things at once:** `outcome`, whole-share
+quantities, and the side-specific `token_id` — without the latter it falls
+back to the bare-`market_id` side-0 behaviour. See
+[Hyperliquid orders](/rest/orders#hyperliquid-orders) for a complete
+example and time-in-force mappings.
+</Note>
+
+**Success response:**
+
+```json
+{
+  "type": "order_response",
+  "request_id": "client-generated-uuid",
+  "result": {
+    "order_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "queued"
+  }
+}
+```
+
+**Error response:**
+
+```json
+{
+  "type": "order_error",
+  "request_id": "client-generated-uuid",
+  "error": "Invalid submit_order payload: ...",
+  "status": 400,
+  "error_details": {
+    "code": "VALIDATION_INVALID_ORDER",
+    "message": "quantity must be positive"
+  }
+}
+```
+
+After submission, the order flows through the execution pipeline. You will receive [status_changed](/websocket/order-updates#status_changed), [filled](/websocket/order-updates#filled), [position_updated](/websocket/order-updates#position_updated), and [balance_updated](/websocket/order-updates#balance_updated) events as the order progresses.
+
+<Note>
+**Gotcha: `order_response` is not success.** The `"queued"` status means the
+order was accepted into the pipeline. Wait for `status_changed` events to
+confirm the order is `live` or `filled`.
+</Note>
+
+---
+
+### cancel_order
+
+Cancel a single open order.
+
+```json
+{
+  "type": "cancel_order",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "order_id": "550e8400-e29b-41d4-a716-446655440000"
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `order_id` | string | Yes | — | UUID of the order to cancel |
+
+Requires `trade:execute` scope for API key users. Only orders you own can be cancelled. Orders in terminal states (`filled`, `cancelled`, `expired`, `failed`) cannot be cancelled.
+
+If the order hasn't reached the exchange yet (no `exchange_order_id`), it is cancelled locally. Otherwise, a cancel request is sent to the exchange.
+
+A successful cancel triggers a [status_changed](/websocket/order-updates#status_changed) event with the new status.
+
+---
+
+### cancel_all_orders
+
+Cancel all open orders on an exchange, optionally restricted to a specific market.
+
+```json
+{
+  "type": "cancel_all_orders",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "exchange_id": "polymarket",
+    "market_id": "570362"
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | Any exchange this deployment has an executor for — in practice `"polymarket"`, `"kalshi"`, or `"predictfun"`. An unregistered id returns `400` with `No executor for exchange '<id>'`. |
+| `market_id` | string | No | all markets | Restrict to a specific market. Polymarket accepts a numeric market id or `0x…` condition id; Kalshi expects the raw Kalshi ticker; Predict.fun accepts a numeric market id only. |
+
+**Response:**
+
+```json
+{
+  "type": "order_response",
+  "request_id": "client-generated-uuid",
+  "result": {
+    "cancelled_count": 3,
+    "failed_count": 0,
+    "cancelled_order_ids": ["550e...", "551e...", "552e..."]
+  }
+}
+```
+
+<Note>
+**Gotcha: Predict.fun cancel-all is synthetic and non-atomic.** It is a list
+plus batched per-order cancels (≤100 ids per venue request), so partial
+success is possible and `cancelled_count` counts venue-confirmed cancels
+only — see [per-venue semantics](/rest/orders#per-venue-semantics).
+</Note>
+
+---
+
+### cancel_batch_orders
+
+Cancel a selected set of open limit orders atomically before any venue request is sent.
+
+```json
+{
+  "type": "cancel_batch_orders",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "order_ids": [
+      "550e8400-e29b-41d4-a716-446655440000",
+      "550e8400-e29b-41d4-a716-446655440001"
+    ]
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `order_ids` | string[] | Yes | — | UUIDs of the selected orders to cancel |
+
+Requires `trade:execute` scope for API key users. The server validates ownership, non-terminal status, exchange homogeneity, and exchange order IDs for the full selection before sending any venue cancel request. Supported venues are Polymarket, Kalshi, and Predict.fun.
+
+**Response:**
+
+```json
+{
+  "type": "order_response",
+  "request_id": "client-generated-uuid",
+  "result": {
+    "success": true,
+    "cancelled_count": 2,
+    "noop_count": 0,
+    "failed_count": 0,
+    "cancelled_order_ids": [
+      "550e8400-e29b-41d4-a716-446655440000",
+      "550e8400-e29b-41d4-a716-446655440001"
+    ],
+    "noop_order_ids": [],
+    "failures": []
+  }
+}
+```
+
+<Note>
+**Gotcha: `noop_order_ids` need reconciliation.** They are orders the venue
+already considered terminal or absent. The service does not overwrite
+ambiguous local fill state for noops; use subsequent order updates or REST
+reads for final reconciliation.
+</Note>
+
+---
+
+### redeem
+
+Redeem a resolved position on-chain.
+
+```json
+{
+  "type": "redeem",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "exchange_id": "polymarket",
+    "condition_id": "0x...",
+    "position_id": "uuid"
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | Exchange the position is held on |
+| `condition_id` | string | Yes | — | Condition to redeem |
+| `position_id` | string | No | all matching rows | Narrows the redeem to one position row |
+
+Requires `trade:execute` plus platform access to `exchange_id`. The redeem
+signs an on-chain transaction with your delegated key, so the connection's
+signing-policy version is also checked; an out-of-date policy returns an
+`order_error` rather than signing. Legacy identity fields (`user_id`,
+`turnkey_org_id`, `wallet_address`) are still accepted but are resolved from
+the authenticated session and can be omitted.
+
+Completion arrives asynchronously as a
+[`position_redeemed`](/websocket/order-updates#position_redeemed) event.
+
+---
+
+### ctf_split / ctf_merge
+
+Split collateral into a full set of conditional tokens, or merge a full set
+back into collateral.
+
+```json
+{
+  "type": "ctf_split",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "exchange_id": "polymarket",
+    "condition_id": "0x...",
+    "amount": "10.5",
+    "market_id": "570362"
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | Exchange to act on |
+| `condition_id` | string | Yes | — | Condition to split or merge |
+| `amount` | string | Yes | — | Collateral (split) or full-set (merge) amount |
+| `market_id` | string | No | resolved from `condition_id` | Market context |
+
+Same gating as `redeem`: `trade:execute`, platform access, and the
+signing-policy version check. Completion arrives as a
+[`ctf_action_completed`](/websocket/order-updates#ctf_action_completed) event.
+
+---
+
+### submit_signed_order
+
+One-round-trip external-signing submit: you send an order you built and signed
+yourself and the server verifies it (signature recovery plus owner-belongs-to-
+user) and forwards it to the venue without signing anything.
+
+```json
+{
+  "type": "submit_signed_order",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "intent": { "...": "venue order intent" },
+    "builder_code": "0x<64 hex digits also signed as Order.builder>",
+    "signature_hex": "0x...",
+    "market_id": "570362",
+    "outcome": "Yes"
+  }
+}
+```
+
+`builder_code` is required, must match the current public Kairos builder code,
+and must be the exact bytes32 value included in the signed EIP-712
+`Order.builder` field. Read `polymarket_builder_code` from the socket's initial
+`connected` frame and refresh it after reconnect.
+
+<Note>
+**Gotcha: this path is allowlist-gated.** A caller that is not enabled for
+external signing receives an `order_error` with the same status the REST
+external-signing endpoint would return. `error_details` is not populated on
+this command.
+</Note>
+
+---
+
+### warm_market
+
+Tell the cell which market you just opened so it scopes your live fill
+subscription to it *before* you place an order. Purely a latency optimization.
+
+```json
+{
+  "type": "warm_market",
+  "request_id": "client-generated-uuid",
+  "payload": {
+    "exchange_id": "polymarket",
+    "market_id": "0x..."
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | Exchange serving the contract |
+| `market_id` | string | Yes | — | Numeric market id or `0x…` condition id. Must be a plausible identifier: at most 128 characters, either `0x` + hex or alphanumerics plus `_ - : .` |
+
+Requires `trade:execute` plus platform access to `exchange_id`, and is rate
+limited to **240 warms per minute per user**.
+
+```json
+{
+  "type": "order_response",
+  "request_id": "client-generated-uuid",
+  "result": {
+    "warmed": true,
+    "subscription_starting": false,
+    "market_scope_requested": true
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `warmed` | `true` only when the fill stream was **already** live — connect and auth were already paid |
+| `subscription_starting` | The connection was kicked off now; it is connecting, not yet live |
+| `market_scope_requested` | The per-market scope was issued (asynchronous; the id resolve can still fail) |
+
+<Warning>
+**Gotcha: warming is fail-soft.** It never rejects your contract-open, so a
+successful `order_response` does not promise a live subscription — read the
+result fields. A rate-limited, streamer-less, or credential-less warm returns
+`{"warmed": false, "reason": "rate_limited" \| "no_fill_streamer"}` rather
+than an error. Fill detection falls back to the polling worker either way.
+</Warning>
+
+---
+
+## Response Types
+
+| Response Type | Trigger | Description |
+|---------------|---------|-------------|
+| `order_response` | Any accepted financial command | Successful command acknowledgment |
+| `order_error` | Any accepted financial command | Command failed with error details |
+
+---
+
+## Errors & Disconnection
+
+Command errors, connection-level failures, and disconnects are documented in detail on the [Order Updates → Errors & Disconnection](/websocket/order-updates#errors-disconnection) page, since both surfaces share the same WebSocket — including the server-initiated **close codes** (`1000`, `1001`, `1006`) and the reconnect/backoff flow. Quick reference for command-specific behavior:
+
+### Command error shape
+
+Every command that fails returns an `order_error` frame on the same connection, with `request_id` echoed so you can correlate it to your in-flight command:
+
+```json
+{
+  "type": "order_error",
+  "request_id": "client-generated-uuid",
+  "error": "Human-readable description",
+  "status": 400,
+  "error_details": {
+    "code": "VALIDATION_INVALID_ORDER",
+    "message": "quantity must be positive"
+  }
+}
+```
+
+The connection **stays open** after an `order_error` — only the offending command is rejected. Branch on `error_details.code` (e.g. `VALIDATION_INVALID_ORDER`, `FUNDS_INSUFFICIENT_BALANCE`) rather than on the human-readable `error` string.
+
+### Common per-command errors
+
+| Command | Status | When it happens | What to do |
+|---------|--------|------|---|
+| `submit_order` | `400` | Payload fails JSON schema (`error_details.code: "VALIDATION_INVALID_ORDER"`) or fails downstream validation | Fix the payload against the field table above |
+| `submit_order` | `4xx`/`5xx` | Builder/persistence errors — `error_details` matches the HTTP `POST /orders` error contract | Branch on `error_details.code` |
+| `cancel_order` | `400` | Malformed payload or `order_id` not a UUID | Send the UUID exactly as returned by submit |
+| `cancel_order` | `403` | API key missing `trade:execute` scope, platform access disabled for the order's exchange, or order belongs to another user | Check the key's scopes; don't retry |
+| `cancel_order` | `404` | Order not found | Re-read open orders from `GET /orders` |
+| `cancel_order` | `500` | DB read/write failed, or cancel succeeded on exchange but DB update failed (the response message will say so explicitly) | If the message says the exchange cancel succeeded, the order **is** cancelled on the exchange even though the DB is stale — reconcile rather than re-cancelling |
+| `cancel_all_orders` | `400` | No executor for `exchange_id` or malformed payload | Check the `exchange_id` |
+| `cancel_all_orders` | `403` | API key missing `trade:execute` scope, or platform access disabled for `exchange_id` | Check the key's scopes; don't retry |
+| `cancel_all_orders` | `500` | Failed to fetch credentials or exchange call failed | Retry with backoff, then reconcile over REST |
+| `cancel_batch_orders` | `400` | Malformed payload, empty/oversized selection, mixed exchanges, or unsupported exchange | Split the batch per exchange and retry |
+| `cancel_batch_orders` | `403` | API key missing `trade:execute` scope, platform access disabled for the selected exchange, or an order belongs to another user | Check the key's scopes; don't retry |
+| `cancel_batch_orders` | `404` | One or more orders were not found | Refresh the id list from `GET /orders` |
+| `cancel_batch_orders` | `409` | One or more orders are in a terminal state, or an order has no exchange order ID yet | Drop those ids and resend the rest |
+| `cancel_batch_orders` | `500` | Failed to fetch credentials, exchange call failed, or DB update failed | Retry with backoff, then reconcile over REST |
+| `redeem`, `ctf_split`, `ctf_merge` | `400` | Malformed payload (`Invalid redeem payload: …`, `Invalid ctf_split payload: …`) | Fix the payload |
+| `redeem`, `ctf_split`, `ctf_merge` | `403` | Missing `trade:execute`, platform access disabled, or the signing-policy version gate rejected the call | Check scopes; if the policy gate rejected, contact support rather than retrying |
+| `submit_signed_order` | `400` | `invalid submit_signed_order payload: …` | Fix the payload |
+| `submit_signed_order` | `4xx`/`5xx` | Signature verification, allowlist, or venue error — mirrors the REST external-signing contract; `error_details` is absent | Read `error` and `status`; allowlist rejections do not clear on retry |
+| `warm_market` | `400` | `Invalid warm_market payload: …` or `Invalid warm_market market_id: '…'` | Fix the identifier |
+| `warm_market` | `403` | Missing `trade:execute` or platform access disabled for `exchange_id` | Check scopes; warming is optional, so proceed without it |
+| Any command | `401` | The connection's JWT expired or was revoked | The server sends the `order_error` and then **terminates the connection** — refresh the JWT and reconnect |
+| Any command | `500` | A panic while handling the command (`Internal error handling command`) | The connection stays open; retry the command |
+
+### Unknown command type
+
+JSON `type` values outside the server's accepted command and control-message
+sets are silently ignored for forward compatibility. The shared connection
+also accepts the RFQ messages `subscribe_fee_quote` /
+`unsubscribe_fee_quote` (see [Fee Quote (RFQ)](/websocket/fee-quote)) and the
+order-updates surface's `ping`.
+
+### Malformed frames
+
+Invalid JSON, a missing/unknown `type`, and unknown message types are silently
+ignored. If a recognized command has an invalid envelope — most commonly a
+missing or non-string `request_id` — the server returns:
+
+```json
+{
+  "type": "order_error",
+  "request_id": "<echoed-if-parseable, else \"unknown\">",
+  "error": "Invalid command format: missing required fields (type, request_id)",
+  "status": 400
+}
+```
+
+### Disconnect handling
+
+<Note>
+**Gotcha: on disconnect, in-flight commands have indeterminate state.** The
+server may have already submitted the order before the connection dropped.
+</Note>
+
+After reconnect:
+
+1. Reconcile open orders with `GET /orders?status=live`.
+2. If you used `client_order_id`, re-submitting the same command is safe (idempotent) — the server returns the existing order rather than creating a duplicate.
+3. The server does not replay missed events; pull anything authoritative from REST.
+
+---
+
+## Limits
+
+Order submissions are limited to **5 per second per user**, shared between this
+WebSocket and REST; an API key carrying an `orders` override gets its own
+budget on top, over that same one-second window — not a per-minute one. Connection-level limits (max connections per user,
+max frame size) are on
+[Order Updates → Limits](/websocket/order-updates#connection-limits).
+
+### WebSocket vs REST
+
+Both the WebSocket and REST API (`POST /orders`, `POST /orders/{id}/cancel`) support the same order operations. Key differences:
+
+| | WebSocket | REST API |
+|--|-----------|----------|
+| **Authentication** | At connection time (no per-request auth) | Per-request headers |
+| **CSRF protection** | Not applicable; authentication is established during upgrade and JWT validity is rechecked before financial commands | Browser JWT calls require `x-csrf-token`; backend calls use `X-Service-Token`; fully validated API-key triples are exempt |
+| **Real-time events** | Delivered on the same connection | Requires separate WebSocket connection |
+| **Idempotency** | Via `client_order_id` | Via `client_order_id` |
+| **Rate limit** | 5 order submissions/second per user (shared with REST); an API key carrying an `orders` override gets its own budget on the same one-second window | 5 order submissions/second per user |
+
+**Recommendation:** Use WebSocket for programmatic trading bots and real-time UIs. Use REST for simple one-off operations or integrations that don't need streaming updates.
+
+---
+
+## Best Practices
+
+- **Use `request_id`** on all commands to correlate responses. Generate a unique UUID for each command.
+- **Use `client_order_id`** for idempotency. If you submit the same `client_order_id` twice, the second submission returns the existing order instead of creating a duplicate.
+- **Check `order_error` responses** for the `error_details.code` field to programmatically handle specific failure cases (e.g., `VALIDATION_INVALID_ORDER`, `FUNDS_INSUFFICIENT_BALANCE`).
+- **Don't assume order success** from the `order_response`. Wait for `status_changed` events to confirm the order is `live` or `filled`.

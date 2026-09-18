@@ -1,0 +1,140 @@
+---
+title: "Positions & PnL"
+description: "Understanding your positions, calculating profit and loss, and settlement"
+---
+
+Once an order fills you're holding something. This chapter covers what a position is, the two ways it can end — you sell, or the market resolves — and exactly how Kairos turns that into a profit-and-loss number.
+
+## What Is a Position?
+
+A **position** is simply shares you're holding. When you buy shares, you open a position. When you sell them, you close it.
+
+| Action | Result |
+|--------|--------|
+| Buy 50 Yes shares | You have a **long Yes** position of 50 |
+| Buy 30 No shares | You have a **long No** position of 30 |
+| Sell your 50 Yes shares | Position closed |
+
+## Long Yes vs Long No
+
+In prediction markets, you can be:
+
+- **Long Yes** — You think the event **will** happen. You profit if it does.
+- **Long No** — You think the event **won't** happen. You profit if it doesn't.
+
+**Example: "Will it snow in April?"**
+
+Current prices: Yes = $0.20, No = $0.80
+
+| Outcome | Long Yes (bought at $0.20) | Long No (bought at $0.80) |
+|---------|--------------------------|--------------------------|
+| It snows | +$0.80 profit | -$0.80 loss |
+| No snow | -$0.20 loss | +$0.20 profit |
+
+## Calculating Profit & Loss (PnL)
+
+Your PnL depends on what you paid and what you got.
+
+### If you sell before resolution:
+
+<Note>
+**PnL = (Sell Price - Buy Price) x Quantity**
+</Note>
+
+**Example:** Bought 100 Yes at $0.40, sold at $0.65:
+
+| | |
+|---|---|
+| Sell Price - Buy Price | $0.65 - $0.40 = $0.25 |
+| x Quantity | x 100 |
+| **PnL** | **+$25.00** |
+
+### If you hold until settlement:
+
+<Note>
+**PnL = (Settlement Value - Buy Price) x Quantity**
+</Note>
+
+**Event happens** — settles at $1.00:
+
+| | |
+|---|---|
+| Settlement - Buy Price | $1.00 - $0.40 = $0.60 |
+| x Quantity | x 100 |
+| **PnL** | **+$60.00** |
+
+**Event doesn't happen** — settles at $0.00:
+
+| | |
+|---|---|
+| Settlement - Buy Price | $0.00 - $0.40 = -$0.40 |
+| x Quantity | x 100 |
+| **PnL** | **-$40.00** |
+
+## Closing a Position
+
+You don't have to wait for the market to resolve. You can close your position at any time by selling your shares back into the order book.
+
+**Why close early?**
+
+- **Lock in profit** — The price moved in your favor, take the win
+- **Cut losses** — You changed your mind, sell before it goes to zero
+- **Free up capital** — Put that money into another trade
+
+
+## Settlement — How Markets Resolve
+
+When the real-world event happens (or doesn't), the market **resolves**:
+
+- **Yes outcome:** All Yes shares become worth $1.00, all No shares become $0.00
+- **No outcome:** All No shares become worth $1.00, all Yes shares become $0.00
+
+Settlement is automatic. Your shares are converted to cash and added to your balance.
+
+On the on-chain venues (Polymarket, Predict.fun) that conversion is a
+**redemption transaction**, which Kairos submits for you once the market
+resolves on-chain. It is not instantaneous: a position can sit marked
+*redeemable* between resolution and the redemption landing, and a backstop
+sweep catches any that the live path missed.
+
+> **Example:** "Will Team A win the finals?" — Team A wins!
+>
+> Your 50 Yes shares x $1.00 = **$50.00 deposited**. Position closed automatically.
+
+## Unrealized vs Realized PnL
+
+| Type | Meaning |
+|------|---------|
+| **Unrealized PnL** | Profit/loss on shares you still hold, based on the current market price. Changes as prices move. |
+| **Realized PnL** | Profit/loss that's locked in — you sold the shares or the market settled. Real money. |
+
+> **How Kairos computes it:** if you bought the same outcome at several prices,
+> "your buy price" is not one number. Kairos matches sells against your buy lots
+> **FIFO** — oldest lot first — so realized PnL reflects the cost of the specific
+> lots you sold, and unrealized PnL is the mark price applied to your remaining
+> cost basis. The `/pnl` endpoints report `cost_basis_usd` and `avg_entry`
+> alongside realized and unrealized figures. See [PnL](/rest/pnl).
+>
+> The formulas above also ignore fees. Your actual result is net of the Kairos
+> platform fee and any exchange fee on both the entry and the exit — see
+> [Fees](/trading/fees).
+
+**Example:** You bought 100 Yes at $0.40 (cost: $40). Current price: $0.55.
+
+> Unrealized PnL = ($0.55 - $0.40) x 100 = **+$15.00**
+>
+> You sell at $0.55 — that $15.00 becomes **realized PnL**.
+
+## Risk and Reward
+
+The most you can lose is what you paid. The most you can gain is $1.00 minus what you paid.
+
+| Buy Price | Max Loss | Max Gain |
+|-----------|----------|----------|
+| $0.10 | $0.10 | $0.90 |
+| $0.50 | $0.50 | $0.50 |
+| $0.90 | $0.90 | $0.10 |
+
+Cheap shares have high upside but low probability. Expensive shares are safer bets but with smaller payoffs. There's always a tradeoff.
+
+**Next:** the [Glossary](/learn/glossary) for a quick reference on any term, or [Fees](/trading/fees) for what these figures look like net of costs.

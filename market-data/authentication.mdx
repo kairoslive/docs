@@ -1,0 +1,169 @@
+---
+title: "Authentication & Rate Limits"
+description: "Free anonymous tier, API-key headers, and rate-limit behavior"
+---
+
+Every Market Data endpoint works without credentials on a free per-IP tier, and
+with an API key on a much larger per-credential budget. This page covers both,
+the rate-limit headers you should read, and the conditional-request headers
+that keep chart-heavy clients cheap.
+
+## Free anonymous tier — no signup
+
+Every `/v1/*` endpoint accepts requests **without any credentials**. Anonymous
+requests are rate-limited per source IP, across two independent buckets:
+
+| Bucket | Endpoints | Anonymous budget | API-key budget |
+|---|---|---|---|
+| `light` | candles, market metadata, resolutions, trade metrics | 120 units/min | 1,200 units/min |
+| `heavy` | trade history, marks, perpetual snapshots | 20 units/min | 150 units/min |
+
+That is enough to explore every endpoint, paint charts, and prototype an
+integration — the try-it panels in these docs run on this tier.
+
+```bash
+curl -i "https://md.kairos.trade/v1/markets?provider=polymarket&limit=5"
+```
+
+Every response tells you which tier applied:
+
+```
+X-RateLimit-Tier: anonymous
+```
+
+> **Never send partial credentials.** Sending **any** of the three API-key
+> headers commits the request to the API-key path. A missing or wrong value
+> then returns `401` instead of falling back to the anonymous tier. This is
+> deliberate — a broken integration fails loudly rather than silently running
+> on the anonymous budget, which is 10× smaller on `light` and 7.5× smaller on
+> `heavy`.
+
+> **The anonymous tier is a courtesy, not a contract.** Kairos can switch it
+> off at runtime as an abuse kill switch — applied within ~30s and without a
+> deploy. While it is off, credential-free requests get `401`. Build
+> production integrations on an API key.
+
+## API keys
+
+For production use, authenticate with the standard Kairos API-key headers —
+the same credentials used with the [REST API](/rest/orders):
+
+| Header | Value |
+|---|---|
+| `X-Client-Id` | `kairos_ck_…` |
+| `X-Api-Key` | 64-char hex |
+| `X-Api-Secret` | 64-char hex |
+
+```bash
+curl -G https://md.kairos.trade/v1/trades/metrics \
+  -H "X-Client-Id: $CLIENT_ID" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "X-Api-Secret: $API_SECRET" \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=123456"
+```
+
+`$CLIENT_ID`, `$API_KEY`, and `$API_SECRET` are your issued credentials. API
+keys are issued by the Kairos team during the beta; the key and secret are
+shown once at issuance.
+
+Requests with **invalid** credentials return `401` — headerless requests ride
+the anonymous tier instead. A credential presented from a source IP outside
+its whitelist returns `403 ip_not_whitelisted`; that is the only `403` this
+API emits. If the credential store itself is unreachable, any endpoint can
+answer `500` with `authentication backend unavailable`; retry.
+
+<Note>
+**A credential's identity, not its headers, is the rate-limit key.** The same
+key used from several hosts shares one budget. Split traffic across separate
+credentials if you need separate budgets.
+</Note>
+
+## Rate limits
+
+Limits are applied over a one-minute sliding window, in **units**, across the
+two independent buckets shown in the table above — per credential when
+authenticated, per source IP on the anonymous tier.
+
+Most requests cost **1 unit**. Larger or heavier requests — a wider candle
+window, a bigger trade-history page, a larger batch of marks — consume more of
+your budget in proportion to the data returned; a typical chart paint or lookup
+still costs only a handful of units. Each operation's exact cost model is
+published as `x-kairos-rate-limit` in the
+[OpenAPI spec](https://app.kairos.trade/openapi/market-data-api.yaml):
+
+| Endpoint | Cost |
+|---|---|
+| `GET /v1/candles` | 1 + 1 per 5,000 requested bars |
+| `POST /v1/candles/batch` | 1 up front, plus 1 per 5,000 bars summed over every item — charged *after* the body is parsed, so it lands against your next request |
+| `GET /v1/trades` | 1 per started 250 rows of `limit` (so 2 at `limit=500`) |
+| `GET /v1/marks` | 1 per started 100 pairs (so 2 at the 200-pair cap) |
+| `POST /v1/market-identifiers/resolve` | 1 per submitted item, charged before per-item validation — a rejected batch still costs its full size |
+| `GET /v1/perpetuals/…/snapshot` | 6 |
+| everything else | 1 |
+
+### Reading the headers
+
+Every response reports the bucket it drew from and what remains:
+
+```
+X-RateLimit-Bucket: light
+X-RateLimit-Tier: api-key
+X-RateLimit-Remaining: 1187
+X-RateLimit-Reset: 1784082459
+```
+
+`X-RateLimit-Reset` is the unix second at which the current one-minute window
+rolls over — that is when budget meaningfully replenishes.
+
+Exceeding a budget returns `429` with a `Retry-After` header (seconds until
+that rollover). The two buckets are independent: exhausting the heavy budget
+never blocks candle or metadata requests.
+
+> **There are two different `429`s.** A coarser per-IP admission gate sits *in
+> front of* authentication. It also answers `429 rate_limited`, but with the
+> message `too many requests from this address`, a flat `Retry-After: 60`, and
+> **no** `X-RateLimit-*` headers — that absence is how you tell the two apart.
+> It exists to keep floods off shared infrastructure and sits far above any
+> legitimate traffic rate.
+
+> **The limiter fails closed.** If its backing store is unreachable, requests
+> get `503 rate_limiter_unavailable` rather than passing unmetered. Retry with
+> backoff.
+
+Contact the team if your integration needs higher budgets — limits are set per
+credential and can be raised.
+
+## Conditional requests
+
+Cacheable responses carry a strong `ETag`. Repeat requests that include
+`If-None-Match` return `304 Not Modified` with no body, and cost you nothing in
+bandwidth:
+
+```bash
+curl -G https://md.kairos.trade/v1/candles \
+  -H 'If-None-Match: "3f8a1c9e2b7d4056"' \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=1897067" \
+  --data-urlencode "timeframe_seconds=3600" \
+  --data-urlencode "start=2026-07-14T00:00:00Z" \
+  --data-urlencode "end=2026-07-15T00:00:00Z"
+```
+
+The `If-None-Match` value is the `ETag` from your previous response, quotes
+included.
+
+`Cache-Control` on each response indicates how long it may be reused — fully
+historical data is cacheable for much longer than recent or live data.
+Respecting these headers is the easiest way to cut bandwidth and latency for
+chart-heavy clients.
+
+## Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `401` | `unauthorized` | Invalid, incomplete, or revoked credentials; or no credentials while the anonymous tier is off | Send all three headers, or none. If you sent none, obtain an API key — the anonymous tier may be off |
+| `403` | `ip_not_whitelisted` | API key used from a source IP outside its whitelist | Call from a whitelisted IP, or ask the team to add yours |
+| `429` | `rate_limited` | Bucket budget exhausted, or the per-IP admission gate refused the request | Sleep for `Retry-After` seconds. If `X-RateLimit-*` headers are absent you hit the per-IP gate, not your credential's budget |
+| `500` | `internal` | The credential store was unreachable (`authentication backend unavailable`) | Retry |
+| `503` | `rate_limiter_unavailable` | The rate limiter is down; the API fails closed | Retry with backoff |

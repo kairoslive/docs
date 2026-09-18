@@ -1,0 +1,366 @@
+---
+title: "Trader Stats"
+description: "Public trader performance metrics, PnL history, positions, and profile lookup by wallet address"
+---
+
+Per-wallet performance: PnL history, open/closed positions, trade history, and public profile lookup.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+## Authentication
+
+The three `/trader-stats/*` routes are **fully public and take no credentials at all** — sending auth headers to them does nothing, and they never return `401` or `403`.
+
+`GET /search-traders` is the only authenticated endpoint on this page (`x-kairos-auth: api-key`). Send the API-key triple (`X-Client-Id`, `X-Api-Key`, `X-Api-Secret`), a first-party session JWT, or an `X-Admin-Secret`. No API-key scope is required. Session-JWT callers additionally pass the invite gate; API-key and admin-secret callers bypass it. It shares the `heavy` rate-limit group (10 requests/minute) with `/trader-stats/*` and `/top-holders`.
+
+The `/search-traders` example below reads credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+## Address handling
+
+`wallet_address` is validated as either an Ethereum address (`0x...`, 42 chars) or a Solana
+base58 address, normalized (EVM addresses lower-cased) before lookup — a value matching
+neither format returns `400`. When omitted, positions and trades choose the provider with
+the most ClickHouse fills for the wallet, then fall back to address format
+(`0x` → Polymarket, Solana → Kalshi). PnL history defaults to Polymarket. Pass
+`provider` for deterministic results, especially for multi-venue EVM wallets.
+
+<Warning>
+**Gotcha:** provider auto-detection is not the same on every route. Positions and trades sniff the wallet's fills; PnL history never does and always falls back to Polymarket; `/search-traders` resolves every `0x` address to Polymarket. Two routes can therefore answer about two different venues for the same wallet unless you pass `provider`.
+</Warning>
+
+## PnL history
+
+```
+GET /trader-stats/pnl-history/{wallet_address}
+```
+
+Cumulative realized-PnL series for one wallet over a fixed time window, bucketed for charting.
+
+**Public — no authentication required.** Uses the `heavy` rate-limit group (10 requests/minute per trusted client IP).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `wallet_address` (path) | string | Yes | — | Trader's wallet address. |
+| `time_range` | string | No | `ALL` | `1D`\|`1W`\|`1M`\|`ALL`. PnL time window; a value outside the set returns `422`. |
+| `provider` | string | No | `polymarket` | A registered provider. Venue whose ClickHouse FIFO ledger should be queried. |
+
+```bash
+curl "https://data.kairos.trade/trader-stats/pnl-history/0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b?time_range=1W&provider=polymarket"
+```
+
+<Note>
+**Gotcha:** `ALL` is not all-time. The window map is `1D` → last 24h in 1-minute buckets, `1W` → last 7 days in 5-minute buckets, `1M` and `ALL` → last 30 days in 1-hour buckets. `ALL` and `1M` return identical data.
+</Note>
+
+### Response
+
+```json
+{
+  "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "time_range": "1W",
+  "data_points": [
+    { "timestamp": "2026-07-15T00:00:00", "realized_pnl": "800.00" },
+    { "timestamp": "2026-07-22T00:00:00", "realized_pnl": "1250.4382" }
+  ],
+  "start_pnl": "800.00",
+  "end_pnl": "1250.4382",
+  "pnl_change": "450.4382",
+  "pnl_change_percent": "56.30",
+  "current_realized_pnl": "1250.4382",
+  "current_total_pnl": null
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `wallet_address` | string | Echoed lower-cased |
+| `data_points` | array | Cumulative realized-PnL series, bucketed over `time_range`. Buckets carry ClickHouse-local UTC timestamps with **no timezone suffix** (`2026-07-15T00:00:00`) |
+| `start_pnl` / `end_pnl` | string | Realized PnL (decimal string) at the start/end of the window |
+| `pnl_change` | string | `end_pnl − start_pnl` |
+| `pnl_change_percent` | string \| null | Percent change; `null` when `abs(start_pnl) <= 0.01` |
+| `current_realized_pnl` | string | Same value as `end_pnl` for the selected window |
+| `current_total_pnl` | null | Reserved field; currently always `null` |
+
+> **Gotcha:** `data_points[].timestamp` carries **no timezone suffix** — it is a ClickHouse-local UTC timestamp such as `2026-07-15T00:00:00`. Parsers that assume local time will shift your chart. Treat it as UTC explicitly.
+
+> **Gotcha:** all PnL values are decimal strings, not floats — parse with a decimal library to avoid precision loss.
+
+Responses are cached publicly for 30 seconds (`stale-while-revalidate=60`); the service also
+caches the computed history in Redis for 120 seconds. Providers not yet covered by the
+ClickHouse FIFO pipeline (Kalshi and other non-EVM venues) return an all-zero payload with
+`data_points: []`.
+
+Unlike positions and trades, this route does **not** auto-detect the provider from the
+wallet's fills — omitting `provider` always queries Polymarket.
+
+## Positions
+
+```
+GET /trader-stats/positions/{wallet_address}
+```
+
+A page of the wallet's open and closed positions, plus a performance summary computed over its full inventory.
+
+**Public — no authentication required.** Uses the `heavy` rate-limit group
+(10 requests/minute per trusted client IP).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `wallet_address` (path) | string | Yes | — | Trader's wallet address. |
+| `include_redeemable` | boolean | No | `false` | Include resolved positions still awaiting on-chain redemption. |
+| `provider` | string | No | — | A registered provider. Venue override; otherwise selected from the wallet's ClickHouse fills, then address format. |
+| `limit` | integer | No | `200` | 1–1000. Positions per page (sorted by value, largest first). |
+| `offset` | integer | No | `0` | ≥ 0, no upper bound. Pagination offset. |
+| `status` | string | No | `all` | `all`\|`open`\|`closed`. Filter the returned page by status. |
+
+```bash
+curl "https://data.kairos.trade/trader-stats/positions/0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b?status=open&limit=50&provider=polymarket"
+```
+
+### Response
+
+```json
+{
+  "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "performance": {
+    "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+    "total_realized_pnl": "1250.4382",
+    "total_unrealized_pnl": "300.00",
+    "total_pnl": "1550.4382",
+    "roi_percent": "12.75",
+    "open_positions": 4,
+    "closed_positions": 27,
+    "total_positions": 31,
+    "positions_value": "420.00",
+    "winning_positions": 18,
+    "losing_positions": 9,
+    "win_rate": "0.6667",
+    "total_volume": "18420.55",
+    "markets_traded": 12,
+    "join_date": null,
+    "profile_views": 0,
+    "largest_win": null,
+    "last_updated": "2026-07-22T14:03:11Z"
+  },
+  "open_positions": [
+    {
+      "market_id": "0xabc123condition",
+      "market_name": "Will the Fed cut rates in September?",
+      "icon": "https://cdn.polymarket.com/markets/fed.png",
+      "token_id": "10723948572...4",
+      "outcome": "YES",
+      "size": "150.0",
+      "entry_price": "0.42",
+      "current_price": "0.55",
+      "cost_basis": "63.00",
+      "unrealized_pnl": "19.50",
+      "realized_pnl": "0.00",
+      "status": "OPEN",
+      "opened_at": "2026-07-01T11:22:03",
+      "closed_at": null,
+      "provider": "polymarket"
+    }
+  ],
+  "closed_positions": [],
+  "has_more": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `performance` | object | Win rate, PnL, and volume computed over the wallet's **full** inventory, not just the returned page |
+| `open_positions` / `closed_positions` | array | This page's positions, sorted by current value, descending |
+| `has_more` | boolean | More positions exist beyond this page in the selected `status` result set |
+| `entry_price` | string | 0–1 scale; clamped to `"0"` when the underlying average entry is missing or negative |
+| `current_price` | string \| null | 0–1 scale; `null` when no mark is available |
+| `unrealized_pnl` | string \| null | `null` when `current_price` is unavailable |
+| `performance.positions_value` | string | Cost basis (deployed capital) of OPEN positions over the full inventory — not mark-to-market value |
+| `performance.win_rate` | string | Fraction in `0`–`1`, not a percentage |
+| `performance.join_date` / `largest_win` | string \| null | Polymarket-sourced; `null` for other venues |
+| `performance.profile_views` | integer | Polymarket-sourced; `0` for other venues |
+| `market_name` / `icon` | string \| null | `null` when metadata resolution finds nothing for the token |
+
+<Warning>
+**Gotcha:** two `performance` fields do not mean what their names suggest. `win_rate` is a fraction in `0`–`1`, not a percentage — multiply by 100 before rendering. `positions_value` is the cost basis of open positions, not their mark-to-market value.
+</Warning>
+
+**Market names/icons are resolved only for the returned page**, so wallets holding tens of
+thousands of positions can't blow past the backend's max query size.
+
+Responses are cached publicly for 15 seconds (`stale-while-revalidate=30`); the service also
+caches per (`provider`, `include_redeemable`, `status`, `limit`, `offset`) in Redis for 30
+seconds.
+
+The Kalshi adapter reads the configured authenticated Kalshi account and does
+not use `wallet_address` to select an arbitrary public account. Pass
+`provider=kalshi` only when that account-level view is intended.
+
+## Trade history
+
+```
+GET /trader-stats/trades/{wallet_address}
+```
+
+A page of the wallet's individual fills.
+
+**Public — no authentication required.** Uses the `heavy` rate-limit group
+(10 requests/minute per trusted client IP).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `wallet_address` (path) | string | Yes | — | Trader's wallet address. |
+| `trade_limit` | integer | No | `50` | 1–500. Trades per page. |
+| `trade_offset` | integer | No | `0` | ≥ 0, no upper bound. Pagination offset. |
+| `provider` | string | No | — | A registered provider. Venue override; otherwise selected from the wallet's ClickHouse fills, then address format. |
+
+```bash
+curl "https://data.kairos.trade/trader-stats/trades/0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b?trade_limit=25&provider=polymarket"
+```
+
+### Response
+
+```json
+{
+  "wallet_address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "trades": [
+    {
+      "trade_id": "trd_9f2c3a1b",
+      "order_id": null,
+      "market_id": "0xabc123condition",
+      "market_name": "Will the Fed cut rates in September?",
+      "icon": "https://cdn.polymarket.com/markets/fed.png",
+      "token_id": "10723948572...4",
+      "outcome": "YES",
+      "side": "SELL",
+      "size": "25.0",
+      "price": "0.47",
+      "timestamp": "2026-07-20T09:14:02Z",
+      "tx_hash": "0xfeedface...beef",
+      "realized_pnl": "3.75",
+      "provider": "polymarket"
+    }
+  ],
+  "has_more": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | string \| null | Parent venue order identifier/hash shared by fills from the same order. Predict.fun uses its EIP-712 order hash; null when unavailable or for synthetic lifecycle rows. Not a Kairos order UUID. |
+| `side` | string | `BUY` or `SELL` |
+| `realized_pnl` | string \| null | Booked by this fill; populated for `SELL`s from the FIFO ledger, `null`/`0` for `BUY`s |
+| `price` | string | Fill price, 0–1 scale |
+| `size` | string | Shares filled, not USD |
+| `market_name` / `icon` / `outcome` / `tx_hash` | string \| null | `null` when unavailable for the fill |
+
+**This endpoint skips the positions/inventory scan** the full profile build does, so it stays
+fast even for high-frequency wallets.
+
+Responses are cached publicly for 15 seconds (`stale-while-revalidate=30`); the service also
+caches per (`provider`, `trade_limit`, `trade_offset`) in Redis for 30 seconds.
+
+## Profile search
+
+```
+GET /search-traders
+```
+
+Look up a trader's public profile by address. The only authenticated endpoint on this page.
+
+**Auth:** API key, JWT, or `X-Admin-Secret` (no scope). **Rate limit:** `heavy` group,
+10 requests/minute (keyed by authenticated user id when a JWT session is present, otherwise
+by trusted client IP). Live upstream profile fetch — not served from a local cache.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `address` | string | Yes | — | Non-empty. Wallet address to search. |
+| `provider` | string | No | — | A registered provider. Venue override. |
+
+```bash
+curl "https://data.kairos.trade/search-traders?address=0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Every `0x` address auto-detects as Polymarket** — pass `provider` explicitly for other EVM
+venues (Opinion, predict.fun). Solana addresses auto-detect as Kalshi. Non-Polymarket venues
+currently return a synthetic, service-generated profile rather than a live upstream fetch.
+
+### Response
+
+```json
+{
+  "provider": "polymarket",
+  "address": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "profile": {
+    "proxyWallet": "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+    "name": "Jane Trader",
+    "pseudonym": "QuietFalcon-2201",
+    "bio": "Macro and elections.",
+    "profileImage": "https://cdn.polymarket.com/avatars/jane.png",
+    "xUsername": "janetrades",
+    "verifiedBadge": true,
+    "displayUsernamePublic": true,
+    "createdAt": "2023-11-02T18:20:44Z",
+    "users": [
+      { "id": "usr_polymarket_884211", "creator": false, "mod": false }
+    ]
+  },
+  "error": null
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `profile` | object \| null | `null` when the provider found no profile for the address |
+| `error` | string \| null | Kairos-generated explanation when `profile` is `null` |
+| `profile.users` | array | Associated Polymarket user records (e.g. multi-role accounts) |
+
+An address with an unrecognized format returns `200` with `profile: null` and
+an explanatory `error`. A blank `address` still returns `400`.
+
+## Migration from removed profile routes
+
+The former `/trader-stats/profile/{wallet_address}`,
+`/trader-stats/category-breakdown/{wallet_address}`, and
+`/trader-stats/refresh/{wallet_address}` routes are no longer registered.
+Replace a profile request with parallel calls to the current positions, trades,
+and PnL-history endpoints. There is no public force-refresh operation; use the
+cache headers above.
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`, except the rate limiter's `429`, which
+uses `{ "error": "Rate limit exceeded: <limit>" }` plus `X-RateLimit-*` and `Retry-After`
+headers.
+
+The three `/trader-stats/*` routes take no credentials at all, so they never return `401` or
+`403`. Only `GET /search-traders` is authenticated.
+
+The Code column holds the exact `detail` string where this page documents one, otherwise `—`.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 400 | `Invalid wallet address format: ...` | Malformed `wallet_address` on `/trader-stats/*`, a `provider` that is not a registered venue, or a blank/whitespace `address` on `/search-traders` | Fix the parameter and resend — deterministic, retrying unchanged returns the same error. The address must be a 42-char `0x` EVM address or a Solana base58 address. |
+| 401 | — | `/search-traders` only — missing/invalid credentials, a partial API-key triple, or an `X-Admin-Secret` that fails verification and falls through to JWT auth | Send a JWT, all three API-key headers together, or a valid admin secret. |
+| 403 | `Invite required` | `/search-traders` only — the JWT caller has not passed the invite gate (API-key and admin callers bypass this) | Do not retry — the session needs an invite while invite-only mode is on. |
+| 422 | — | Schema validation failure: `time_range` outside `1D`/`1W`/`1M`/`ALL`, `status` outside `all`/`open`/`closed`, `limit`/`trade_limit`/`offset` out of range, or `address` omitted entirely on `/search-traders` | Fix the parameter and resend — deterministic, retrying unchanged returns the same error. |
+| 429 | `Rate limit exceeded: <limit>` | `heavy` group, 10/minute on `/trader-stats/*` and `/search-traders` (IP-keyed on the public trader-stats routes; user-or-IP on `/search-traders`) | Back off and retry; `Retry-After` says how long. Cache-control headers on the successful responses let you reuse a result instead of re-polling. |
+| 500 | `Error fetching PnL history` / `Error fetching trader positions` / `Error fetching trader trades` | `/trader-stats/*` — every backend failure (ClickHouse, Redis, metadata cache, upstream) is collapsed into this one status; these routes never return `502` or `503` | Report to support with the response body. The status does not tell you whether the failure was transient, so do not treat it as a definitive "no data". |
+| 500 | `An internal error occurred. Please try again later.` | Unhandled exception on `/search-traders` | Report to support with the response body. |
+| 502 | `Provider error: ...` | `/search-traders` only — the upstream profile fetch fails | Safe to retry; the failure is upstream, not in your request. |

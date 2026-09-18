@@ -1,0 +1,472 @@
+---
+title: "Markets, Resolutions & Marks"
+description: "Market metadata, token resolution, on-chain settlements, and latest prices"
+---
+
+Everything you need to identify a market before you chart or trade it: full
+metadata, batch lookup, venue-identifier resolution, catalog enumeration,
+settlement outcomes, the resolution lifecycle, and last traded prices.
+
+Most integrations start with [Identifier resolution](#identifier-resolution)
+(turn a venue ticker or token id into a Kairos `market_id`), then
+[Market metadata](#market-metadata) (get the outcomes and their `token_id`s).
+
+All endpoints on this page work anonymously on the
+[free tier](/market-data/authentication); add API-key headers for
+production budgets.
+
+## Market metadata
+
+```
+GET /v1/markets/{provider}/{market_id}
+```
+
+Full metadata for one market — title, status, outcomes with their token ids,
+[condition id](/learn/glossary), tick size, fees, imagery.
+
+**Auth:** none required. `light` bucket, 1 unit.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | Path segment. `kalshi`, `polymarket`, `predictfun`, `hyperliquid`; `opinion` for historical reads |
+| `market_id` | string | yes | — | Path segment. The provider's market identifier |
+
+### Example
+
+```bash
+curl https://md.kairos.trade/v1/markets/polymarket/1897067
+```
+
+### Response
+
+```json
+{
+  "exchange_id": "polymarket",
+  "market_id": "1897067",
+  "condition_id": "0x…",
+  "title": "…",
+  "neg_risk": false,
+  "tick_size": 0.01,
+  "status": "active",
+  "end_date": "…",
+  "outcomes": [
+    { "outcome": "Yes", "normalized_outcome": "yes", "token_id": "77891…" },
+    { "outcome": "No",  "normalized_outcome": "no",  "token_id": "50174…" }
+  ]
+}
+```
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `304` | — | `If-None-Match` matched | Reuse your cached body |
+| `400` | `invalid_request` | Unknown `provider` | Use a supported provider slug |
+| `404` | `not_found` | The market does not exist | Confirm the id with [Identifier resolution](#identifier-resolution) |
+| `502` | `upstream` | The metadata cache answered with an unexpected status | Retry with backoff |
+| `503` | `cache_cold` | The metadata cache is still warming | Retry after `Retry-After: 5` |
+| `503` | `unavailable` | No metadata cache is configured for this deployment | Do not retry-loop; this will not resolve on its own |
+
+## Batch metadata
+
+```
+POST /v1/markets/batch
+```
+
+The same metadata for up to 200 markets of **one** provider, in one round trip.
+
+**Auth:** none required. `light` bucket, flat 1 unit whatever the batch size.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | One provider for the whole call |
+| `market_ids` | array of string | yes | — | 1–200 market identifiers |
+
+### Example
+
+```bash
+curl -X POST https://md.kairos.trade/v1/markets/batch \
+  -H "Content-Type: application/json" \
+  -d '{ "provider": "polymarket", "market_ids": ["1897067", "1961527"] }'
+```
+
+### Response
+
+```json
+{
+  "exchange_id": "polymarket",
+  "markets": { "1897067": { … }, "1961527": { … } },
+  "misses": []
+}
+```
+
+<Note>
+**Ids that could not be found are listed in `misses`, not raised as errors.**
+A batch where nothing resolved is still a `200`. Check `misses` explicitly.
+</Note>
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | Unknown `provider`; missing or oversized `market_ids` | Split into calls of at most 200 ids, one provider each |
+| `502` / `503` | `upstream`, `cache_cold`, `unavailable` | As for single metadata, above | Same remediation |
+
+The response is `Cache-Control: no-store`, so it never `304`s.
+
+## Identifier resolution
+
+```
+POST /v1/market-identifiers/resolve
+```
+
+Resolves up to 200 venue-specific identifiers — tickers, market ids,
+condition-like ids, outcome token ids — to canonical Kairos market ids. Use
+this when you hold an id from a venue and need the id this API expects. The
+request may mix providers.
+
+**Auth:** none required. `light` bucket, **1 unit per submitted item**.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `requests` | array | yes | — | 1–200 items |
+| `requests[].provider` | string | yes | — | Provider for this item; echoed back exactly as submitted, not canonicalized |
+| `requests[].identifier` | string | yes | — | The venue identifier to resolve. Must be non-empty |
+| `requests[].scope` | string | yes | — | `market` for market-level identifiers (tickers, market ids, condition-like ids); `outcome` for an identifier representing one outcome |
+
+Scopes apply consistently to both on-chain and off-chain exchanges.
+
+### Example
+
+```bash
+curl -X POST https://md.kairos.trade/v1/market-identifiers/resolve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      { "provider": "polymarket", "identifier": "77891…", "scope": "market" },
+      { "provider": "polymarket", "identifier": "77891…", "scope": "outcome" },
+      { "provider": "kalshi", "identifier": "KXBTC-26JUL", "scope": "market" }
+    ]
+  }'
+```
+
+### Response
+
+```json
+{
+  "results": [
+    {
+      "provider": "polymarket",
+      "identifier": "77891…",
+      "scope": "market",
+      "found": false,
+      "market_id": null
+    },
+    {
+      "provider": "polymarket",
+      "identifier": "77891…",
+      "scope": "outcome",
+      "found": true,
+      "market_id": "1897067"
+    },
+    {
+      "provider": "kalshi",
+      "identifier": "KXBTC-26JUL",
+      "scope": "market",
+      "found": true,
+      "market_id": "KXBTC-26JUL"
+    }
+  ]
+}
+```
+
+Results preserve request order. Unresolved identifiers return `found: false`
+and `market_id: null`, so callers never need to correlate separate hit and
+miss collections.
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | A bad `scope`, an empty `identifier`, a missing or oversized `requests` array | The message carries the failing index — e.g. `requests[2].scope must be market or outcome`. Validation stops at the first bad item, so fix it and resend to see any others |
+
+### Notes
+
+> **A rejected batch still costs its full size.** The charge is 1 unit per
+> submitted item, applied as soon as the array length is known — *before* any
+> per-item validation. A 200-item batch rejected for one bad `scope` costs 200
+> units. Validate your `scope` values client-side.
+
+> **When you don't know which shape you hold, submit it under both scopes.**
+> Put the identifier in the same batch once with `scope: "market"` and once
+> with `scope: "outcome"`, then use whichever came back `found`. If the two
+> scopes return *different* market ids, treat the input as ambiguous rather
+> than picking one.
+
+Unlike [Batch metadata](#batch-metadata), which is a flat 1 unit, this
+endpoint scales with batch size. The response is not ETagged.
+
+## Enumeration
+
+```
+GET /v1/markets
+```
+
+Pages through a provider's active markets.
+
+**Auth:** none required. `light` bucket, 1 unit.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | Provider whose catalog to page |
+| `limit` | integer | no | `100` | Page size, 1–250 |
+| `cursor` | string | no | — | The `next_cursor` from the previous page |
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/markets \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "limit=250"
+```
+
+Follow `next_cursor` while `has_more` is true.
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `304` | — | `If-None-Match` matched | Reuse your cached body |
+| `400` | `invalid_request` | Unknown `provider`; `limit` outside 1–250 | Fix the parameter and resend |
+| `503` | `cache_cold` | The provider's listing has not been populated yet | Retry after `Retry-After: 5` |
+| `503` | `unavailable` | No metadata cache is configured for this deployment | Do not retry-loop |
+
+## Settled outcomes
+
+```
+GET /v1/resolutions
+```
+
+The settlement outcome for resolved markets, for **any** registered provider —
+not Polymarket only.
+
+**Auth:** none required. `light` bucket, 1 unit.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | Provider for every id in the call |
+| `market_ids` | string | yes | — | Comma-separated, up to 200 ids |
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/resolutions \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "market_ids=1897067,1961527"
+```
+
+### Response
+
+```json
+{ "resolutions": { "1897067": 1.0, "1961527": 0.0 } }
+```
+
+The value is the YES payout fraction — `1.0` YES won, `0.0` NO won, `0.5`
+split. Scalar/range markets with no payout vector report the venue's settled
+value instead.
+
+<Note>
+**Markets that haven't resolved are omitted from the map.** Treat a missing
+key as "not settled yet", not as an error. A response of
+`{"resolutions": {}}` means none of your ids have settled.
+</Note>
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `304` | — | `If-None-Match` matched | Reuse your cached body |
+| `400` | `invalid_request` | Unknown `provider`; missing or oversized `market_ids` | Send at most 200 ids per call |
+| `500` | `internal` | The resolutions query failed | Retry with backoff |
+
+### Notes
+
+The lookup is keyed differently per venue: Kalshi tickers identify the market
+directly, while CTF venues (`polymarket`, `predictfun`, `opinion`) are joined
+to their on-chain condition id first.
+
+## Resolution lifecycle
+
+Where `/v1/resolutions` answers "did it settle, and how", these two answer
+"where is it in the process". Both take the same `{provider}/{market_id}` path
+as [Market metadata](#market-metadata).
+
+**Auth:** none required. `light` bucket, 1 unit each.
+
+### Current state
+
+```
+GET /v1/markets/{provider}/{market_id}/resolution
+```
+
+Status, the UMA-style proposal/dispute metadata, and — once resolved — the
+payout numerators.
+
+```bash
+curl https://md.kairos.trade/v1/markets/polymarket/1897067/resolution
+```
+
+```json
+{
+  "provider": "polymarket",
+  "market_id": "1897067",
+  "condition_id": "0x…",
+  "status": "proposed",
+  "proposed_price": 1.0,
+  "proposed_at": "2026-07-15T09:30:00+00:00",
+  "challenge_window_ends_at": "2026-07-15T11:30:00+00:00",
+  "proposer": "0x…",
+  "disputer": "",
+  "dispute_count": 0,
+  "reset_count": 0,
+  "payout_numerators": [],
+  "resolved_ts": null,
+  "last_event_ts": "2026-07-15T09:30:00+00:00"
+}
+```
+
+Proposals move through a roughly two-hour challenge window, so this response
+is only cached for a short period — long enough to absorb polling, short
+enough not to report a disputed market as still merely proposed.
+
+### Event timeline
+
+```
+GET /v1/markets/{provider}/{market_id}/resolution/events
+```
+
+The append-only timeline behind that state, oldest first, capped at 200 events.
+
+```bash
+curl https://md.kairos.trade/v1/markets/polymarket/1897067/resolution/events
+```
+
+```json
+{
+  "provider": "polymarket",
+  "market_id": "1897067",
+  "market_key": "0x…",
+  "events": [
+    { "event_type": "proposed", "source": "polygon",
+      "event_ts": "2026-07-15T09:30:00+00:00", "price_norm": 1.0,
+      "proposer": "0x…", "bond": "500000000000", "reward": "5000000",
+      "expiration_ts": "2026-07-15T11:30:00+00:00",
+      "tx_hash": "0x…", "block_number": 74812339 }
+  ]
+}
+```
+
+`market_key` is the key the events were actually queried under — the ticker
+for Kalshi, the resolved condition id for CTF venues.
+
+<Note>
+**Optional fields are omitted entirely when unset, not sent as `null`.** Use
+key presence, not a null check, when decoding events.
+</Note>
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `304` | — | `If-None-Match` matched | Reuse your cached body |
+| `400` | `invalid_request` | Unknown `provider` | Use a supported provider slug |
+| `404` | `not_found` | The market has no resolution state. For CTF venues this includes "no condition id mapping was found" | Not an error condition for an unproposed market — treat it as "no lifecycle yet" |
+| `500` | `internal` | The lifecycle query failed | Retry with backoff |
+
+## Last traded prices (marks)
+
+```
+GET /v1/marks
+```
+
+The **last traded price** per `(contract_id, token_id)` pair. A mark moves only
+when a new trade executes.
+
+**Auth:** none required. `heavy` bucket, 1 unit per started 100 pairs (so 2 at
+the 200-pair cap).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | Provider for every pair in the call |
+| `pairs` | string | yes | — | Comma-separated `contract_id:token_id` pairs, up to 200. Both halves of each pair must be non-empty |
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/marks \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "pairs=1897067:77891…,1961527:50174…"
+```
+
+### Response
+
+```json
+{
+  "marks": [
+    { "contract_id": "1897067", "token_id": "77891…", "price": 35 }
+  ]
+}
+```
+
+Prices are on the 0–100 scale.
+
+<Warning>
+**Pairs that have never traded are omitted.** Treat absence as "no trade
+history", not as an error.
+</Warning>
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | Unknown `provider`; missing or oversized `pairs`; a malformed pair | Each pair must be exactly `contract_id:token_id` with both halves non-empty; send at most 200 |
+| `500` | `internal` | The marks query failed | Retry with backoff |
+
+### Notes
+
+<Warning>
+**Do not poll this endpoint for real-time prices.** It draws on the `heavy`
+bucket and is explicitly uncacheable (`Cache-Control: no-store`, no ETag, so
+never a `304`). For live updates use the
+[WebSocket API](/websocket/market-data-websocket).
+</Warning>
+
+## Caching summary
+
+Which responses on this page are ETagged and can return `304` on
+`If-None-Match`:
+
+| Endpoint | ETagged |
+|---|---|
+| `GET /v1/markets/{provider}/{market_id}` | Yes |
+| `GET /v1/markets` (enumeration) | Yes |
+| `GET /v1/resolutions` | Yes |
+| `GET /v1/markets/…/resolution`, `…/resolution/events` | Yes |
+| `POST /v1/markets/batch` | No — `no-store` |
+| `POST /v1/market-identifiers/resolve` | No |
+| `GET /v1/marks` | No — `no-store` |
+
+Shared `401` / `403` / `429` behavior is on the
+[Authentication](/market-data/authentication#errors) page.
