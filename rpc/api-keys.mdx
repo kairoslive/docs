@@ -1,0 +1,289 @@
+---
+title: "API Keys"
+description: "Programmatic authentication for the Kairos RPC server"
+---
+
+Kairos issues **API keys** (the `kairos_ck_...` triples) for users who need to call the platform from scripts, bots, or other non-browser clients. This page covers what a credential looks like, what each scope unlocks, which procedures are reachable, and how the auth errors are distinguished — read it before your first authenticated call.
+
+One key authenticates to both:
+
+- The **order execution service** at `https://execution.kairos.trade/` (submit / cancel / query orders).
+- The **RPC server** at `https://rpc.kairos.trade/api/rpc/` for a curated subset of read and trading procedures.
+
+API keys are a deliberately narrow auth path with a curated allowlist — they cannot create wallets, move funds, manage copy-trading subscriptions, or perform other high-risk account operations. Those remain available only through the web app. Access is opt-in per procedure and defaults to closed, so a newly added procedure is never programmatically reachable until someone explicitly allowlists it.
+
+## Credential format
+
+A credential is a three-tuple handed out once at creation time. Lose it and you can't recover it — create a new one.
+
+| Field | Format | Example |
+|---|---|---|
+| `clientId` | `kairos_ck_` + 24 hex chars | `kairos_ck_4f2a...b091` |
+| `apiKey` | 64 hex chars | `8d4b9c2e5a7f...` |
+| `clientSecret` | 64 hex chars | `1e7d3f6a9b2c...` |
+
+All three must be included on every authenticated request as HTTP headers:
+
+```
+X-Client-Id:  kairos_ck_...
+X-Api-Key:    <64-char hex>
+X-Api-Secret: <64-char hex>
+```
+
+The server stores SHA-256 hashes of the key and secret and compares them in constant time — both comparisons run even when the first fails, so response timing doesn't reveal which field was wrong. Plaintext values are never persisted.
+
+Credentials **do not expire**. There is no TTL or expiry date on a credential; it stays valid until it is revoked, or until the owning account is deleted or suspended (either of which makes every one of that user's keys fail authentication immediately).
+
+> **Gotcha: send only the API-key headers.** Authenticate with
+> `X-Client-Id` / `X-Api-Key` / `X-Api-Secret` alone. When any of the three
+> `X-Api-*` headers is present the server authenticates on them exclusively and
+> will not fall back to a cookie or `Authorization` JWT, so a malformed key
+> header fails authentication outright. If your HTTP client injects an
+> `Authorization` header automatically, disable it for these requests.
+
+> **CSRF is not required.** CSRF protects against browsers auto-attaching
+> cookies to cross-site requests. API keys live in explicit `X-Api-*` headers
+> that browsers never add automatically, so the RPC server skips the CSRF check
+> when a request authenticates via API key.
+
+## Quick start — Python httpx
+
+```python
+import httpx, json
+
+HEADERS = {
+    "X-Client-Id":  "kairos_ck_...",
+    "X-Api-Key":    "...",
+    "X-Api-Secret": "...",
+}
+
+async def list_open_positions():
+    payload = {"json": {"onlyOpen": True, "limit": 100}}
+    async with httpx.AsyncClient(timeout=10, headers=HEADERS) as client:
+        r = await client.get(
+            "https://rpc.kairos.trade/api/rpc/positions.getPositions",
+            params={"input": json.dumps(payload, separators=(",", ":"))},
+        )
+        r.raise_for_status()
+        return r.json()["result"]["data"]["positions"]
+```
+
+The same three headers work against the order execution service:
+
+```bash
+curl -X POST "https://execution.kairos.trade/orders" \
+  -H "X-Client-Id:  kairos_ck_..." \
+  -H "X-Api-Key:    ..." \
+  -H "X-Api-Secret: ..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "exchange_id": "polymarket",
+    "market_id":   "1500754",
+    "token_id":    "34215103...",
+    "side":        "SELL",
+    "kind":        "market",
+    "quantity":    0.010766,
+    "price":       0.44
+  }'
+```
+
+That call requires the `trade:execute` scope.
+
+<Note>
+**Gotcha: the two services use different field casing.** Order execution
+request bodies are **snake_case**, not the camelCase used by RPC payloads —
+`exchange_id`, `market_id`, `token_id`, `kind` (not `orderType`), `quantity`
+(not `size`). A field mismatch (e.g. sending `marketId` instead of
+`market_id`) fails with a plain deserialization `400`, not a helpful
+validation error — double check the payload shape if you get an unexpected
+400.
+</Note>
+
+## Scopes
+
+Every credential carries a `scopes` list. RPC matching accepts exact scopes
+and `*`; additionally, `position:read` and `trade:read` satisfy an RPC `read`
+requirement, while `trade:execute` satisfies RPC `trade`. These relationships
+are one-way. Order execution requires the exact scope and does not treat `*`
+as a wildcard.
+
+Only three scopes are actually **issuable**: `position:read`, `trade:read`, and `trade:execute`. The bare `read` / `trade` names below are the *requirements* procedures declare, not values you can be granted; `*` is a legacy wildcard the server still honours but the issuing flow does not hand out.
+
+| Scope | Issuable | Service | Grants |
+|---|---|---|---|
+| `read` | no — requirement name only | RPC server | General read-only queries: markets, fees, rewards, referrals, invites, geo, feature flags, account metadata, wallet list/transactions, deposit-bridge reads. Satisfied by `position:read` or `trade:read`. |
+| `position:read` | **yes** | RPC server | Position-, portfolio-, and balance-sensitive reads: positions, portfolio summaries, `wallet.getPortfolio`, wallet balances, PnL, copy-trading subscriptions/open-positions. Also satisfies every `read` procedure. |
+| `trade:read` | **yes** | RPC server + order execution | Order/fill history: `orders.getChartFills` and `copytrading.traderFeed` on the RPC server; `GET /orders`, `GET /orders/{id}`, `GET /orders/fee-quote` on the order execution service. Also satisfies every `read` procedure. |
+| `trade` | no — requirement name only | RPC server | `positions.closePosition` only — derives close-order parameters. Satisfied by `trade:execute`. |
+| `trade:execute` | **yes** | RPC server + order execution | Satisfies RPC `trade` (including `positions.closePosition`) and authorizes supported execution mutations such as order submission/cancellation, redeem, and CTF split/merge. |
+| `*` | legacy | RPC server | Wildcard — satisfies any RPC scope requirement. Order execution does not recognize it. |
+
+Because the two services grew their scope checks independently, the naming isn't uniform — the RPC server uses bare `read`/`trade` for most of its own procedures but issues only the colon-namespaced `position:read` / `trade:read` / `trade:execute`. The inheritance above is what bridges them.
+
+<Warning>
+**Gotcha: inheritance is strictly one-way.** `position:read` grants `read`,
+but `read` never grants `position:read`. A key carrying only `trade:execute`
+gets `403 FORBIDDEN` calling `positions.getPositions`. Ask whoever issued
+your credential which scopes it carries and make sure it holds every scope
+your integration needs.
+</Warning>
+
+## Platform access
+
+Passing a scope check does not guarantee access to every provider. Kairos can
+disable API-key access to a provider independently of its browser/JWT
+availability. Selected RPC procedures explicitly enforce this gate, as do
+provider-scoped order execution requests; `kalshi_offchain` is checked as
+`kalshi`.
+
+For RPC calls, a disabled provider returns `403 FORBIDDEN` with `API access is disabled for <provider>`. A settings lookup failure returns `500 INTERNAL_SERVER_ERROR` with `Unable to verify platform API access`.
+
+<Note>
+**Gotcha: an aggregating procedure fails as a whole if any provider it
+touches is disabled.** An unfiltered `positions.getPositions` or
+`balances.getAllBalances` request may check several providers at once. Add
+the narrowest available provider or chain filter when you only need one
+venue.
+</Note>
+
+Order execution uses a separate error envelope: a disabled provider returns `403` with `error_details.code: "AUTH_INSUFFICIENT_SCOPE"`, while an unavailable access check returns `503` with code `"INTERNAL_ERROR"`. Some status-only endpoints omit the structured body. This provider gate is distinct from the execution killswitch: platform access affects API-key clients only, while an execution killswitch blocks new order submission for all callers. See [REST authentication](/guides/authentication#platform-access) for the cross-API behavior.
+
+## What's allowed
+
+### `read` — general queries (RPC server)
+
+- `markets.getMarkets`, `getAllMarkets`, `getMarketsPage`, `getTokenOutcome`, `getTrendingMarkets`, `getTrendingItems`
+- `polymarket.getMarkets`, `hasCredentials`, `getWalletInfo`
+- `exchange.getActiveExchanges`, `hasCredentials`
+- `combo.getComboMarkets`
+- `perpetuals.venues`
+- `txodds.listFixtures`, `getFixture`, `getFixtureTimeseries`
+- `lpRewards.getMyRewards`
+- `infra.executionManifest`
+- `wallet.list`, `wallet.getForChain`
+- `walletTransactions.list`, `getRecent`, `getStats`, `getById`
+- `deposit.polymarketBridge`, `polymarketBridgeSupportedAssets`, `polymarketBridgeQuote`, `polymarketBridgeStatus`, `evmWalletBalances`
+- `auth.me`, `user.getMe`, `user.getKalshiExecutionMode`
+- `trading.getStatus`, `trading.getKairosPublicKey`
+- `fees.getUserTier`, `getUserVolumeMetrics`, `getFeeTiers`
+- `rewards.getMyPoints`, `getMyHistory`, `getMyBreakdown`
+- `referrals.getMyStats`, `getLeaderboard`, `getShareLink`, `getMyReferrer`, `getMyInvitees`
+- `tournaments.getActive`, `competitions.getActive`, `getLeaderboard`, `getRankEvents`
+- `invites.listMine`, `getAllocation`, `getVolumeProgress`
+- `geo.getMyCountry`, `checkAccess`, `checkAccessBulk`
+- `featureFlags.get`, `getMany`
+
+### `position:read` — position/portfolio/balance queries (RPC server)
+
+- `positions.getPositions` — authoritative current holdings
+- `positions.getPosition`
+- `wallet.getPortfolio` — unified personal + trading-account portfolio view
+- `wallet.discoverTokens`
+- `portfolio.getSummary`, `getActivity`, `getChartData`, `getDailyPnLBreakdown`, `getSettlements`
+- `balances.getWalletBalances`, `getAllBalances`, `getGasEstimate`, `getBalanceForAddress`
+- `polymarket.getEoaBalances`, `getSafeBalances`
+- `combo.getComboHistory`
+- `pnl.getPnL`
+- `copytrading.listSubscriptions`, `allOpenPositions`, `subscriptionOpenPositions`
+
+### `trade:read` — order/fill history
+
+- `orders.getChartFills` (RPC server)
+- `copytrading.traderFeed` (RPC server) — grouped with the queries above by feature, but gated on `trade:read`, not `position:read`
+- `GET /orders`, `GET /orders/{order_id}`, `GET /orders/fee-quote` (order execution service, `execution.kairos.trade`)
+
+### `trade` — the one RPC trade mutation
+
+- `positions.closePosition` — derives close-order parameters for a specific position. See [Positions](/rpc/positions#positionscloseposition).
+
+### `trade:execute` — execution mutations
+
+**Order submission and cancellation are not RPC procedures.** They are REST endpoints on the order execution service, authenticated with the same three headers:
+
+- `POST /orders` — submit a market or limit order
+- `POST /orders/{order_id}/cancel` — cancel one order
+- `POST /orders/cancel-all` — cancel every open order on an exchange (optionally scoped to one `market_id`)
+- `POST /orders/cancel-batch` — cancel a specific set of orders in one call
+
+Other order-execution handlers explicitly accept `trade:execute`, including
+supported redeem and CTF split/merge flows. Treat the endpoint's documented
+scope as authoritative; API-key mutation access is allowlisted, not inferred
+from the HTTP method.
+
+## What's NOT allowed
+
+A number of high-risk or account-lifecycle operations are only reachable via the web app. Calling any of these with an API key returns `403 Forbidden`:
+
+- **Session / credential lifecycle** — issuing, revoking, or listing session tokens; enabling or revoking exchange credentials.
+- **Wallet lifecycle** — creating, renaming, or managing the underlying custodial wallets.
+- **Profile changes** — updating username, display name, execution-mode preferences, or any other profile fields.
+- **Position maintenance** — `positions.recalculatePosition`, `updatePosition`, `backfillPositions`, `syncFromPolymarket`, `syncFromPredictfun`, and the order-reconciliation mutations (`orders.reconcilePolymarketFills`, `orders.backfillTrades`).
+- **Copy-trade subscription management** — `copytrading.createSubscription`, `updateSubscription`, `pauseSubscription`, `resumeSubscription`, `cancelSubscription`, `followTrader`, and the `bulk*` variants. (Reading subscription state is allowed.)
+- **Fund movement** — `wallet.transfer` and the Hyperliquid deposit / transfer / withdraw prepare+submit pairs.
+- **Invites, referrals, notifications, and integrations** — managing invites, linking third-party accounts (Telegram, Discord), creating support tickets, saved layouts, favorites, or banners.
+
+If you have a use case that needs programmatic access to something in this list, reach out through Kairos support — the right answer is usually a new purpose-built endpoint with its own narrow scope, not a broader API key.
+
+## IP whitelisting
+
+A credential can optionally be pinned to a specific source IP (or list of IPs). When a whitelist is set, requests from any other IP return `403 Forbidden` (`Source IP is not in the credential's whitelist`). An empty whitelist means no IP restriction.
+
+Matching is an **exact string comparison** against the *last* `X-Forwarded-For` hop — the entry the load balancer appends, which a caller cannot forge because spoofed entries can only be prepended. CIDR ranges are not supported: list each address individually. The check runs on every request and is never cached.
+
+If your bot runs on a floating IP (residential cloud, CI/CD pipeline, etc.), ask the issuer to leave the whitelist empty. Empty = no restriction.
+
+## Rate limits
+
+Rate-limit buckets are keyed on the **credential ID**, not on the owning user. Two credentials belonging to the same user get independent budgets, and a per-key override applies to exactly one window.
+
+Server defaults (per minute), all overridable per deployment and per credential:
+
+| Bucket | Default cap |
+|---|---|
+| `queries` | 3600 |
+| `mutations` | 1800 |
+| `expensive` | 600 |
+| `auth` | 300 |
+| `public` | 30 |
+| `balances_agg` (`balances.getAllBalances` only) | 30 |
+
+A credential can carry absolute per-bucket overrides (`rpc.public` / `rpc.auth` / `rpc.mutations` / `rpc.queries` / `rpc.expensive`), plus separate budgets for order submission, the data API, websockets, and the market-data API. Ask the issuer what your key is set to.
+
+> **Gotcha: 429 responses carry no `Retry-After` header.** The delay is in the
+> error message — `Rate limit exceeded. Please retry in <N> seconds.`
+
+## Key rotation
+
+To rotate:
+1. Request a new credential from Kairos.
+2. Update your client to use the new `X-Api-Key` / `X-Api-Secret`.
+3. Verify requests succeed.
+4. Have Kairos revoke the old credential (sets `status='revoked'`).
+
+Revoked credentials fail with `401 Unauthorized` — there's no grace period. Revocation publishes a cache invalidation so every replica of every service drops the credential in near-real-time; if that pub/sub path is unavailable, passive expiry still bounds the window at the credential cache's TTLs (15 s in-process, 60 s in Redis). Plan rotations accordingly.
+
+There is also no "rotate in place" operation — a rotation is always *create new, then revoke old*, and the plaintext of the new credential is shown exactly once at creation.
+
+## Errors
+
+Every error is the standard tRPC envelope (`error.message`, `error.code`, `error.data.code`, `error.data.httpStatus`, `error.data.path`) — see [Overview](/rpc/overview#response-shape).
+
+| Status / code | When it happens | What to do |
+|---|---|---|
+| `200` | Success. | — |
+| `401` `UNAUTHORIZED` | `Invalid API credentials` — unknown `client_id`, hash mismatch on key or secret, revoked credential, or an owner account that is deleted or suspended. Also returned when *some* but not all three headers are present: a partial set is treated as a malformed key attempt, never as an anonymous request. | Fix or replace the credential triple. Don't retry the same one. |
+| `401` `UNAUTHORIZED` | `API key is no longer valid` — the credential authenticated but its owning user row no longer resolves. | Contact whoever issued the key; retrying won't help. |
+| `403` `FORBIDDEN` | `Source IP is not in the credential's whitelist` — the credential has a non-empty `ipWhitelist` and the request's trusted client IP isn't in it. | Call from a whitelisted IP, or ask the issuer to add it / clear the list. |
+| `403` `FORBIDDEN` | `This procedure does not accept API key authentication` — the procedure exists but isn't on the allowlist. | Use the web app for that operation, or ask for a purpose-built endpoint. |
+| `403` `FORBIDDEN` | `API key missing required scope: <scope>` — allowlisted, but your scopes don't satisfy the requirement. | Check the [scope table](#scopes) and request a key with that scope. |
+| `403` `FORBIDDEN` | `Admin procedures are not available via API key` — an admin/support/growth procedure. Never reachable with a key, and on the public instance it 404s instead. | Stop retrying; there is no key that unlocks these. |
+| `403` `FORBIDDEN` | `API access is disabled for <provider>` — the [platform gate](#platform-access). | Narrow the request to another provider, or wait for access to be re-enabled. |
+| `404` `NOT_FOUND` | `Procedure "<path>" not found` — unknown procedure. This bucket is separately rate limited per IP. | Fix the `<router>.<procedure>` path. |
+| `429` `TOO_MANY_REQUESTS` | `Rate limit exceeded. Please retry in <N> seconds.` | Sleep the number of seconds named in the message. There is no `Retry-After` header. |
+| `500` `INTERNAL_SERVER_ERROR` | `Authentication backend unavailable` — credential lookup (Postgres or the credential cache) failed. | Retry with backoff. |
+| `500` `INTERNAL_SERVER_ERROR` | `Unable to verify platform API access` — the platform-access settings lookup failed. | Retry with backoff. |
+| `500` `INTERNAL_SERVER_ERROR` | `Service temporarily unavailable. Please retry shortly.` — the rate limiter's Redis is unreachable and the server fails closed. | Retry with backoff. |
+
+Auth failures short-circuit with their own status rather than collapsing to a generic 401 — a whitelist block stays a 403, a backend outage stays a 500.
+
+401 and 403 are intentionally distinguished: 401 means "your credentials are wrong or revoked", 403 means "your credentials are fine but you cannot call this thing from here." Handle them differently in your client.

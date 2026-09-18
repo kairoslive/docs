@@ -1,0 +1,51 @@
+---
+title: "API Reference"
+sidebarTitle: "Overview"
+description: "Every public Kairos API in one place — REST, streaming, and OpenAPI-generated endpoint references across four services."
+---
+
+Kairos exposes four purpose-built API services. Each has its own base URL, but they share authentication, pagination, and error conventions.
+
+| API | Base URL | Auth | Purpose |
+| --- | --- | --- | --- |
+| **Market Data API** | `https://md.kairos.trade` | None | Free, key-free market data: markets, candles, trades, resolutions, perpetuals |
+| **Data API** | `https://data.kairos.trade` | API key or JWT | Markets, search, sports, trader analytics, PnL, discovery |
+| **Execution API** | `https://execution.kairos.trade` | API key or JWT | Order entry, cancellation, routing, combos, external signing |
+| **Agora Auction API** | `https://agora.kairos.trade` | API key or JWT | Private institutional auctions with firm quotes and a WebSocket event stream |
+
+<CardGroup cols={2}>
+  <Card title="Submit an order" icon="paper-plane" href="/rest/orders">
+    The exact request shape, status semantics, and error codes for the custodial order lane.
+  </Card>
+  <Card title="Stream market data" icon="bolt" href="/websocket/market-data-websocket">
+    Real-time orderbooks, trades, and prices over WebSocket with protobuf encoding.
+  </Card>
+  <Card title="Fees and fee quotes" icon="receipt" href="/trading/fees">
+    Platform tiers, per-venue exchange fees, and the live fee-quote endpoint.
+  </Card>
+  <Card title="Get an API key" icon="key" href="/guides/authentication">
+    API keys, JWTs, and scopes for the Data and Execution APIs.
+  </Card>
+</CardGroup>
+
+## Machine-readable specifications
+
+Every public API is described by an OpenAPI 3.1 specification. The copies below power the auto-generated endpoint references in this section; download them to generate clients or feed your own tooling.
+
+| Spec | Service |
+| --- | --- |
+| [market-data-api.yaml](/openapi/market-data-api.yaml) | Market Data API (`md.kairos.trade`) |
+| [data-api.yaml](/openapi/data-api.yaml) | Data API (`data.kairos.trade`) |
+| [execution.yaml](/openapi/execution.yaml) | Execution API (`execution.kairos.trade`) |
+| [agora.yaml](/openapi/agora.yaml) | Agora Auction House (`agora.kairos.trade`) |
+
+<Note>
+  WebSocket surfaces are described separately with AsyncAPI. See the [WebSocket](/websocket/market-data-websocket) section for the wire contracts and [Protobuf Schema](/websocket/protobuf-reference) for the generated message definitions.
+</Note>
+
+## Conventions
+
+- **Authentication** — the Market Data API is anonymous and free. The Data, Execution, and Agora APIs accept a Kairos API key (`X-Client-Id`, `X-Api-Key`, `X-Api-Secret`) or a session JWT, gated per-operation by scopes. See [Authentication](/guides/authentication).
+- **Pagination** — cursor-based. Responses carry an opaque `nextCursor`; pass it back to fetch the next page.
+- **Errors** — standard HTTP status codes with a JSON body. `401` means missing or invalid credentials, `403` means the credential lacks the required scope, and `429` means a rate limit was hit.
+- **Rate limits** — per-IP on the free tier and per-key on authenticated tiers. Honor `429` with exponential backoff.

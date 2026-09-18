@@ -1,0 +1,235 @@
+---
+title: "Instruments and identity"
+description: "Stable identifiers, symbols, asset roles, and contract units"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, enabled in production and staging today; a
+deployment with the flag off returns `404` for every perpetual route. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+How a perpetual instrument is identified, which asset plays which role, and
+what happens when you name an instrument that does not exist. Read this before
+you key any storage or join any two perpetual feeds.
+
+A symbol such as `BTC`, `BTC-PERP`, or `xyz:BTC` is **not** a primary key. It
+is a display label that can change. Identity is the canonical instrument id
+plus the venue, environment, and integration that scope it.
+
+<Note>
+**Beta:** The full public `InstrumentRef` is carried by every v2 perpetual
+book. Private account and execution identities remain outside the public
+market-data beta.
+</Note>
+
+## Instrument reference
+
+Every public and private record carries an instrument reference. These are the
+field names of `kairos.v2.InstrumentRef`, carried on every v2 book snapshot:
+
+| Field | Meaning |
+| --- | --- |
+| `provider` | Normalized venue family (`kairos.v1.Provider` enum) |
+| `instrument_id` | Stable Kairos identifier |
+| `venue_instrument_id` | Exact identifier required by the venue |
+| `display_symbol` | Current human-readable label; not stable identity |
+| `instrument_type` | `INSTRUMENT_TYPE_PERPETUAL` for every record here |
+| `base_asset_id` | Asset whose exposure the contract represents |
+| `quote_asset_id` | Asset used to express price |
+| `collateral_asset_id` | Asset securing the position |
+| `settlement_asset_id` | Asset in which settlement or PnL is realized; optional |
+| `native_quantity_unit` | `QUANTITY_UNIT_BASE_ASSET` or `QUANTITY_UNIT_CONTRACTS` |
+| `environment` | Production, test, or another explicit venue environment |
+| `integration_id` | Credential and routing boundary where required |
+
+An integration and environment are part of identity. Test and production data,
+or two independently configured venue connections, must never collide.
+
+### What the gateway refuses
+
+The public gateway drops a snapshot whose:
+
+- `instrument_type` is not `INSTRUMENT_TYPE_PERPETUAL`
+- `native_quantity_unit` is neither `BASE_ASSET` nor `CONTRACTS`
+- `venue_instrument_id`, `display_symbol`, `base_asset_id`, `quote_asset_id`,
+  `collateral_asset_id`, `environment`, or `integration_id` is empty
+
+`settlement_asset_id` is the one asset role the schema marks optional and the
+gateway does not require.
+
+> **The rejection is silent.** An invalid message is dropped before fan-out.
+> There is no client error frame. From the consumer's side this is
+> indistinguishable from an instrument that simply has no updates.
+
+> **`environment` is per venue and is not uniform.** Hyperliquid and Polymarket
+> Perps report `mainnet`; Kalshi Margin reports `production`. Compare it
+> exactly rather than assuming one spelling.
+
+## Asset roles are not interchangeable
+
+Base, quote, collateral, and settlement assets can differ. A price may be
+quoted in one asset while collateral and realized PnL use another. Use the
+named role. Do not assume every market is base/USDC with USDC settlement.
+
+Market Data API snapshots expose these roles as `base_asset_id`,
+`quote_asset_id`, `collateral_asset_id`, and `settlement_asset_id`. All four
+are required there.
+
+| Venue | Quote | Collateral | Settlement |
+|---|---|---|---|
+| Hyperliquid (standard main-dex) | USDT, except HYPE and PURR which quote USDC | USDC | USDC |
+| Polymarket Perps | — | pUSD | pUSD |
+| Kalshi Margin | — | USD | USD |
+
+### Extra fields from the instruments catalog
+
+`GET /perpetuals/instruments` additionally carries `price_increment`,
+`size_increment`, `contract_multiplier`, `max_leverage`, `isolated_only`, and a
+`status` of `active`, `inactive`, `closed`, `delisted`, or `unknown`.
+
+<Warning>
+**All five of those are nullable.** A venue that does not publish a tick
+size, lot size, or multiplier leaves the field absent. A multiplier is never
+derived from observed prices or quantities — if it is absent, you do not have
+one.
+</Warning>
+
+Each instrument also carries a venue-discriminated `metadata` object — keyed by
+`kind`, which must equal the instrument's `venue` — holding facts that have no
+cross-venue meaning:
+
+| Venue | `metadata` contents |
+|---|---|
+| Hyperliquid | `margin_table_id`, listing namespace |
+| Polymarket Perps | `funding_interval`, `price_decimals`, `risk_tiers` |
+| Kalshi Margin | Schedule, plus a *sampled* leverage curve |
+
+<Warning>
+**Kalshi's leverage is a sample, not a rule.** It is labelled
+`semantics: "sampled_estimate"` because it is probed at a sample notional
+rather than published by the venue. Do not treat it as an enforceable venue
+limit.
+</Warning>
+
+## Hyperliquid instrument ids
+
+Hyperliquid's standard main-dex perpetuals have a fixed canonical id:
+
+```text
+hl-mainnet-<symbol lowercased>-<quote asset lowercased>
+```
+
+| Venue symbol | Canonical instrument id |
+|---|---|
+| `BTC` | `hl-mainnet-btc-usdt` |
+| `ETH` | `hl-mainnet-eth-usdt` |
+| `HYPE` | `hl-mainnet-hype-usdc` |
+| `PURR` | `hl-mainnet-purr-usdc` |
+| `kPEPE` | `hl-mainnet-kpepe-usdt` |
+
+The quote asset defaults to **USDT**, with per-symbol exceptions — currently
+`HYPE` and `PURR`, which quote in **USDC**. Collateral and settlement are USDC
+for all of them, so quote, collateral, and settlement roles must stay separate.
+
+This is one identifier used everywhere: the streamed book, the funding
+observations, the trade facts, and the Market Data API snapshot all key on it,
+which is what makes them joinable. The rule lives in a single shared contract
+file and is code-generated into every consumer rather than hand-copied — a
+drifted copy would change an instrument id and silently orphan every fact for
+it.
+
+### Venue coin names are case-sensitive; canonical ids are not
+
+<Note>
+**You cannot recover a venue coin from a canonical id by string
+manipulation.** `kPEPE` is the venue's spelling; `KPEPE` and `kpepe` are not
+coins the venue accepts. Because the canonical id lowercases the symbol,
+`kPEPE` and `KPEPE` both collapse to `hl-mainnet-kpepe-usdt` — and only one
+of them exists.
+</Note>
+
+If you need the venue coin, resolve it from the venue's own asset universe.
+
+<Note>
+**A wrong-cased coin fails invisibly.** Subscribing to Hyperliquid's
+WebSocket with one closes the socket with **no error and no close frame**,
+which is indistinguishable from a network drop. Handle it explicitly.
+</Note>
+
+## Native quantity
+
+`native_quantity_unit` determines what the venue's quantity means:
+
+| Unit | Meaning |
+|---|---|
+| `base_asset` | The size is already an amount of the base asset |
+| `quote_asset` | The size is an amount of the quote asset |
+| `contracts` | The size is a contract count, and needs documented contract specifications before it can be converted |
+
+The canonical model defines all three; the v2 gateway accepts only
+`BASE_ASSET` and `CONTRACTS` on a book snapshot, as listed above.
+
+Normalized base quantity and quote notional can be published alongside native
+quantity only when the conversion inputs and rules are known.
+
+## Lifecycle
+
+Perpetuals do not have a scheduled expiry, but they still have lifecycle state.
+An instrument can be:
+
+- listed but not yet active
+- active
+- halted
+- close-only or reduce-only
+- delisted
+
+Lifecycle state is time-varying. **Delisting does not permit identifier
+reuse** — historical records continue to reference the original instrument.
+
+## Alias resolution
+
+Venue symbols and aliases are resolved at ingestion. The resolution result must
+include the venue, environment, and effective period. Silent alias fallback is
+unsafe: if a symbol is unknown or ambiguous, ingestion fails until metadata
+establishes the identity.
+
+The streamer implements exactly that for Hyperliquid. A canonical id is
+resolved back to a venue coin from the venue's own asset universe, cached for
+five minutes with a thirty-second floor between refetches after a miss.
+
+| Condition | Result |
+|---|---|
+| Id matches no live coin | `UnknownInstrument` |
+| Id shared by two live symbols | `AmbiguousInstrument` |
+
+In both cases the adapter refuses to subscribe rather than guessing a symbol.
+
+## What an unknown instrument looks like
+
+Each surface fails differently. This table is worth memorizing before you
+debug a silent stream:
+
+| Surface | Behaviour |
+|---|---|
+| `GET /v1/perpetuals/{venue}/{instrument}/snapshot` | `400 invalid_request` if the id fails the venue's grammar; `502 upstream` if the grammar passes but the venue has no such listing |
+| `GET /perpetuals/instruments` | The instrument is simply absent from the list; there is no per-instrument lookup. An unrecognized `?venue=` is a `422` validation error, an upstream venue failure is `502`, and the whole route is `404` while the preview flag is off |
+| `perps_book` WebSocket subscribe | The subscription is **accepted**. The gateway validates only that the provider is a perpetual provider and that the id is a safe transport token — it does not check the id against the catalog. An unknown id acknowledges normally and then never delivers a frame |
+
+<Note>
+**On the WebSocket, "acknowledged" does not mean "exists".** A misspelled
+instrument id produces a healthy-looking subscription that is silent
+forever. If you see no frames, verify the id against
+`GET /perpetuals/instruments` before suspecting the network.
+</Note>
+
+## Consumer invariants
+
+- Join on stable IDs, not display symbols.
+- Partition venue-native IDs by provider and environment.
+- Treat asset roles and quantity units as required.
+- Do not treat delisted instruments as expired prediction markets.
+- Keep venue-native metadata for audit and replay.
+
+Next: [Exact values and time](/perpetuals/exact-values-and-time).

@@ -1,0 +1,151 @@
+---
+title: "Market Data"
+description: "Orderbook snapshots and the backtest endpoint"
+---
+
+Two utility endpoints: one exposes the cached orderbook Krisis evaluates
+strategies against, so you can see the same numbers the engine sees; the other
+replays a DSL strategy over candles you supply. Use them while developing a
+strategy — neither needs a strategy to exist.
+
+**Both endpoints are public — no `Authorization` header required.**
+
+## Get orderbook
+
+```
+GET /api/v1/orderbook/{market_id}
+```
+
+The cached top-of-book snapshot for a market — the same book the engine reads
+when it evaluates `bid`, `ask`, and `spread`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `market_id` | string | Yes | — | Path parameter — market / contract identifier |
+
+### Example
+
+```bash
+curl https://krisis.kairos.trade/api/v1/orderbook/KXBTCD-25
+```
+
+### Response
+
+```json
+{
+  "market_id": "KXBTCD-25",
+  "data": {
+    "best_bid": 0.48,
+    "best_ask": 0.51,
+    "bid_depth": 320,
+    "ask_depth": 275,
+    "spread": 0.03,
+    "levels": 5,
+    "timestamp_us": 1784094262213000
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `market_id` | string | Market identifier |
+| `data.best_bid` | number | Best bid price |
+| `data.best_ask` | number | Best ask price |
+| `data.bid_depth` | number | Size at the best bid |
+| `data.ask_depth` | number | Size at the best ask |
+| `data.spread` | number | `best_ask - best_bid` |
+| `data.levels` | integer | Book levels in the snapshot |
+| `data.timestamp_us` | integer | Snapshot time, microseconds since epoch |
+
+### Errors
+
+| Status | When it happens | What to do |
+|---|---|---|
+| `404` | Krisis has no orderbook cached for the market | Check the identifier; a strategy on a market with no cached book has nothing to evaluate against |
+
+## Backtest
+
+```
+POST /api/v1/backtest
+```
+
+Replays a DSL strategy over a supplied series of historical candles and
+reports the trades it would have taken.
+
+> **Stateless — you supply the history.** Nothing is persisted, and the candles
+> are whatever you pass in the request; Krisis does not look up history for you.
+
+> **Gotcha: backtest is the only place candle indicators work.** Because you
+> supply the bar series, an expression here can use candle-derived indicators.
+> The live engine has no candle history and **rejects those at compile time**, so
+> an expression that backtests fine can still be refused when you arm it. See
+> [DSL variables](/krisis/strategies#dsl-variables) for what an armed strategy can
+> actually reference.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `expression` | string | Yes | — | DSL trigger expression |
+| `action_type` | string | Yes | — | Action on trigger, e.g. `"market_buy"`, `"market_sell"`, `"limit_buy"`, `"limit_sell"` |
+| `action_config` | object | Yes | — | Action parameters — quantity, price, max cost, etc. |
+| `candles` | array | Yes | — | Historical candles, in chronological order |
+| `initial_balance` | number | Yes | — | Starting balance |
+| `cooldown_secs` | integer | No | `0` | Minimum seconds between triggers |
+
+Each entry in `candles`:
+
+| Field | Type | Description |
+|---|---|---|
+| `open` / `high` / `low` / `close` | number | OHLC prices |
+| `volume` | number | Bar volume |
+| `timestamp` | string | Bar timestamp, ISO 8601 (e.g. `"2026-05-16T14:30:00Z"`) |
+
+### Example
+
+```bash
+curl -X POST https://krisis.kairos.trade/api/v1/backtest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expression": "price > sma(20)",
+    "action_type": "market_buy",
+    "action_config": { "quantity": 100 },
+    "initial_balance": 10000,
+    "cooldown_secs": 300,
+    "candles": [
+      { "open": 0.50, "high": 0.52, "low": 0.49, "close": 0.51, "volume": 1200, "timestamp": "2026-05-16T14:30:00Z" }
+    ]
+  }'
+```
+
+### Response
+
+```json
+{
+  "total_candles": 720,
+  "total_triggers": 14,
+  "trades": [ /* simulated trades */ ],
+  "final_balance": 11824.50,
+  "total_pnl": 1824.50,
+  "win_rate": 0.64,
+  "max_drawdown": 312.00
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `total_candles` | integer | Candles processed |
+| `total_triggers` | integer | Times the expression fired |
+| `trades` | array | Simulated trades |
+| `final_balance` | number | Balance after the run |
+| `total_pnl` | number | `final_balance - initial_balance` |
+| `win_rate` | number | Fraction of winning trades, `0.0`–`1.0` |
+| `max_drawdown` | number | Largest peak-to-trough equity drop |
+
+### Errors
+
+| Status | When it happens | What to do |
+|---|---|---|
+| `400` | Invalid `expression` or malformed request | Read the `error` message; validate the expression with [`POST /api/v1/dsl/validate`](/krisis/strategies#validate-an-expression) first |

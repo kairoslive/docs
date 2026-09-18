@@ -1,0 +1,367 @@
+---
+title: "Order Types"
+description: "How to place and manage orders on Kairos — kinds, time-in-force, status, and cancellation"
+---
+
+This page covers everything you send when placing an order on Kairos — the order kinds, how to name an outcome, time-in-force, price format — and everything you do afterwards: reading status and cancelling. Reach for it when you are building order submission and want to know which fields are required and which values a venue will actually accept.
+
+For the full request/response schema see the [Orders API reference](/rest/orders); for live try-it panels see the [API Reference](/api-reference).
+
+## Market Orders
+
+Execute immediately at the best available price.
+
+```json
+{
+  "kind": "market",
+  "side": "buy",
+  "outcome": "Before Aug 1, 2026",
+  "quantity": "100",
+  "price": "0.46",
+  "exchange_id": "polymarket",
+  "market_id": "0x..."
+}
+```
+
+Use market orders when you want immediate execution and are willing to accept the current market price.
+
+<Note>
+**`price` is required even for market orders.** Kairos treats it as the limit
+you're willing to cross to, not a market-price sentinel, and rejects the order
+without it. Submit the live same-outcome quote — **ask for buys, bid for
+sells** — pulled from the [Market Data WebSocket](/websocket/market-data-websocket)
+or `GET /markets/batch-prices`.
+</Note>
+
+## Limit Orders
+
+Place an order at a specific price. The order rests on the book until filled or cancelled.
+
+```json
+{
+  "kind": "limit",
+  "side": "buy",
+  "outcome": "Before Aug 1, 2026",
+  "quantity": "100",
+  "price": "0.45",
+  "exchange_id": "polymarket",
+  "market_id": "0x..."
+}
+```
+
+Use limit orders when you want to specify your price. You pay maker fees if your order rests on the book.
+
+## Specifying the Outcome
+
+Each prediction market has multiple outcomes. Name the one you're trading with **either** field — not both:
+
+- `outcome` — the exact human-readable outcome label from market metadata
+- `token_id` — the token identifier for the outcome
+
+```json
+{ "outcome": "Before Aug 1, 2026", "side": "buy" }
+```
+
+```json
+{ "token_id": "71321045679252212594626385532706912750332728571942532289631379312455583992563", "side": "buy" }
+```
+
+<Warning>
+**Never submit a generic side alias (`yes`/`no`, `long`/`short`) as the
+outcome** — use the exact label from market metadata, even for binary markets.
+Market and limit orders must include the price for the outcome you're
+submitting; Kairos does not infer a price from the opposite outcome.
+</Warning>
+
+## Order Sides
+
+| Side | Description |
+|------|-------------|
+| `buy` | Purchase outcome tokens |
+| `sell` | Sell outcome tokens you own |
+
+<Note>
+**To close a position, sell the same outcome label you bought** — not the
+opposite outcome.
+</Note>
+
+## Time in Force
+
+Control how long your order stays active. `GTC`/`GTD` are resting (limit-style); `FOK`/`FAK`/`IOC` are immediate taker executions.
+
+| Value | Behavior |
+|-------|----------|
+| `GTC` (default) | Good till cancelled — rests until it fills or you cancel it |
+| `FOK` | Fill or kill — fills completely and immediately, or the whole order cancels (no partials) |
+| `FAK` | Fill and kill — fills as much as possible immediately, cancels the remainder |
+| `IOC` | Immediate or cancel — alias for `FAK`; partial fills allowed, remainder cancelled |
+| `GTD` | Good till date — expires after `expiration_minutes` minutes (required for this value) |
+
+```json
+{ "time_in_force": "GTD", "expiration_minutes": 60 }
+```
+
+### Per-venue support
+
+| Exchange | Supported `time_in_force` |
+|---|---|
+| `polymarket` | `GTC`, `GTD`, `FOK`, `FAK`, `IOC` |
+| `predictfun` | `GTC`, `GTD`, `FOK`, `FAK`, `IOC` |
+| `kalshi` | `GTC`, `GTD`, `FOK`, `FAK`, `IOC` |
+| `hyperliquid` | `GTC`, `GTD`, `FOK`, `FAK`, `IOC` |
+| `opinion` | `GTC` only |
+
+<Note>
+**An unrecognized non-empty `time_in_force` is rejected, not silently
+downgraded to `GTC`.** A recognized value the target venue does not support is
+a separate error. Both are `400 VALIDATION_INVALID_ORDER` — see
+[Submission errors](#submission-errors) for the exact messages.
+</Note>
+
+`time_in_force` and `side` are case-insensitive and trimmed on input. **`kind`
+is case-sensitive** — `"Market"` is a `400`, only `"market"` and `"limit"` parse.
+
+## Order Parameters
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | `polymarket`, `kalshi`, `predictfun`, `opinion`, or `hyperliquid`, subject to what is enabled for your account. `kalshi_offchain` is accepted as a deprecated alias for `kalshi`. |
+| `market_id` | string | Yes | — | The market identifier |
+| `outcome` | string | Yes* | — | Exact outcome label from market metadata |
+| `token_id` | string | Yes* | — | Token identifier (alternative to `outcome`) |
+| `side` | string | Yes | — | `buy` or `sell` |
+| `kind` | string | Yes | — | `market` or `limit` |
+| `quantity` | string (decimal) | Yes | — | Contracts; must be `> 0` and `<= 1,000,000`. A server-configured minimum applies to `buy` orders only — `sell` orders are allowed at any size so a position can be fully closed after partial fills. |
+| `price` | string (decimal) | Yes | — | Executable price in range (see [Price Format](#price-format)). Limit orders use the resting limit price. Market orders must use the live same-outcome quote: ask for buys, bid for sells. |
+| `time_in_force` | string | No | `GTC` | `GTC`, `FOK`, `FAK`, `IOC`, or `GTD` (case-insensitive on input, normalized upper-case) |
+| `expiration_minutes` | integer | GTD only | — | Minutes from now until expiry; must be `1`–`43200` (30 days) |
+| `post_only` | boolean | No | `false` | Limit orders only. Rejected on market orders, on venues that do not support it (`opinion`), and with an immediate TIF (`FOK`/`FAK`/`IOC`) — post-only requires `GTC` or `GTD`. |
+| `max_slippage_cents` | integer | No | — | `1`–`99`. The distance from your submitted price that Kairos may re-price to on a retry. See [Execution & Slippage](/learn/execution-and-slippage). |
+| `max_retries` | integer | No | `0` | `0`–`20`. Retries after the first attempt. |
+
+*Provide either `outcome` or `token_id`.
+
+> **`quantity` and `price` are decimal *strings*, not JSON numbers.** That is the
+> documented request contract, and it is the form Kairos serializes decimals
+> back to you in responses — so a value that round-trips through your client
+> stays exact. The parser does also accept an unquoted JSON number, but a
+> fractional one is converted via a binary float on the way in, so the string
+> form is the only one guaranteed to be preserved digit-for-digit. Send
+> `"0.45"`, not `0.45`.
+>
+> `expiration_minutes`, `max_slippage_cents`, and `max_retries` are ordinary
+> JSON integers — do **not** quote those.
+
+> **`expiration_minutes` is validated and applied only when `time_in_force` is
+> `GTD`.** On any other TIF the field is accepted and silently discarded, so an
+> out-of-range value there does not produce an error.
+
+> **API-key buy minimum.** Buy orders submitted with API-key credentials must be
+> worth at least **$5** notional (`quantity × price`).
+
+### Submission errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `VALIDATION_INVALID_ORDER` | `Invalid time_in_force '<x>'; expected one of GTC, GTD, FOK, FAK, IOC` — the value is not one of the five | Send a recognized value |
+| `400` | `VALIDATION_INVALID_ORDER` | `Time-in-force <TIF> is not supported by <Exchange>` — recognized value, wrong venue | Check [per-venue support](#per-venue-support) |
+| `400` | `VALIDATION_INVALID_ORDER` | An API-key buy is worth less than $5 notional | Increase `quantity` or `price` |
+| `400` | `VALIDATION_INVALID_PRICE` | `Price must be positive` — `price` is `0` or below | Send a price in `(0, 1.0]` |
+| `400` | `VALIDATION_INVALID_PRICE` | `Price must be <= 1 for <Exchange>` — `price` above `1.0` | Send a price in `(0, 1.0]` |
+| `400` | `EXCHANGE_UNSUPPORTED` | `exchange_id` is not a registered exchange | Fix the `exchange_id` value |
+| `400` | — | `kind` is not exactly `"market"` or `"limit"` | Lower-case the value; `kind` is case-sensitive |
+
+<Note>
+**`EXCHANGE_UNSUPPORTED` is reserved for an `exchange_id` that is not
+registered at all** — it is not the error for a bad venue/TIF combination.
+</Note>
+
+## Order Status
+
+Orders transition through multiple statuses during their lifecycle.
+
+**Statuses visible to clients:**
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Order received, awaiting processing |
+| `live` | Order is active on the exchange |
+| `partial` | Some contracts have filled |
+| `filled` | Order completely filled |
+| `cancelled` | You cancelled the order |
+| `expired` | GTD order reached expiration |
+| `failed` | Order could not be executed |
+
+**Terminal statuses** (no further transitions): `filled`, `cancelled`, `expired`, `failed`. `partial` is **not** terminal — a partially filled order is still working.
+
+<Note>
+**Four more statuses can appear on the wire.** `queued`, `locked`,
+`executing`, and `orphaned` are internal states. The DB schema flattens them
+into `pending`, but API responses serialize the live variant — **so a client
+can observe all four.** Treat them as non-terminal, in-flight states.
+</Note>
+
+## Managing Orders
+
+### Cancel an Order
+
+Cancels a single open order. Available from the Orders panel or the REST API.
+
+```
+POST /orders/{order_id}/cancel
+Scope: trade:execute
+```
+
+**Request**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `order_id` | string (path) | Yes | — | The Kairos order id to cancel |
+
+**Example**
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/550e8400-.../cancel \
+  -H "X-Client-Id: kairos_ck_abc123..." \
+  -H "X-Api-Key: deadbeef..." \
+  -H "X-Api-Secret: cafebabe..."
+```
+
+**Response**
+
+```json
+{
+  "success": true,
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message": "Order cancelled on exchange"
+}
+```
+
+<Note>
+**This endpoint almost always returns `200`, even when the cancel doesn't
+happen.** If the order is already terminal (`filled`/`cancelled`/`expired`/`failed`)
+or the venue currently refuses the cancel, you get `success: false` with an
+explanatory `message` — not a 4xx. **Check `success`, not just the status
+code.** Non-2xx codes are reserved for auth/ownership/not-found/infrastructure
+failures.
+</Note>
+
+### Cancel All
+
+Cancels all your open orders on an exchange at once — the kill-switch path. Optionally restrict to a specific market.
+
+```
+POST /orders/cancel-all
+Scope: trade:execute
+```
+
+**Request**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `exchange_id` | string | Yes | — | Exchange to cancel on |
+| `market_id` | string | No | — | Restrict to a specific market |
+
+**Example**
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-all \
+  -H "X-Client-Id: kairos_ck_abc123..." \
+  -H "X-Api-Key: deadbeef..." \
+  -H "X-Api-Secret: cafebabe..." \
+  -H "Content-Type: application/json" \
+  -d '{"exchange_id": "polymarket"}'
+```
+
+**Response**
+
+```json
+{
+  "cancelled_count": 3,
+  "failed_count": 0,
+  "cancelled_order_ids": ["550e...", "551e...", "552e..."]
+}
+```
+
+**Errors**
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `VALIDATION_INVALID_ORDER` | `unknown exchange_id '<x>'` | Fix the `exchange_id` value |
+| `400` | `EXCHANGE_UNSUPPORTED` | `<Exchange> does not support cancel-all` — implemented only for `polymarket`, `kalshi`, and `predictfun` | Cancel orders individually or in a batch |
+
+<Note>
+**Unlike single-order cancel, a bad `exchange_id` here is a real `400`.** This
+is the kill-switch path, so a caller-input problem must be visibly distinct
+from "the venue kept orders resting."
+</Note>
+
+### Cancel a Batch
+
+Cancels a specific list of order ids — up to **100** per request, deduplicated server-side, all on the same exchange.
+
+```
+POST /orders/cancel-batch
+Scope: trade:execute
+```
+
+**Request**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `order_ids` | array of string (uuid) | Yes | — | Kairos order ids to cancel. Must be non-empty and at most 100 entries; deduplicated server-side. |
+
+**Response fields**: `cancelled_count`, `noop_count`, `failed_count`,
+`cancelled_order_ids`, `noop_order_ids`, and a `failures` array of
+`{order_id, exchange_order_id, reason}`. `success` is true only when
+`failed_count` is zero.
+
+**Errors** — note these differ from cancel-all:
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | — | The id list is empty, or holds more than 100 ids | Send 1–100 ids |
+| `400` | `EXCHANGE_UNSUPPORTED` | Any exchange other than `polymarket`, `kalshi`, or `predictfun` | Cancel orders individually |
+| `403` | — | The batch contains another user's order | Only cancel your own orders |
+| `409` | — | An already-terminal order, or a mix of exchanges in one batch | Split by exchange and drop terminal ids |
+
+### Per-venue cancel semantics
+
+The `market_id` form and cancel mechanism differ per venue — Polymarket accepts a numeric market id or a `0x…` condition id, Kalshi expects the raw Kalshi ticker, and Predict.fun accepts a numeric market id only.
+
+<Note>
+**Predict.fun cancel-all is synthetic and non-atomic** — it is composed of a
+listing plus batched per-order cancels, 100 per venue request. See
+[per-venue semantics](/rest/orders#per-venue-semantics) for the failure
+modes.
+</Note>
+
+## Price Format
+
+Prediction market prices represent probabilities.
+
+- Price of **0.45** means 45% implied probability
+- Your payout if correct is always **$1.00** per contract
+- Buying at 0.45 risks $0.45 to win $0.55 profit
+
+Kairos admits any price in **`(0, 1.0]`** — strictly greater than zero, and
+`1.0` itself is accepted — on every exchange. Out-of-range prices are rejected
+`400 VALIDATION_INVALID_PRICE`; see [Submission errors](#submission-errors).
+
+That is the admission gate only. Your price must additionally sit on the
+venue's tick grid, which is enforced downstream and rejects separately:
+
+| Exchange | Minimum tick |
+|----------|--------------|
+| Polymarket | 0.01 |
+| Kalshi | 0.01 |
+| Opinion | 0.01 |
+| Predict.fun | 0.001 |
+| Hyperliquid | 0.0001 |
+
+<Note>
+**Venues also apply their own price bounds**, so a price Kairos admits can
+still be rejected by the exchange.
+</Note>
+
+For live prices to build market orders from, use `GET /markets/batch-prices` (see [Markets](/rest/markets)) or subscribe to the [Market Data WebSocket](/websocket/market-data-websocket). For historical OHLCV instead, the dedicated [Market Data API](/market-data/overview) has a higher-throughput free tier.

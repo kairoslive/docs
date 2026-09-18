@@ -1,0 +1,307 @@
+---
+title: "Overview"
+description: "Kairos perpetual futures market data and integration contracts"
+---
+
+> **⚠ Live in production, still flag-gated — read before you write code**
+>
+> Every perpetual surface — REST and WebSocket alike — is behind one rollout
+> flag, enabled in production and staging today. Where it is off, the surface
+> does not exist rather than erroring usefully: `/perpetuals/venues`,
+> `/perpetuals/instruments` and the snapshot all return `404`, and the
+> WebSocket refuses a `perps_book` subscription. Do not read that `404` as an
+> outage or a bad identifier.
+>
+> Contracts remain **beta** and carry no SLA, and three
+> pages in this chapter are design previews with nothing callable behind them.
+> See [Availability and guarantees](/perpetuals/availability-and-guarantees).
+
+Point your integration at the production hosts:
+
+| Surface | Production | Staging (integration testing) |
+|---|---|---|
+| REST snapshot | `https://md.kairos.trade` | `https://staging-md.kairos.trade` |
+| WebSocket book stream | `wss://stream.kairos.trade` | `wss://staging-stream.kairos.trade` |
+
+Perpetual futures are non-expiring leveraged instruments. They share familiar
+market-data concepts with prediction markets — books, trades, and candles — but
+require different identity, pricing, funding, margin, risk, and position
+semantics. This chapter covers what is *different*.
+
+Kairos standardizes Hyperliquid, Polymarket Perps, and Kalshi Margin without
+hiding venue-specific facts or inventing conversions.
+
+Perpetuals are not a separate API. They ride the same REST service
+([Market Data](/market-data/overview)) and the same WebSocket gateway
+([Market Data Stream](/websocket/market-data-websocket)) as prediction
+markets, with the same auth and error envelopes.
+
+> **Never apply prediction-market probability math here.** Perpetual prices
+> are direct venue prices, not 0–100 probabilities. Dividing one by 100
+> produces a silently wrong number.
+
+> **Hyperliquid is two products.** Its HIP-4 outcome markets are prediction
+> markets (`provider: "hyperliquid"`, venue coins like `#1210`); its
+> perpetuals are bare coins (`provider: "hyperliquid_perps"`, `BTC` /
+> `kPEPE`). Different id schemes, different price scales, separate decoders.
+> See
+> [Venue normalization](/perpetuals/venue-normalization#hyperliquid-is-two-products-on-one-venue).
+
+## Identifier asymmetry: REST vs WebSocket
+
+This is the single most common integration mistake in this chapter.
+
+| Surface | Address it with | Example |
+|---|---|---|
+| `GET /v1/perpetuals/{venue}/{instrument}/snapshot` | The **venue-native** identifier | `BTC`, `6`, `KXBTCPERP` |
+| `perps_book` WebSocket subscription | The **canonical Kairos** instrument id | `hl-mainnet-btc-usdt` |
+
+The canonical id is returned in the REST snapshot body as
+`canonical_instrument_id`, and by `GET /perpetuals/instruments`. **Do not swap
+them.** The venue slugs differ too — see
+[Venue normalization](/perpetuals/venue-normalization#one-venue-four-namespaces).
+
+<Warning>
+**A wrong id fails differently on each surface.** REST answers `400` or
+`502`. The WebSocket **accepts** the subscription, acknowledges it, and then
+never delivers a frame — the gateway does not check the id against the
+catalog. Silence is the only symptom.
+</Warning>
+
+## Live snapshot
+
+```
+GET /v1/perpetuals/{venue}/{instrument}/snapshot
+```
+
+One composite read of a perpetual market: an ordered book, market state, recent
+trades, one-minute candles, and funding observations, all from the venue's
+public HTTP API. It also carries the canonical instrument key and the minimum
+asset, price-unit, quantity-unit, multiplier, and notional context required to
+interpret that data safely.
+
+**Auth:** the standard Market Data
+[API-key headers](/market-data/authentication#api-keys), or anonymous on
+the free tier. `heavy` bucket, **6 units** per call.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `venue` | string | yes | — | Path segment: `hyperliquid`, `polymarket_perps`, or `kalshi_margin` |
+| `instrument` | string | yes | — | Path segment: the **venue-native** identifier (`BTC`, `6`, `KXBTCPERP`), not the canonical Kairos id |
+| `depth` | integer | no | the venue's own ceiling | Maximum book levels per side, 1–500. Defaults to 20 for `hyperliquid`, 500 for `polymarket_perps` and `kalshi_margin` |
+
+The `depth` default is per venue on purpose: a flat default would mark every
+Hyperliquid snapshot depth-limited for no reason and ask Kalshi for less book
+than it has.
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/perpetuals/hyperliquid/BTC/snapshot \
+  -H "X-Client-Id: $CLIENT_ID" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "X-Api-Secret: $API_SECRET" \
+  --data-urlencode "depth=20"
+```
+
+### Response
+
+```json
+{
+  "canonical_instrument_id": "hl-mainnet-btc-usdt",
+  "fetched_at_ns": 1784094262213000000,
+  "book": {
+    "requested_depth": 20,
+    "depth": 20,
+    "source_depth_limit": 20,
+    "depth_limited": false,
+    "sequence_domain": "hyperliquid:unsequenced-l2-snapshot",
+    "feed_mode": "snapshot_only",
+    "event_time_ns": 1784094262100000000,
+    "received_time_ns": 1784094262180000000,
+    "bids": [ … ],
+    "asks": [ … ]
+  },
+  "market_state": {
+    "status": "active",
+    "event_time_ns": 1784094262100000000,
+    "prices": [
+      { "price_type": "mark", "value": "60000.1", "observed_time_ns": 1784094262100000000 }
+    ],
+    "measures": [ { "measure_type": "open_interest", … } ]
+  },
+  "trades": [
+    { "trade_id": "…", "price": "60000.1", "quantity": "0.25",
+      "quantity_unit": "base_asset", "side": "buy",
+      "event_time_ns": 1784094261900000000 }
+  ],
+  "candles": [
+    { "interval": "1m", "interval_start_ns": 1784094180000000000,
+      "interval_end_ns": 1784094240000000000, "finality": "closed_unconfirmed", … }
+  ],
+  "funding": [
+    { "rate": "0.0000125", "phase": "final",
+      "effective_time_ns": 1784091600000000000,
+      "calculated_time_ns": 1784091600000000000,
+      "rate_period_seconds": 3600, "payment_interval_seconds": 3600,
+      "sign_convention": "positive_longs_pay",
+      "funding_price": "60000.1", "funding_price_type": "mark" }
+  ]
+}
+```
+
+| Key | What it holds | Detail |
+|---|---|---|
+| `canonical_instrument_id` | The id the WebSocket stream is addressed by | [Instruments and identity](/perpetuals/instruments-and-identity) |
+| `book` | Ordered levels plus depth, sequence-domain, and feed-mode metadata | [Order books](/perpetuals/order-books#deep-book-controls) |
+| `market_state` | Sparse typed `prices` and `measures`, plus `status` | [Funding and market state](/perpetuals/funding-and-market-state#market-state) |
+| `trades` | Recent public prints | [Trades and candles](/perpetuals/trades-and-candles#public-trades) |
+| `candles` | 1-minute buckets only, roughly the last hour | [Trades and candles](/perpetuals/trades-and-candles#trade-candles) |
+| `funding` | Funding observations with phase, interval, and sign convention | [Funding and market state](/perpetuals/funding-and-market-state#funding-observations) |
+
+> **Every financial value is a decimal string.** Prices, quantities, volumes,
+> rates, and multipliers never cross the boundary as a JSON number. See
+> [Exact values and time](/perpetuals/exact-values-and-time#exact-decimals).
+
+> **Every timestamp is a nanosecond JSON *number*, already past 2^53.**
+> `fetched_at_ns`, `event_time_ns`, `observed_time_ns`, `interval_start_ns`
+> and friends will lose precision if parsed as a JavaScript `Number`. Parse
+> them as `BigInt` or as text. See
+> [Exact values and time](/perpetuals/exact-values-and-time#clocks).
+
+### Errors
+
+Errors use the shared Market Data API envelope,
+`{"error": {"code": …, "message": …}}`.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | An unsupported `{venue}` (`unsupported perpetual venue`) | Use `hyperliquid`, `polymarket_perps`, or `kalshi_margin`. Note `hyperliquid_perps` — the *WebSocket* slug — is rejected here |
+| `400` | `invalid_request` | A non-integer `depth` (`depth must be an integer`) or one outside `[1, 500]` (`depth must be between 1 and 500`) | Send an integer in range, or omit `depth` for the venue default |
+| `400` | `invalid_request` | An `{instrument}` that does not match the venue's identifier grammar | Use the venue-native id, not the canonical Kairos id |
+| `401` / `403` / `429` | — | Credential or budget problem | See [Authentication](/market-data/authentication#errors) |
+| `502` | `upstream` | Any venue failure, any validation failure, or a well-formed id the venue has no listing for | Retry with backoff. If it persists, confirm the instrument is live on the venue |
+| `404` | — | The route is not mounted | `PERPETUALS_PUBLIC_API_ENABLED` is off for that deployment. Production and staging both have it on |
+
+<Note>
+**`502` is also how "stale" is reported.** The snapshot fails closed rather
+than serving a partially old body: any component outside its freshness fence
+returns `502 upstream`. The fences are tabulated in
+[Availability and guarantees](/perpetuals/availability-and-guarantees#rest-snapshot-staleness-fences).
+</Note>
+
+### Notes
+
+The snapshot is `Cache-Control: no-store`. The Market Data API coalesces
+bursts behind a one-second replica-local cache, and concurrent requests for the
+same `(venue, instrument, depth)` share one in-flight fetch.
+
+Quantity units differ by venue and must not be collapsed:
+
+| Venue | Book and trade sizes | Candle volume | Quote | Collateral | Settlement |
+|---|---|---|---|---|---|
+| Hyperliquid | base asset | base asset | USDT, except HYPE and PURR which quote USDC | USDC | USDC |
+| Polymarket Perps | contracts | base asset | — | pUSD | pUSD |
+| Kalshi Margin | contracts | contracts | — | USD | USD |
+
+<Warning>
+**`notional_formula` can say "I don't know."** It is
+`unavailable_contract_multiplier` when Kairos cannot prove the conversion —
+today that is Polymarket Perps. Do not invent a multiplier. Hyperliquid and
+Kalshi Margin both report `quantity_times_price`, and Kalshi additionally
+carries the venue's `contract_size` as `contract_multiplier`.
+</Warning>
+
+## Book stream
+
+The WebSocket gateway exposes one perps topic, `perps_book`. It delivers
+`kairos.v2.BookSnapshot` frames for all three venues and replays the latest
+validated frame on subscribe when one is cached. Automatic catalog enrollment
+keeps books warm without relying on a subscriber-created presence lease.
+
+Perps are v2-only. There is no parallel v1 perpetual book contract to reconcile
+or deprecate. See
+[Streaming and recovery](/perpetuals/streaming-and-recovery) for the
+byte-level frame and consumer algorithm.
+
+## The other beta surfaces
+
+| Surface | What it serves |
+|---|---|
+| Python API `GET /perpetuals/venues` | Venue metadata |
+| Python API `GET /perpetuals/instruments` | Instrument metadata; optional `?venue=` filter accepting `hyperliquid`, `polymarket_perps`, or `kalshi_margin` |
+| RPC `perpetuals.venues` | Venues only — RPC does not serve instrument or market data |
+| Market Data API `GET /v1/perpetuals/{venue}/{instrument}/snapshot` | The composite snapshot documented above |
+| `websocket_cpp` at `wss://stream.kairos.trade` | The `perps_book` stream. The Market Data API does not host WebSockets |
+
+Full instrument rules and discovery are owned by the Python API, not by the
+snapshot endpoint.
+
+## What is shared with prediction markets
+
+| Concept | Shared contract | Important perps distinction |
+| --- | --- | --- |
+| Order books | Snapshot and delta envelopes, bid/ask levels, sequence metadata | Direct two-sided prices, deeper books, venue-specific depth and grouping |
+| Trades | Price, quantity, side, identifiers, event time | Quantity unit, liquidation attribution, contract multiplier |
+| Candles | OHLC, volume, interval, finality and revisions | Trade-price and quote-price series stay distinct |
+| Source metadata | Provider, environment, connection, producer and receive times | Venue region and relay path can materially affect latency |
+
+## What is new
+
+- Non-expiring instrument identity and asset roles
+- Exact decimal values with explicit quantity units
+- Mark, index, oracle, mid, and other typed price sources
+- Funding observations, predictions, settlements, and account ledger entries
+- Cross, isolated, and venue-specific margin modes
+- Position episodes, account risk, maintenance tiers, and liquidation events
+- Reconnect epochs, book-view identities, revision state, and recovery fences
+
+## Design principles
+
+1. **Preserve facts.** Native identifiers, units, clocks, and source metadata
+   remain available after normalization.
+2. **Never guess.** Kairos does not infer a multiplier, liquidation, side, or
+   conversion that the venue does not prove.
+3. **Exact values at boundaries.** Prices, quantities, rates, balances, and
+   notionals do not cross service boundaries as binary floating-point values.
+4. **Absence is not zero.** Missing, unavailable, stale, and zero are different
+   states.
+5. **Recovery is part of the contract.** A stream consumer can determine when
+   state is valid, detect gaps, and rebuild deterministically.
+6. **Shared shapes, separate semantics.** Reuse is preferred when the economic
+   meaning is the same; venue extensions remain explicit when it is not.
+
+## Current availability
+
+| Capability | Status |
+| --- | --- |
+| Venue and instrument discovery | Beta |
+| Automatic catalog enrollment | Beta |
+| Read-only live REST snapshots | Beta |
+| Live venue-backed perps books | Beta |
+| Canonical v2 perps WebSocket stream | Beta |
+| Compacted book recovery checkpoints | Beta |
+
+Beta fields and availability can change before general availability. Private
+account data, order entry, and an SLA remain outside the public market-data
+beta — see
+[Availability and guarantees](/perpetuals/availability-and-guarantees) for
+the exact boundary.
+
+## Read this chapter
+
+| Page | Read it for |
+|---|---|
+| [Instruments and identity](/perpetuals/instruments-and-identity) | Canonical ids, asset roles, quantity units, unknown-instrument behavior |
+| [Exact values and time](/perpetuals/exact-values-and-time) | Decimal encoding, nanosecond clocks, revisions |
+| [Order books](/perpetuals/order-books) | Depth controls, book validity, snapshot-only semantics |
+| [Trades and candles](/perpetuals/trades-and-candles) | Side normalization, volume units, candle finality |
+| [Funding and market state](/perpetuals/funding-and-market-state) | Typed prices, funding phases and intervals per venue |
+| [Accounts and margin](/perpetuals/accounts-and-margin) | Design preview — not callable |
+| [Positions, orders, and fills](/perpetuals/positions-orders-and-fills) | Design preview — not callable |
+| [Risk and liquidations](/perpetuals/risk-and-liquidations) | Design preview — not callable |
+| [Streaming and recovery](/perpetuals/streaming-and-recovery) | The `0x40 0x02` frame, ordering fence, reconnect algorithm |
+| [Venue normalization](/perpetuals/venue-normalization) | Per-venue differences in one place |
+| [Availability and guarantees](/perpetuals/availability-and-guarantees) | What is validated, what fails closed, what is out of scope |

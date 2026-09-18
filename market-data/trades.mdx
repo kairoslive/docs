@@ -1,0 +1,217 @@
+---
+title: "Trades"
+description: "Trade history and aggregate volume metrics"
+---
+
+Executed-trade records and windowed volume aggregates for one contract. Use
+`GET /v1/trades` for the tape, `GET /v1/trades/metrics` when you only need
+totals.
+
+## Trade history
+
+```
+GET /v1/trades
+```
+
+Returns executed trades for one contract, newest first, within a lookback
+window.
+
+**Auth:** none required — works on the anonymous
+[free tier](/market-data/authentication). `heavy` bucket, cost `1 per
+started 250 rows of limit` (so 2 at `limit=500`).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | Registered provider — see [Overview](/market-data/overview#endpoints) |
+| `contract_id` | string | yes | — | Contract/market identifier |
+| `window_seconds` | integer | no | `86400` | Lookback window, 3600–86400. Measured back from the *current server time* — not from `before` |
+| `before` | integer | no | — | Exclusive upper time bound, positive unix seconds. Used for paging backwards |
+| `limit` | integer | no | `500` | Maximum records returned, 1–500 |
+
+<Note>
+**Out-of-range values are rejected, not clamped.** A `window_seconds` of
+`100` or a `limit` of `1000` returns `400`, not the nearest legal value.
+</Note>
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/trades \
+  --data-urlencode "provider=predictfun" \
+  --data-urlencode "contract_id=10909" \
+  --data-urlencode "window_seconds=86400" \
+  --data-urlencode "limit=100"
+```
+
+### Response
+
+```json
+{
+  "trades": [
+    {
+      "trade_id": "0x20e837…:172",
+      "contract_id": "10909",
+      "size": 51,
+      "price": 97.4,
+      "outcome": "no",
+      "timestamp": 1784094262.213,
+      "token_id": "95637417…",
+      "taker_address": "0x5e5a…",
+      "side": "BUY"
+    }
+  ],
+  "has_more": true,
+  "oldest_available_ts": 1784081362.4,
+  "coverage_hours": 3.6
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `trade_id` | string | Venue-scoped unique trade identifier |
+| `size` | integer | Quantity in contracts |
+| `price` | number | Executed price of the traded outcome, 0–100 scale |
+| `outcome` | string | The outcome that was traded (e.g. `yes`, `no`, or a named outcome on multi-outcome markets) |
+| `timestamp` | number | Execution time, unix seconds with millisecond precision |
+| `token_id` | string | Outcome token identifier; omitted when not applicable |
+| `taker_address` | string | Taker wallet address; omitted when not applicable |
+| `side` | string | Taker direction as stored on the trade row (casing is venue-dependent); omitted when unknown |
+| `metadata` | string | Raw JSON blob from ingestion, passed through as an unparsed string; omitted when empty or `{}` |
+| `has_more` | boolean | More records exist before the oldest returned |
+| `oldest_available_ts` | number \| null | Timestamp of the oldest record returned |
+| `coverage_hours` | number | Hours between the oldest returned record and now |
+
+Records are ordered newest first, deduplicated by trade id, and filtered to
+`0 < price ≤ 100` with a non-zero size.
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | Missing or unknown `provider`; missing `contract_id`; `window_seconds` or `limit` outside their ranges; a non-positive or non-integer `before` | Fix the named parameter and resend |
+| `401` / `403` / `429` | — | Credential or budget problem | See [Authentication](/market-data/authentication#errors) |
+| `500` | `internal` | `trades query failed` | Retry with backoff |
+| `503` | `rate_limiter_unavailable` | The rate limiter is down; the API fails closed | Retry with backoff |
+
+There is no `404`. An unknown `contract_id` returns an empty result, not an
+error.
+
+### Paging backwards
+
+Repeat the request with `before` set to the oldest `timestamp` you received
+(as integer seconds), while `has_more` is true.
+
+> **`has_more` only means "the page came back full."** It is true whenever
+> exactly `limit` records were returned — it is not a lookahead. Expect one
+> final empty or short page at the end of the tape.
+
+> **`window_seconds` always measures back from *now*, never from `before`.**
+> Page far enough back and your window no longer contains the trades you asked
+> for, so the primary query empties out — at which point the fallback below
+> takes over and paging keeps working.
+
+### The empty-window fallback
+
+If the window contains no trades, the query is retried with no lower bound at
+all (still bounded above by `before`, or now). The response then carries the
+most recent trades the contract has before that point, which may be far older
+than the window you asked for.
+
+<Note>
+**Inspect `oldest_available_ts` to detect this.** A value far outside your
+requested window means you are looking at the fallback, not at trades inside
+`window_seconds`.
+</Note>
+
+### Notes
+
+- The implicit "now" upper bound is quantized to a few seconds so repeated
+  polls share a server-side cache. Responses are `Cache-Control: private,
+  max-age=5` with no ETag, so this route never returns `304`.
+- Prices always refer to the outcome actually traded. To express a trade on
+  any outcome in terms of the other outcome of a binary market, use
+  `100 − price`.
+
+## Volume metrics
+
+```
+GET /v1/trades/metrics
+```
+
+Returns aggregate notional, per-outcome split, and trade count for one
+contract over a window. Cheaper than paging the tape when you only need totals.
+
+**Auth:** none required. `light` bucket, flat 1 unit.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | Registered provider |
+| `contract_id` | string | yes | — | Contract/market identifier |
+| `window_seconds` | integer | no | `86400` | Aggregation window, 3600–86400 |
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/trades/metrics \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=1897067" \
+  --data-urlencode "window_seconds=86400"
+```
+
+### Response
+
+```json
+{
+  "metrics": {
+    "volume_usd": 1865734.6,
+    "outcome_0_volume_usd": 1705203.42,
+    "outcome_1_volume_usd": 160531.17,
+    "outcome_0_volume_share_pct": 91.4,
+    "trade_count": 141826,
+    "window_seconds": 86400,
+    "coverage_pct": 100.0
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `volume_usd` | number | Total notional traded in the window, USD |
+| `outcome_0_volume_usd` | number | Notional attributed to the first outcome |
+| `outcome_1_volume_usd` | number | Notional attributed to the second outcome |
+| `outcome_0_volume_share_pct` | number | First outcome's share of two-outcome notional, percent; `50.0` when the window is empty |
+| `trade_count` | integer | Number of trades in the window |
+| `window_seconds` | integer | Echoes the effective request parameter |
+| `coverage_pct` | number | Portion of the requested window covered by available history, clamped to 0–100; below 100 typically indicates a recently listed contract. `0` when the window has no trades |
+
+[Notional](/learn/glossary) is computed per trade as `size × price / 100`.
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | Missing or unknown `provider`; missing `contract_id`; `window_seconds` outside its range | Fix the named parameter and resend |
+| `401` / `403` / `429` | — | Credential or budget problem | See [Authentication](/market-data/authentication#errors) |
+| `500` | `internal` | `metrics query failed` | Retry with backoff |
+| `503` | `rate_limiter_unavailable` | The rate limiter is down; the API fails closed | Retry with backoff |
+
+A contract with no trades in the window returns `200` with zeroed volumes and
+`outcome_0_volume_share_pct: 50.0`, not a `404`.
+
+### Notes
+
+<Note>
+**`outcome_0` / `outcome_1` are not a guaranteed Yes/No mapping.** On Kalshi
+they are the `yes` and `no` sides. On **every other venue** they are the two
+highest-volume outcome tokens in the window, in descending volume order —
+a volume ranking, recomputed per window. If you need a specific outcome,
+resolve its `token_id` from
+[market metadata](/market-data/markets#market-metadata).
+</Note>
+
+Like `/v1/trades`, this endpoint is `Cache-Control: private, max-age=5` with
+no ETag.

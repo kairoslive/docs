@@ -1,0 +1,268 @@
+---
+title: "Providers"
+description: "Exchange-agnostic provider configuration: order types, auth flow, chain, and token-format metadata"
+---
+
+Configuration metadata for every active prediction-market provider — order types, auth flow, chain, and the token/metadata-key format the frontend needs to look up a market. Call these endpoints when you need to know what a venue supports before you build a request against it.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+## Authentication
+
+None. No auth dependency is attached to this router at all, so no auth headers are checked on any endpoint below, and the router is deliberately excluded from the invite gate that covers the user-facing routers. The curl examples send no credentials.
+
+<Note>
+**Gotcha:** the active provider set is deployment-specific. Discover it with `GET /providers/configs` instead of hard-coding the providers shown in the examples on this page.
+</Note>
+
+## List provider configurations
+
+```
+GET /providers/configs
+```
+
+Every active provider currently loaded from the provider configuration, cached in-process. The active set is deployment-specific; use this endpoint for discovery instead of hard-coding the examples below. **Public endpoint — no auth dependency is attached to this router at all, so no auth headers are checked.** Not decorated with a per-route rate limit; only the global default (100/minute) applies.
+
+### Request
+
+No parameters.
+
+```bash
+curl https://data.kairos.trade/providers/configs
+```
+
+### Response
+
+```json
+{
+  "configs": [
+    {
+      "id": "kalshi",
+      "display_name": "Kalshi",
+      "icon_url": "https://assets.kairos.trade/providers/kalshi.svg",
+      "chain_id": "0",
+      "chain_name": "Kalshi (Centralized)",
+      "is_active": true,
+      "supported_order_types": ["limit", "market"],
+      "supports_walk_the_book": true,
+      "supports_token_approval": false,
+      "has_multi_token_markets": false,
+      "auth_flow_type": "api_key",
+      "token_id_format": "opaque",
+      "metadata_key_type": "marketId",
+      "numeric_id": 1,
+      "primary_color": null,
+      "created_at": "2024-01-15T10:30:00.000Z",
+      "updated_at": "2024-06-20T15:45:00.000Z"
+    },
+    {
+      "id": "polymarket",
+      "display_name": "Polymarket",
+      "icon_url": "https://assets.kairos.trade/providers/polymarket.svg",
+      "chain_id": "137",
+      "chain_name": "Polygon",
+      "is_active": true,
+      "supported_order_types": ["limit", "market", "fok"],
+      "supports_walk_the_book": true,
+      "supports_token_approval": true,
+      "has_multi_token_markets": true,
+      "auth_flow_type": "wallet_signature",
+      "token_id_format": "clob_uint256",
+      "metadata_key_type": "conditionId",
+      "numeric_id": 2,
+      "primary_color": null,
+      "created_at": "2024-01-15T10:30:00.000Z",
+      "updated_at": "2024-07-01T09:00:00.000Z"
+    }
+  ],
+  "meta": { "count": 2 }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `configs[].id` | string | Provider identifier, e.g. `kalshi` \| `polymarket` \| `predictfun` \| `hyperliquid` |
+| `configs[].auth_flow_type` | string | `none` \| `wallet_signature` \| `api_key` |
+| `configs[].supported_order_types` | array | e.g. `limit`, `market`, `fok` |
+| `configs[].supports_walk_the_book` | boolean | Market orders may walk through the orderbook |
+| `configs[].supports_token_approval` | boolean | Requires an on-chain token approval before trading |
+| `configs[].has_multi_token_markets` | boolean | Markets may have more than one tradeable outcome token |
+| `configs[].token_id_format` | string | `opaque` (presence-only check, e.g. Kalshi tickers) or `clob_uint256` (uint256 CLOB condition tokens — Polymarket / predict.fun / other CTFExchange forks); default `opaque` |
+| `configs[].metadata_key_type` | string | Which id the frontend's market-metadata lookup keys on: `marketId` or `conditionId`; default `marketId` |
+| `configs[].numeric_id` | integer \| null | Numeric provider id used internally; `null` if not yet registered in the central provider map |
+| `configs[].primary_color` | string \| null | Brand hex color; `null` means the frontend falls back to a neutral color |
+| `configs[].created_at` / `updated_at` | string \| null | Timestamps |
+| `meta.count` | integer | Number of configs returned |
+
+> **Gotcha:** an empty `configs` array is a valid response, not an error. It means no providers are currently active.
+
+> **Gotcha:** `numeric_id` can be `null` — a provider that is active and fully usable here may still not be registered in the central provider map. Do not key your own storage on it without a null check.
+
+## Get a provider configuration
+
+```
+GET /providers/configs/{provider_id}
+```
+
+Look up a single provider by id (case-insensitive, trimmed) from the same in-process cache as the list endpoint. **Public endpoint — no auth required.** Only the global rate limit (100/minute) applies.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider_id` (path) | string | Yes | — | Case-insensitive. Provider identifier. |
+
+```bash
+curl https://data.kairos.trade/providers/configs/hyperliquid
+```
+
+### Response
+
+Same shape as one entry of `configs[]` above.
+
+```json
+{
+  "id": "hyperliquid",
+  "display_name": "Hyperliquid",
+  "icon_url": "https://imagedelivery.net/Hias1rvxalFDFzbgXzaBJg/cfe0d4ac-9597-415b-c186-a375bda5be00/public",
+  "chain_id": "hyperliquid",
+  "chain_name": "Hyperliquid",
+  "is_active": true,
+  "supported_order_types": ["limit", "market"],
+  "supports_walk_the_book": false,
+  "supports_token_approval": false,
+  "has_multi_token_markets": true,
+  "auth_flow_type": "wallet_signature",
+  "token_id_format": "opaque",
+  "metadata_key_type": "marketId",
+  "numeric_id": 9,
+  "primary_color": "#97FCE4",
+  "created_at": "2026-01-15T10:30:00.000Z",
+  "updated_at": "2026-07-20T15:45:00.000Z"
+}
+```
+
+<Warning>
+**Gotcha:** the `404` `detail` echoes the **raw** `provider_id` as sent, not the lowercased/trimmed form used for the lookup. Do not parse it back out as a canonical id.
+</Warning>
+
+## Providers available to API keys
+
+```
+GET /providers/api-access
+```
+
+The subset of active providers whose API-key access is currently enabled. Each active provider id from [the config list](#list-provider-configurations) is checked against its `api_access_<provider>_enabled` feature flag (5-second cache); a provider with no flag row defaults to enabled. Session and admin callers are unaffected by these flags — this endpoint describes the API-key surface only.
+
+**Public endpoint — no auth required.** Only the global rate limit (100/minute) applies.
+
+### Request
+
+No parameters.
+
+```bash
+curl https://data.kairos.trade/providers/api-access
+```
+
+### Response
+
+```json
+{
+  "providers": ["kalshi", "polymarket", "predictfun"],
+  "meta": { "count": 3 }
+}
+```
+
+`providers[]` holds provider ids in the same order as the config list, filtered to the enabled ones. An empty array is valid — it means no provider is currently open to API-key traffic.
+
+## Provider reference
+
+Snapshot of three commonly configured providers. The live set comes from `GET /providers/configs`.
+
+### Kalshi
+
+| Property | Value |
+|---|---|
+| ID | `kalshi` |
+| Numeric ID | 1 |
+| Chain | Centralized (off-chain) |
+| Auth flow | `api_key` |
+| Order types | `limit`, `market` |
+| Token approval | Not required |
+| Multi-token markets | No |
+| Token ID format | `opaque` |
+| Metadata key | `marketId` |
+
+### Polymarket
+
+| Property | Value |
+|---|---|
+| ID | `polymarket` |
+| Numeric ID | 2 |
+| Chain | Polygon (`chain_id: 137`) |
+| Auth flow | `wallet_signature` |
+| Order types | `limit`, `market`, `fok` |
+| Token approval | Required |
+| Multi-token markets | Yes |
+| Token ID format | `clob_uint256` |
+| Metadata key | `conditionId` |
+
+### Hyperliquid
+
+| Property | Value |
+|---|---|
+| ID | `hyperliquid` |
+| Numeric ID | 9 |
+| Chain | Hyperliquid L1 |
+| Auth flow | `wallet_signature` (one-time agent authorization) |
+| Order types | `limit`, `market` |
+| Token approval | Not required |
+| Multi-token markets | Yes — one book per HIP-4 side |
+| Token ID format | `#<encoding>`, where `encoding = 10 * outcome_id + side` |
+| Metadata key | `marketId` |
+
+## Configuration fields
+
+What each enum value and flag in the response means.
+
+**Order types:** `limit` (limit order at a specified price), `market` (executes immediately), `fok` (fill-or-kill — complete fill or cancel).
+
+**Auth flow types:** `none` (no authentication), `wallet_signature` (sign a message with a wallet), `api_key` (API-key authentication).
+
+**Token ID format:** `opaque` (presence-only validation — Kalshi-style tickers) or `clob_uint256` (long-decimal uint256 condition tokens — Polymarket, predict.fun, and other CTFExchange forks). Config-driven, so adding a new CLOB venue is a config-row edit, not a code change.
+
+**Metadata key type:** `marketId` (frontend's market-metadata cache is keyed by the numeric market id) or `conditionId` (Polymarket, keyed by on-chain condition id).
+
+**`supports_token_approval`:** when `true`, users must approve token spending before placing orders.
+
+**`has_multi_token_markets`:** when `true`, the provider's markets may have more than one tradeable outcome token.
+
+**`supports_walk_the_book`:** when `true`, the provider supports market orders that walk through the orderbook.
+
+## Integration notes
+
+- Read the flags above off the response rather than branching on provider id — a new venue arrives as a config row, not a code change.
+- The provider list is cached in-process, so a configuration change can take effect on the next cache load rather than immediately.
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`, except `429`, which is `{ "error": "Rate limit exceeded: <limit>" }` and carries `Retry-After` / `X-RateLimit-*` headers. Unhandled failures are `500 {"detail": "An internal error occurred. Please try again later."}`.
+
+The Code column holds the exact `detail` string this router returns, or `—` where there is none.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 404 | `Provider 'invalid-provider' not found` | `GET /providers/configs/{provider_id}` — no active provider matches | Fix the id and resend. List `GET /providers/configs` to see the active set; the `detail` echoes your raw input, not a normalised id. |
+| 429 | — | Global default limit (100/minute) exceeded — this router has no per-endpoint limits | Back off and retry; `Retry-After` says how long. |
+| 500 | `An internal error occurred. Please try again later.` | Provider configuration can't be loaded from the database | Report to support with the response body. |
+| 503 | `Unable to verify platform API access` | `GET /providers/api-access` — the access flags can't be read, or a flag row is malformed | Report to support with the response body. The config list endpoints are unaffected, so you can still discover providers. |
+
+There is no `401` or `403` on this page: none of these endpoints attach an auth dependency, and the router is deliberately excluded from the invite gate that covers the user-facing routers.
+
+`POST /providers/configs/reload` also lives on this router but is admin-only (forces a cache refresh from the database) and is not part of the public API.

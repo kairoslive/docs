@@ -2,11 +2,24 @@
   "$schema": "https://mintlify.com/docs.json",
   "name": "Kairos",
   "theme": "luma",
-  "favicon": "https://media.brand.dev/03366fe1-69e7-4f87-98e6-fc0b1ae207a7.webp",
+  "appearance": {
+    "default": "dark"
+  },
+  "favicon": "/logo/kairos-wing.png",
+  "logo": {
+    "light": "/logo/kairos-wing.png",
+    "dark": "/logo/wordmark.png"
+  },
   "colors": {
     "primary": "#807dfe",
-    "light": "#060610",
-    "dark": "#848488"
+    "light": "#6d6ae0",
+    "dark": "#a5a3ff"
+  },
+  "background": {
+    "color": {
+      "light": "#ffffff",
+      "dark": "#0a0a0f"
+    }
   },
   "navbar": {
     "primary": {
@@ -15,6 +28,20 @@
       "href": "https://app.kairos.trade"
     }
   },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "download-spec",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ],
+    "display": "header"
+  },
   "navigation": {
     "tabs": [
       {
@@ -22,6 +49,7 @@
         "groups": [
           {
             "group": "Get Started",
+            "icon": "rocket",
             "pages": [
               "introduction",
               "quickstart",
@@ -30,6 +58,7 @@
           },
           {
             "group": "Core Concepts",
+            "icon": "book-open",
             "pages": [
               "concepts/markets",
               "concepts/venues",
@@ -38,22 +67,78 @@
             ]
           },
           {
-            "group": "Guides",
+            "group": "Learn Trading",
+            "icon": "graduation-cap",
             "pages": [
-              "guides/trading",
-              "guides/market-data",
-              "guides/websocket",
+              "learn/prediction-markets",
+              "learn/order-book",
+              "learn/order-types",
+              "learn/time-in-force",
+              "learn/execution-and-slippage",
+              "learn/positions-and-pnl",
+              "learn/glossary"
+            ]
+          },
+          {
+            "group": "Guides",
+            "icon": "compass",
+            "pages": [
+              "guides/overview",
+              "guides/authentication",
+              "guides/order-types",
+              "guides/synthetic-books",
               "guides/auctions",
               "guides/cross-venue-routing",
               "guides/combos"
             ]
           },
           {
-            "group": "WebSocket",
+            "group": "Perpetual Futures",
+            "icon": "infinity",
             "pages": [
-              "websocket/overview",
-              "websocket/market-data",
-              "websocket/protobuf"
+              "perpetuals/overview",
+              "perpetuals/instruments-and-identity",
+              "perpetuals/exact-values-and-time",
+              "perpetuals/order-books",
+              "perpetuals/trades-and-candles",
+              "perpetuals/funding-and-market-state",
+              "perpetuals/accounts-and-margin",
+              "perpetuals/positions-orders-and-fills",
+              "perpetuals/risk-and-liquidations",
+              "perpetuals/streaming-and-recovery",
+              "perpetuals/venue-normalization",
+              "perpetuals/availability-and-guarantees"
+            ]
+          },
+          {
+            "group": "External Execution",
+            "icon": "key",
+            "pages": [
+              "external-execution/overview",
+              "external-execution/signing",
+              "external-execution/regional-execution"
+            ]
+          },
+          {
+            "group": "Trading",
+            "icon": "chart-line",
+            "pages": [
+              "trading/fees",
+              "trading/copy-trading"
+            ]
+          },
+          {
+            "group": "Compliance",
+            "icon": "scale-balanced",
+            "pages": [
+              "compliance/geo-restrictions"
+            ]
+          },
+          {
+            "group": "Updates",
+            "icon": "megaphone",
+            "pages": [
+              "changelog"
             ]
           }
         ]
@@ -62,44 +147,116 @@
         "tab": "API Reference",
         "groups": [
           {
+            "group": "Overview",
+            "icon": "book",
+            "pages": [
+              "api-reference"
+            ]
+          },
+          {
+            "group": "REST API",
+            "icon": "server",
+            "pages": [
+              "rest/orders",
+              "rest/ctf",
+              "rest/markets",
+              "rest/trading-data",
+              "rest/pnl",
+              "rest/search",
+              "rest/providers",
+              "rest/sports",
+              "rest/trader-stats",
+              "rest/top-holders",
+              "rest/matched-markets",
+              "rest/combo",
+              "rest/exchanges"
+            ]
+          },
+          {
             "group": "Market Data API",
+            "icon": "database",
             "pages": [
-              "api/market-data/overview",
-              "api/market-data/markets",
-              "api/market-data/candles",
-              "api/market-data/trades",
-              "api/market-data/perpetuals"
+              "market-data/overview",
+              "market-data/authentication",
+              "market-data/candles",
+              "market-data/trades",
+              "market-data/markets"
             ]
           },
           {
-            "group": "Data API",
+            "group": "RPC API",
+            "icon": "plug",
             "pages": [
-              "api/data/overview",
-              "api/data/markets",
-              "api/data/search",
-              "api/data/sports",
-              "api/data/trader-analytics",
-              "api/data/pnl"
+              "rpc/overview",
+              "rpc/positions",
+              "rpc/portfolio",
+              "rpc/api-keys"
             ]
           },
           {
-            "group": "Execution API",
+            "group": "RFQ Network",
+            "icon": "comments",
             "pages": [
-              "api/execution/overview",
-              "api/execution/orders",
-              "api/execution/exchanges",
-              "api/execution/routing",
-              "api/execution/combos",
-              "api/execution/onboarding"
+              "rfq/overview",
+              "rfq/rest-and-streaming",
+              "rfq/fix"
             ]
           },
           {
-            "group": "Agora Auction API",
+            "group": "WebSocket",
+            "icon": "bolt",
             "pages": [
-              "api/agora/overview",
-              "api/agora/auctions",
-              "api/agora/quotes"
+              "websocket/market-data-websocket",
+              "websocket/order-updates",
+              "websocket/order-execution",
+              "websocket/fee-quote",
+              "websocket/synthetic-books",
+              "websocket/protobuf-reference"
             ]
+          },
+          {
+            "group": "Krisis Engine",
+            "icon": "robot",
+            "pages": [
+              "krisis/overview",
+              "krisis/strategies",
+              "krisis/conditional-orders",
+              "krisis/funds-credentials",
+              "krisis/positions-pnl",
+              "krisis/market-data"
+            ]
+          },
+          {
+            "group": "Market Data API (OpenAPI)",
+            "icon": "code",
+            "openapi": {
+              "source": "openapi/market-data-api.yaml",
+              "directory": "api-reference/market-data"
+            }
+          },
+          {
+            "group": "Data API (OpenAPI)",
+            "icon": "code",
+            "openapi": {
+              "source": "openapi/data-api.yaml",
+              "directory": "api-reference/data"
+            }
+          },
+          {
+            "group": "Execution API (OpenAPI)",
+            "icon": "code",
+            "openapi": {
+              "source": "openapi/execution.yaml",
+              "directory": "api-reference/execution"
+            }
+          },
+          {
+            "group": "Agora Auction API (OpenAPI)",
+            "icon": "code",
+            "openapi": {
+              "source": "openapi/agora.yaml",
+              "directory": "api-reference/agora"
+            }
           }
         ]
       }

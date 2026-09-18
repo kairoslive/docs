@@ -1,0 +1,183 @@
+---
+title: "Funding and market state"
+description: "Typed prices, market measures, funding phases, and revisions"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, enabled in production and staging today; a
+deployment with the flag off returns `404` for every perpetual route. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+What the `market_state` and `funding` blocks of the
+[REST snapshot](/perpetuals/overview#live-snapshot) contain, and — more
+importantly — what each venue leaves out. The per-venue gaps here are the part
+that breaks integrations.
+
+Perp venues publish several prices and market measures that are related but not
+interchangeable. Kairos models them as typed observations rather than adding
+loosely named fields to a ticker.
+
+<Note>
+**Mixed status:** the typed-observation model below is a design preview.
+Hyperliquid funding and market state are already being collected — see
+[Hyperliquid today](#hyperliquid-today).
+</Note>
+
+## Market state
+
+`market_state.prices` is a **sparse** array of
+`{price_type, value, observed_time_ns}`, and the available types differ by
+venue:
+
+| Venue | `prices[].price_type` | `measures[].measure_type` | `status` |
+|---|---|---|---|
+| Hyperliquid | `mark`, `oracle`, `mid` — each omitted when the venue omits it | `open_interest` in `base_asset`, always present | `active`, or `delisted` when the venue flags the asset |
+| Polymarket Perps | `index`, `mark`, `last`, `mid` — all four required | `open_interest` in `contracts` | `active` |
+| Kalshi Margin | `price`, `bid`, `ask` (each omitted when zero), plus `reference`, `settlement_mark`, `liquidation_mark` with their own venue timestamps | `open_interest` in `contracts`, `open_interest_notional` in `usd` | `active`, `inactive`, or `unknown` |
+
+> **Select a price by type. Never use "best available."** An absent price is
+> not copied from another price type, and a venue-provided mark is not replaced
+> by a locally calculated mid. If you need `mark` and the venue omitted it, you
+> do not have a mark.
+
+> **`next_funding_time_ns` is populated only by Polymarket Perps.** Do not
+> build a countdown that assumes every venue supplies one.
+
+The status vocabulary the validator accepts is exactly `active`, `inactive`,
+`delisted`, `unknown`. A snapshot carrying anything else returns `502`.
+
+There is no `premium`, `basis`, `rolling volume`, or reduce-only state on the
+REST snapshot. Those fields exist on `kairos.v2.MarketStateUpdate`, which the
+beta does not publish.
+
+### The full canonical market-state model
+
+A market-state update can contain sparse observations such as mark price, index
+price, oracle price, mid price, last trade price, open interest, rolling
+volume, premium or basis, and market status and reduce-only state. Every price
+has a type and source.
+
+Sparse updates merge only within the same instrument, source epoch, and state
+source. Fields are ordered by their own observation or revision identity; a
+newer message cursor does not make every field in an older snapshot obsolete.
+
+## Funding observations
+
+On the REST snapshot a funding record is `rate`, `phase`, `effective_time_ns`,
+`calculated_time_ns`, `rate_period_seconds`, `payment_interval_seconds`,
+`sign_convention`, `funding_price`, and `funding_price_type`.
+
+What each venue actually fills in differs, and the gaps are the point:
+
+| Venue | Source | `phase` | `rate_period_seconds` / `payment_interval_seconds` | `funding_price_type` |
+|---|---|---|---|---|
+| Hyperliquid | `fundingHistory`, last hour | `final` | both `3600` | absent |
+| Polymarket Perps | `/v1/info/funding`, last hour | `final` | both `3600` | `mark`, when the venue supplies a price |
+| Kalshi Margin | `/margin/funding_rates/estimate` | `estimate` | **both absent** | `mark` |
+
+<Warning>
+**Kalshi Margin's funding rate cannot be normalized from the snapshot
+alone.** It publishes an estimate with no declared rate period and no
+declared payment cadence. **Do not assume 3600 seconds because the other two
+venues use it.** Compare funding across venues only after aligning sign and
+interval.
+</Warning>
+
+All three declare `positive_longs_pay`. That is enforced, not observed: a
+funding record with any other sign convention, or a `phase` outside
+`estimate` / `final`, fails validation and the request returns `502`.
+
+<Note>
+**`effective_time_ns` means different things by phase.** It is the *next*
+funding time for Kalshi's estimate and the settled interval time for the
+other two. An estimate is allowed up to 24 hours in the future; a final
+record is not.
+</Note>
+
+### The full canonical funding model
+
+A funding update identifies:
+
+| Dimension | Examples |
+| --- | --- |
+| Phase | predicted, current/accruing, fixed, settled |
+| Sign convention | positive means longs pay; another explicitly named convention |
+| Rate interval | hourly, eight-hour equivalent, venue-native interval |
+| Settlement interval | actual payment cadence |
+| Reference prices | mark, index, oracle, premium inputs |
+| Effective period | start, end, and settlement time where applicable |
+| Revision | monotonic version for the same observation |
+
+Rates are stored in their native interval. Kairos may additionally expose a
+normalized rate only when the conversion is mathematically and economically
+valid, with the target interval named. Clients must not compare an hourly rate
+with an eight-hour rate as if they were the same unit.
+
+<Warning>
+**Predicted funding is not a payment, and a settled public funding
+observation is not an account ledger entry.** These remain separate records.
+Do not derive account payments from public rates alone.
+</Warning>
+
+## Funding sign
+
+The venue's sign convention is carried explicitly. A UI may render "longs pay"
+or "shorts pay," but storage and transport never rely on an undocumented sign
+assumption.
+
+## Revisions and historical truth
+
+Predictions can change repeatedly before settlement. The latest projection is
+useful for display; the revision history is useful for research and audit.
+Kairos therefore distinguishes:
+
+- the append-only observation history
+- the current projection for fast reads
+- the final venue settlement, when published
+
+Preserve revisions for backtests that must avoid look-ahead.
+
+## Hyperliquid today
+
+Hyperliquid funding and reference prices are collected by polling the venue's
+public info endpoint — `POST https://api.hyperliquid.xyz/info` with
+`{"type":"metaAndAssetCtxs"}` — every **30 seconds**. That response is a
+two-element tuple: the asset universe, then a positionally matching array of
+asset contexts, so a length mismatch is treated as a broken response rather
+than silently mispaired.
+
+Each polled asset context yields:
+
+| Observation | Value |
+|---|---|
+| Funding rate | The venue's `funding` value |
+| Funding phase | `estimate` — an accruing projection, not a settled payment |
+| Rate interval | 3600 s. Hyperliquid accrues and charges funding hourly |
+| Sign convention | `positive_longs_pay` |
+| Mark price | Required |
+| Oracle price, mid price, open interest | Recorded when the venue supplies them; open interest is in base-asset units |
+
+A malformed or half-populated asset context is skipped individually — one
+delisted coin must not cost the funding observation for every other instrument.
+An asset the venue marks `isDelisted` is dropped before decoding: it keeps its
+slot in the universe, and recording funding for it would imply a live contract.
+
+<Note>
+**Same venue, two paths, two legitimate phases.** This poller records
+`estimate` because Hyperliquid exposes only a current accruing value; the
+REST snapshot's `funding` array reads `fundingHistory` and records `final`.
+The polled rows land in the perpetual fact tables, not in any public
+endpoint.
+</Note>
+
+## Consumer rules
+
+- Select a price by type; never use "best available."
+- Compare funding only after aligning sign and interval.
+- Do not derive account payments from public rates alone.
+- Preserve revisions for backtests that must avoid look-ahead.
+- Treat market status as a trading prerequisite, not decorative metadata.
+
+Next: [Accounts and margin](/perpetuals/accounts-and-margin).

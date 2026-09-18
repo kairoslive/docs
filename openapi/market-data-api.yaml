@@ -1,0 +1,3258 @@
+# Kairos Market Data API — OpenAPI 3.1 specification.
+# Canonical source of truth for the public API reference.
+#
+# Consumers:
+#   - services/web/scripts/build-openapi.ts        -> /openapi/market-data-api.{yaml,json} static assets
+#   - services/web/scripts/generate-api-reference.ts -> docs 'API Reference' page + try-it panels
+#   - services/market-data-api/internal/server/openapi_coverage_test.go -> CI check that every
+#     registered route is documented here (and nothing phantom is)
+#
+# When you add or change a Market Data API route, update this file in the same PR —
+# the coverage test fails otherwise.
+openapi: 3.1.0
+# Every /v1 operation on this service is reachable on the anonymous free
+# tier (per-IP budgets) — the reference UI badges them "free" by default.
+x-kairos-anonymous: true
+info:
+  title: Kairos Market Data API
+  version: 1.2.0
+  summary: Read-only prediction and perpetual market data across venues.
+  description: |
+    The Kairos Market Data API provides read-only access
+    to normalized prediction-market data across every venue Kairos integrates:
+    OHLCV candles, the trade tape, market metadata, resolution lifecycles, and
+    latest mark prices.
+
+    ## No signup required
+
+    Every endpoint works **without credentials** on the anonymous free tier,
+    rate-limited per source IP (120 light units/min, 20 heavy units/min). Try any
+    request from the interactive docs at
+    [app.kairos.trade/docs/market-data](https://app.kairos.trade/docs/market-data)
+    or straight from curl. For production budgets (1,200 light and 150 heavy
+    units/min by default, raisable per credential), request an API key from the
+    Kairos team.
+
+    ## Authentication
+
+    Three modes, resolved per request:
+
+    - **Anonymous** — no credential headers at all. Free tier, IP-keyed limits.
+    - **API key** — `X-Client-Id` + `X-Api-Key` + `X-Api-Secret` headers
+      (all three; partial header sets are rejected with 401 rather than
+      degrading to anonymous).
+    - **First-party session** — `Authorization: Bearer` JWT (Kairos web app
+      sessions only; not offered to API consumers).
+
+    Resolution order is fixed: an `Authorization` header takes the bearer
+    path, any of the three API-key headers takes the API-key path, and only
+    a request carrying neither is eligible for the anonymous tier.
+
+    On the API-key path, an unreachable credential store surfaces on **any**
+    endpoint as `500` with `code: internal` and the message
+    `authentication backend unavailable`. A source IP outside a credential's
+    whitelist is `403 ip_not_whitelisted`; that is the only 403 this service
+    emits.
+
+    ## Rate limiting
+
+    Weighted sliding-window budgets over one minute, in **units**, across two
+    independent buckets: light (candles, metadata, resolutions, trade
+    metrics) and heavy (trade history, marks, perpetual snapshots). Most
+    requests cost 1 unit; larger requests may consume more of your quota —
+    each operation's `x-kairos-rate-limit` states its exact cost model.
+    Every admitted response carries `X-RateLimit-Bucket`, `X-RateLimit-Tier`,
+    `X-RateLimit-Remaining`, and `X-RateLimit-Reset`; 429s add `Retry-After`.
+
+    A separate per-IP admission gate runs *before* authentication to keep a
+    flood off shared infrastructure. It also answers 429 `rate_limited`, but
+    with `Retry-After: 60` and no `X-RateLimit-*` headers.
+
+    Redis backs the weighted limiter and it fails **closed**: if it is
+    unreachable the request is rejected with 503 `rate_limiter_unavailable`
+    rather than let through unmetered.
+
+    ## Conventions
+
+    - **Prediction-market prices** are on the 0–100 scale (implied probability
+      × 100) in the prediction candle, trade, and mark endpoints. Prediction
+      USD notional = `size × price / 100`.
+    - **Perpetual prices are direct venue prices**, not probabilities and not
+      0–100 values. Perpetual quantities retain their declared native unit
+      (`base_asset` or `contracts`). Never divide a perpetual price by 100 or
+      compute contract notional without the instrument's authoritative contract
+      multiplier; the snapshot does not synthesize a cross-venue notional.
+    - **Hyperliquid is two products on one venue.** Its HIP-4 outcome markets
+      are prediction markets, read with `provider=hyperliquid` on the
+      prediction endpoints; its perpetuals are bare coins read under
+      `/v1/perpetuals/hyperliquid/{instrument}/snapshot`, where the instrument
+      is the canonical id `hl-mainnet-<symbol>-<quote>` (e.g.
+      `hl-mainnet-btc-usdt`). Different id schemes, different price semantics;
+      they are never interchangeable.
+    - **Errors** all use one envelope:
+      `{"error": {"code": "...", "message": "..."}}`.
+    - **Providers** are case-insensitive; `kalshi_offchain` aliases `kalshi`,
+      `dome` aliases `polymarket`, and `opinion` is resolvable for historic
+      reads only.
+  contact:
+    name: Kairos
+    url: https://app.kairos.trade/docs/market-data
+  termsOfService: https://kairos.trade/terms
+servers:
+- url: https://md.kairos.trade
+  description: Production
+- url: https://staging-md.kairos.trade
+  description: Staging
+security:
+- {}
+- apiKeyClientId: []
+  apiKeyKey: []
+  apiKeySecret: []
+tags:
+- name: Candles
+  description: OHLCV candle series (1s → 1d), JSON or compact columnar binary.
+- name: Trades
+  description: Trade tape and aggregate volume metrics.
+- name: Markets
+  description: Market metadata, batch lookup, identifier resolution, and enumeration.
+- name: Resolutions
+  description: Resolution outcomes and UMA-style lifecycle state/timelines.
+- name: Marks
+  description: Latest mark (last trade price) per outcome token.
+- name: Perpetuals
+  description: Live perpetual books, trades, candles, funding, and market state. Beta.
+- name: Status
+  description: Health and readiness probes.
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      x-kairos-auth: public
+      x-kairos-rate-limit: none — registered directly on the mux, outside the auth and rate-limit middleware chain
+      summary: Liveness probe
+      tags:
+      - Status
+      security: []
+      description: |
+        Trivially cheap liveness check used by the load balancer. Touches no dependencies and is never rate-limited.
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - status
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /ready:
+    get:
+      operationId: getReady
+      x-kairos-auth: public
+      x-kairos-rate-limit: none — registered directly on the mux, outside the auth and rate-limit middleware chain
+      summary: Readiness probe
+      tags:
+      - Status
+      security: []
+      description: |
+        Probes the two dependencies in order — ClickHouse (`SELECT 1`, 3s deadline) then Redis (`PING`) — and returns 503 naming the first one that fails.
+      responses:
+        '200':
+          description: All dependencies reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - ready
+                properties:
+                  ready:
+                    type: boolean
+                    example: true
+        '503':
+          description: A dependency is unreachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - ready
+                - failing
+                properties:
+                  ready:
+                    type: boolean
+                    example: false
+                  failing:
+                    type: string
+                    description: Name of the unavailable dependency.
+                    enum:
+                    - clickhouse
+                    - redis
+                    example: clickhouse
+  /v1/markets/{provider}/{market_id}:
+    get:
+      operationId: getMarket
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request
+      summary: Get one market's metadata
+      tags:
+      - Markets
+      description: |-
+        Returns the full metadata document for a single market. Rate-limit bucket: LIGHT.
+
+        Provider is resolved case-insensitively against the registry (aliases such as `kalshi_offchain` → `kalshi` and `dome` → `polymarket` are accepted and normalized before the lookup).
+
+        Response is ETagged (strong ETag) with a `Cache-Control` header; a matching `If-None-Match` returns 304. Responses ≥1KB are gzip-compressed when the client sends `Accept-Encoding: gzip`.
+      parameters:
+      - name: provider
+        in: path
+        required: true
+        description: Venue identifier. Case-insensitive; aliases are normalized (`kalshi_offchain`→`kalshi`,
+          `dome`→`polymarket`). Unknown values are rejected with 400.
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        example: polymarket
+      - name: market_id
+        in: path
+        required: true
+        description: Venue-specific market identifier (e.g. a Kalshi ticker, or a Polymarket/predict.fun
+          numeric market id or condition id).
+        schema:
+          type: string
+        example: '1897040'
+      responses:
+        '200':
+          description: Market metadata document.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=30
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+              example:
+                exchange_id: polymarket
+                market_id: '1897040'
+                condition_id: 0xabc123...
+                event_id: evt-4521
+                title: Will BTC close above $120k on July 31?
+                neg_risk: false
+                tick_size: 0.01
+                taker_base_fee_bps: 200
+                fees_enabled: true
+                category: Crypto
+                group_slug: btc-price-2026
+                fee_type: standard
+                status: active
+                image: https://cdn.kairos.trade/markets/1897040.png
+                icon: https://cdn.kairos.trade/markets/1897040-icon.png
+                end_date: '2026-07-31T23:59:59Z'
+                open_time: '2026-01-01T00:00:00Z'
+                outcomes:
+                - outcome: 'Yes'
+                  normalized_outcome: 'yes'
+                  token_id: '18812649149814341758733697580460697418474693998558159483117'
+                - outcome: 'No'
+                  normalized_outcome: 'no'
+                  token_id: '88123409981238091823740918237409182734091823740918237409182'
+                raw: {}
+        '304':
+          description: Not Modified — `If-None-Match` matched the current ETag.
+        '400':
+          description: Unknown provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: unknown provider "coinbase"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '404':
+          description: Market not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: market not found
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: '`internal` / `authentication backend unavailable` — the API-key path could not
+            reach the credential store.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: authentication backend unavailable
+        '502':
+          description: Market lookup failed upstream for a reason other than not-found/cold/disabled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: upstream
+                  message: metadata cache request failed
+        '503':
+          description: 'Either the market data source is still warming up (`cache_cold`, with a `Retry-After: 5`
+            header — retry shortly), not configured for this deployment (`unavailable`), or the
+            rate limiter is unreachable (`rate_limiter_unavailable`, fails closed).'
+          headers:
+            Retry-After:
+              schema:
+                type: string
+              description: Present only for `cache_cold`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: cache_cold
+                  message: metadata cache warming up, retry shortly
+      x-kairos-bucket: light
+  /v1/markets/batch:
+    post:
+      operationId: batchGetMarkets
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request, regardless of batch size
+      summary: Fetch multiple markets by id, one provider at a time
+      tags:
+      - Markets
+      description: |-
+        Fetches metadata for one provider and up to 200 market ids in a single call. Rate-limit bucket: LIGHT, flat cost of 1 unit regardless of batch size (unlike `/v1/market-identifiers/resolve`, this endpoint does NOT charge per-item). Not cached (`Cache-Control: no-store`) — every call returns live data.
+
+        Request body is capped at 1 MiB, and `market_ids` is capped at 200 entries per request (`market_ids exceeds maximum 200`).
+
+        Ids that cannot be found are omitted from `markets` and listed in `misses`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketBatchRequest'
+            example:
+              provider: polymarket
+              market_ids:
+              - '1897040'
+              - '1897041'
+              - does-not-exist
+      responses:
+        '200':
+          description: Batch lookup result, keyed by market_id.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketBatchResponse'
+              example:
+                exchange_id: polymarket
+                markets:
+                  '1897040':
+                    exchange_id: polymarket
+                    market_id: '1897040'
+                    condition_id: 0xabc123...
+                    event_id: evt-4521
+                    title: Will BTC close above $120k on July 31?
+                    neg_risk: false
+                    tick_size: 0.01
+                    outcomes:
+                    - outcome: 'Yes'
+                      normalized_outcome: 'yes'
+                      token_id: '18812649149814341758733697580460697418474693998558159483117'
+                    raw: {}
+                misses:
+                - does-not-exist
+        '400':
+          description: Unreadable/invalid JSON body, unknown provider, missing `market_ids`, or `market_ids`
+            exceeds the maximum of 200.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                too_many:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: market_ids exceeds maximum 200
+                empty:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: market_ids is required
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '404':
+          description: The upstream metadata cache answered the batch lookup with 404. Individual ids that
+            are simply absent come back in `misses` with a 200 instead.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: market not found
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: '`internal` / `authentication backend unavailable` — the API-key path could not
+            reach the credential store.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: authentication backend unavailable
+        '502':
+          description: The metadata cache answered with an unexpected status (`upstream` / `metadata cache
+            request failed`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: upstream
+                  message: metadata cache request failed
+        '503':
+          description: '`cache_cold` — the metadata cache is still warming (with `Retry-After: 5`); `unavailable`
+            — no metadata cache is configured for this deployment; or `rate_limiter_unavailable`.'
+          headers:
+            Retry-After:
+              schema:
+                type: string
+              description: Present only for `cache_cold`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-kairos-bucket: light
+  /v1/market-identifiers/resolve:
+    post:
+      operationId: resolveMarketIdentifiers
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per submitted item — admitted at 1 unit, then `len(requests) - 1` charged as a deferred charge
+      summary: Resolve venue-specific identifiers to canonical Kairos market ids
+      tags:
+      - Markets
+      description: |-
+        Maps up to 200 venue-specific identifiers — market-scoped (a venue's market id, ticker, or condition-like identifier) or outcome-scoped (an outcome/token id) — onto Kairos's canonical `market_id` for that provider. Requests are grouped by (provider, scope) for efficient batch resolution. Not cached (`Cache-Control: no-store`).
+
+        Rate-limit bucket: LIGHT, but with a distinct cost model from the other batch endpoints — the request is admitted at a base cost of 1 unit, then the service charges the FULL request-item count (`len(requests) - 1` additional units) as a deferred charge immediately after the body is parsed and size-validated, before any per-item validation runs. This means a batch of N requests always costs N light units even if individual items subsequently fail validation (e.g. a bad `scope`) and the call returns 400.
+
+        Unresolved identifiers are reported with `found: false` and `market_id: null` rather than causing the whole call to fail.
+
+        The request body is capped at 1 MiB.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarketIdentifierResolveRequestBody'
+            example:
+              requests:
+              - provider: polymarket
+                identifier: '18812649149814341758733697580460697418474693998558159483117'
+                scope: outcome
+              - provider: kalshi
+                identifier: KXBTC-26JUL
+                scope: market
+      responses:
+        '200':
+          description: Per-item resolution results, in request order.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketIdentifierResolveResponse'
+              example:
+                results:
+                - provider: polymarket
+                  identifier: '18812649149814341758733697580460697418474693998558159483117'
+                  scope: outcome
+                  found: true
+                  market_id: '1897040'
+                - provider: kalshi
+                  identifier: KXBTC-26JUL
+                  scope: market
+                  found: true
+                  market_id: KXBTC-26JUL
+        '400':
+          description: 'Unreadable/invalid JSON body, empty `requests`, `requests` exceeds 200, an item''s
+            `provider` is unknown, an item''s `identifier` is empty after trimming, or an item''s `scope`
+            is not `market` or `outcome`. Per-item messages include the offending index (e.g. `requests[2].scope
+            must be market or outcome`); the unknown-provider message does not (it reads `unknown provider
+            "…"`). Validation stops at the first bad item.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: requests[0].scope must be market or outcome
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '404':
+          description: 'The upstream metadata cache answered one of the (provider, scope) group lookups
+            with 404. Identifiers that are merely unresolvable come back as `found: false` with a 200.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: market not found
+        '500':
+          description: Response encoding failed (internal error, not upstream).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: market identifier response encoding failed
+        '502':
+          description: A (provider, scope) group lookup failed against the metadata cache — an unexpected
+            upstream status, an undecodable body, or a resolved entry missing its `market_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: upstream
+                  message: metadata cache request failed
+        '503':
+          description: '`cache_cold` (metadata cache still warming, `Retry-After: 5`), `unavailable` (no
+            metadata cache configured), or `rate_limiter_unavailable`.'
+          headers:
+            Retry-After:
+              schema:
+                type: string
+              description: Present only for `cache_cold`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-kairos-bucket: light
+  /v1/markets:
+    get:
+      operationId: listMarkets
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request
+      summary: Paginate active markets for one provider
+      tags:
+      - Markets
+      description: |-
+        Enumerates active markets for a single provider, cursor-paginated. Rate-limit bucket: LIGHT.
+
+        The response is ETagged (strong ETag) with a `Cache-Control` header; a matching `If-None-Match` returns 304.
+
+        Returns 503 (`cache_cold`) until the active-market listing has been populated for the requested provider at least once.
+      parameters:
+      - name: provider
+        in: query
+        required: true
+        description: Venue identifier. Case-insensitive; unknown values are rejected with 400.
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        example: kalshi
+      - name: limit
+        in: query
+        required: false
+        description: Page size. Must be an integer in [1, 250].
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 250
+          default: 100
+        example: 100
+      - name: cursor
+        in: query
+        required: false
+        description: Opaque pagination cursor from a previous response's `next_cursor`.
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Page of active markets.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=30
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketListResponse'
+              example:
+                exchange_id: kalshi
+                markets:
+                - exchange_id: kalshi
+                  market_id: KXBTC-26JUL
+                  condition_id: ''
+                  event_id: KXBTC-26JUL-EVT
+                  title: Bitcoin price above $120k on July 31?
+                  neg_risk: false
+                  outcomes:
+                  - outcome: 'Yes'
+                    normalized_outcome: 'yes'
+                    token_id: KXBTC-26JUL-YES
+                    outcome_index: 0
+                    side: 'yes'
+                  - outcome: 'No'
+                    normalized_outcome: 'no'
+                    token_id: KXBTC-26JUL-NO
+                    outcome_index: 1
+                    side: 'no'
+                  raw: {}
+                count: 1
+                next_cursor: eyJvZmZzZXQiOjEwMH0=
+                has_more: true
+        '304':
+          description: Not Modified — `If-None-Match` matched the current ETag.
+        '400':
+          description: Missing/unknown `provider`, or `limit` out of range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: limit must be an integer in [1, 250]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '404':
+          description: The upstream metadata cache answered the listing request with 404.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: market not found
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: '`internal` / `authentication backend unavailable` — the API-key path could not
+            reach the credential store.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: authentication backend unavailable
+        '502':
+          description: The metadata cache answered with an unexpected status (`upstream` / `metadata cache
+            request failed`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: upstream
+                  message: metadata cache request failed
+        '503':
+          description: '`cache_cold` — the provider''s active-market listing has not been populated yet (`Retry-After:
+            5`); `unavailable` — not configured for this deployment; or `rate_limiter_unavailable`.'
+          headers:
+            Retry-After:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      x-kairos-bucket: light
+  /v1/resolutions:
+    get:
+      operationId: getResolutions
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request
+      summary: Batch resolution fractions for up to 200 markets
+      tags:
+      - Resolutions
+      description: |-
+        Returns the resolved YES-side fraction (payout_numerators[0] / sum) for each requested market that has resolved; unresolved markets are omitted entirely from the response (never a guessed value). Providers are keyed either directly by market id/ticker (kalshi) or by their on-chain condition id (polymarket, predictfun, opinion). Rate-limit bucket: LIGHT.
+
+        For scalar/range markets with no payout numerators, the venue's settled value is used as the fraction instead of a YES/NO split (kalshi-keyed providers only).
+
+        The response is ETagged (strong ETag) with a `Cache-Control` header; a matching `If-None-Match` returns 304.
+      parameters:
+      - name: provider
+        in: query
+        required: true
+        description: Venue identifier. Any registered provider (including disabled ones, for historic
+          reads).
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        example: kalshi
+      - name: market_ids
+        in: query
+        required: true
+        description: Comma-separated market ids/tickers. Up to 200. Empty entries are dropped.
+        schema:
+          type: string
+        example: KXBTC-26JUL,KXETH-26JUL
+      responses:
+        '200':
+          description: Map of market_id to resolved YES-side fraction, for resolved markets only.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=3600
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolutionsResponse'
+              example:
+                resolutions:
+                  KXBTC-26JUL: 1
+                  KXETH-26JUL: 0.5
+        '304':
+          description: Not Modified — `If-None-Match` matched the current ETag.
+        '400':
+          description: Unknown provider, or `market_ids` missing/empty/exceeds 200.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: market_ids exceeds maximum 200
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The resolutions query failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: resolutions query failed
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: light
+  /v1/markets/{provider}/{market_id}/resolution:
+    get:
+      operationId: getMarketResolutionStatus
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request
+      summary: Current resolution lifecycle snapshot for one market
+      tags:
+      - Resolutions
+      description: |-
+        Returns the current resolution state for one market — status (e.g. proposed/disputed/resolved), the UMA-style proposal/dispute metadata, and (once resolved) the payout numerators. For kalshi-style providers the ticker identifies the market directly; for CTF venues (polymarket, predictfun, opinion) the market id is resolved to its on-chain condition id internally. Rate-limit bucket: LIGHT.
+
+        The response caches for a short window (`Cache-Control` header with a strong ETag / 304 support) because proposals move through a roughly 2-hour challenge window — a longer cache lifetime would routinely misreport "proposed" as already final.
+      parameters:
+      - name: provider
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        example: polymarket
+      - name: market_id
+        in: path
+        required: true
+        description: For kalshi, the ticker (used directly as market_key). For CTF venues, the market
+          id — resolved to its condition_id internally.
+        schema:
+          type: string
+        example: '516710'
+      responses:
+        '200':
+          description: Resolution lifecycle snapshot.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=30
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolutionStatus'
+              example:
+                provider: polymarket
+                market_id: '516710'
+                condition_id: 0xcond123
+                status: proposed
+                proposed_price: 0.5
+                proposed_at: '2026-07-15T09:30:00+00:00'
+                challenge_window_ends_at: null
+                proposer: 0xprop
+                disputer: ''
+                dispute_count: 1
+                reset_count: 0
+                payout_numerators: []
+                resolved_ts: null
+                last_event_ts: '2026-07-15T09:30:00+00:00'
+        '304':
+          description: Not Modified — `If-None-Match` matched the current ETag.
+        '400':
+          description: Unknown provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '404':
+          description: No resolution state row for this market (or, for CTF venues, no on-chain condition
+            id mapping was found).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: no resolution state for market
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The resolution status query failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: resolution status query failed
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: light
+  /v1/markets/{provider}/{market_id}/resolution/events:
+    get:
+      operationId: getMarketResolutionEvents
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request
+      summary: Full resolution lifecycle timeline for one market
+      tags:
+      - Resolutions
+      description: |-
+        Returns the append-only event timeline (proposed, disputed, reset, settled, etc.) for a market's resolution, oldest first, capped at 200 events, keyed the same way as `.../resolution` (kalshi ticker identifies the market directly; CTF venues resolve market_id to its on-chain condition id first). Duplicate ingestion events are de-duplicated before ordering chronologically. Rate-limit bucket: LIGHT.
+
+        Cache lifetime matches the resolution-status endpoint: a `Cache-Control` header with a strong ETag (304 on matching `If-None-Match`).
+      parameters:
+      - name: provider
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        example: kalshi
+      - name: market_id
+        in: path
+        required: true
+        description: For kalshi, the ticker (used directly as market_key). For CTF venues, the market
+          id — resolved to its condition_id internally.
+        schema:
+          type: string
+        example: TICK-A
+      responses:
+        '200':
+          description: Resolution event timeline (possibly empty if the market has resolution state but
+            no recorded events yet).
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=30
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolutionEventsResponse'
+              example:
+                provider: kalshi
+                market_id: TICK-A
+                market_key: TICK-A
+                events:
+                - event_type: proposed
+                  source: polygon
+                  event_ts: '2026-07-01T10:00:00+00:00'
+                  price_norm: 1
+                  too_early: true
+                  proposer: 0xprop
+                  bond: '500000000000'
+                  reward: '5000000'
+                  expiration_ts: '2026-07-01T12:00:00+00:00'
+                  request_timestamp: '2026-07-01T09:00:00+00:00'
+                  tx_hash: '0xdead'
+                  block_number: 123
+                - event_type: settled_offchain
+                  source: kalshi_api
+                  event_ts: '2026-07-01T13:00:00+00:00'
+                  payout_numerators:
+                  - 1
+                  - 0
+        '304':
+          description: Not Modified — `If-None-Match` matched the current ETag.
+        '400':
+          description: Unknown provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '404':
+          description: No resolution state for this market — for CTF venues this means no condition_id
+            mapping was found (events cannot be looked up without one).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: not_found
+                  message: no resolution state for market
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The resolution events query failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: resolution events query failed
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: light
+  /v1/marks:
+    get:
+      operationId: getMarks
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 heavy unit per started 100 pairs (2 units at the 200-pair cap)
+      summary: Latest mark (last trade price) for up to 200 contract/token pairs
+      tags:
+      - Marks
+      description: |-
+        A mark is defined as the LAST TRADE PRICE, on the 0–100 scale used by candles/trades (not the 0–1 probability scale used by PnL consumers). Rate-limit bucket: HEAVY and explicitly uncacheable at the HTTP layer (`Cache-Control: no-store`, no ETag); real-time consumers should prefer the WebSocket feed instead.
+
+        Pairs that have never traded are omitted from the response entirely (no zero/null placeholder).
+
+        Cost: larger requests consume more of your quota based on the number of pairs requested. Since the hard cap is 200 pairs, the maximum possible cost for one request is 2 heavy units.
+      parameters:
+      - name: provider
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        example: polymarket
+      - name: pairs
+        in: query
+        required: true
+        description: Comma-separated `contract_id:token_id` pairs. Up to 200. Each pair must contain a
+          non-empty contract_id and token_id separated by exactly one colon.
+        schema:
+          type: string
+        example: 0xabc123:18812649149814341758733697580460697418474693998558159483117,0xabc123:88123409981238091823740918237409182734091823740918237409182
+      responses:
+        '200':
+          description: Marks for the requested pairs, in request order; never-traded pairs are omitted.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarksResponse'
+              example:
+                marks:
+                - contract_id: '0xabc123'
+                  token_id: '18812649149814341758733697580460697418474693998558159483117'
+                  price: 63.5
+        '400':
+          description: Unknown provider, missing `pairs`, `pairs` exceeds 200, or a pair is not in `contract_id:token_id`
+            form.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: pairs exceeds maximum 200
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The marks lookup failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: marks query failed
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: heavy
+  /v1/candles:
+    get:
+      operationId: getCandles
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit + 1 per 5000 requested bars (window ÷ timeframe, after retention clamping)
+      summary: Get a single OHLCV candle series
+      tags:
+      - Candles
+      x-kairos-bucket: light
+      description: |
+        Returns OHLCV candles for one `(provider, contract_id, timeframe_seconds, outcome)`
+        series over `[start, end)`.
+
+        **Alignment.** `start` is floored and `end` is ceiled to the nearest
+        `timeframe_seconds` bucket boundary; `end` is additionally clamped to
+        `now + 1 bucket`. Degenerate windows (`end <= start` after alignment)
+        are extended by exactly one bucket. The requested window is silently
+        clamped (not rejected) to the per-timeframe retention ceiling: 1s=1
+        day, 1m=30 days, 5m=90 days, 15m=180 days, 1h=365 days, 4h=365 days,
+        1d=730 days. For `timeframe_seconds=1`, if the aligned window falls
+        entirely before `now - 24h` (the retention window for 1-second
+        candles) the endpoint short-circuits to `{"candles":[]}` without
+        querying upstream.
+
+        **Timeframes.** Only 1s and 1m candles are stored directly; every
+        other timeframe (5m, 15m, 1h, 4h, 1d) is rolled up server-side from
+        the 1m base. When the first read comes back empty, `60`, `3600`,
+        `14400` and `86400` retry as a rollup of the 1s base (brand-new
+        contracts whose only history is 1-second candles); `300` and `900`
+        have no such fallback and return an empty series instead. Prices are
+        on a 0-100 scale. For providers that are not natively per-token
+        (i.e. not `kalshi`, `polymarket`, `dome`, `opinion`, `predictfun`,
+        `hyperliquid`), requesting `outcome > 0` inverts prices
+        (`price = 100 - price`, high/low swapped) rather than resolving a
+        distinct token. The check is on the provider string exactly as
+        submitted, so the `kalshi_offchain` alias takes the inverting path
+        even though `kalshi` does not — send `kalshi` for Kalshi candles.
+
+        **Rate limiting / cost.** This route is in the `light` rate-limit
+        bucket. Larger requests — wider windows, finer timeframes — consume
+        more of your quota; a typical chart paint (a few hundred bars) costs
+        1 unit.
+
+        **Caching.** `Cache-Control` depends on how the aligned window
+        relates to `now`: a window still in progress (`end >= now`) is
+        `no-store`; a window entirely in the recent past is cached briefly;
+        anything older is cached for longer. Cacheable responses carry a
+        strong ETag and honor `If-None-Match`, returning `304` on a match.
+        Responses ≥1KB are gzip-encoded when the client sends
+        `Accept-Encoding: gzip`.
+
+        **Binary format.** Pass `?fmt=binary` or send
+        `Accept: application/x-kairos-candles` to receive a compact
+        columnar binary frame instead of JSON. Layout: `u8 magic=0xCA,
+        u8 version=1, u16 num_results`, then per result `u32 index,
+        u32 count`, followed by the columnar arrays `u32[count] t` (epoch
+        seconds), `u16[count] o,h,l,c` (price ×100), `i64[count] vol`
+        (×100). A single-series `GET` response always has `num_results=1`.
+      parameters:
+      - name: provider
+        in: query
+        required: true
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - dome
+          - kalshi_offchain
+        description: |
+          Market-data provider. Case-insensitive. `dome` and `kalshi_offchain` are aliases resolved to `polymarket` and `kalshi` respectively. `opinion` is a disabled provider kept resolvable for historic reads only. Unknown values return `400 invalid_request`.
+        example: polymarket
+      - name: contract_id
+        in: query
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+        description: |
+          Provider-native contract/market/ticker id. For polymarket this may be either a numeric market id or a `0x`-prefixed condition_id (both resolve to the same series). Empty or >128 chars is rejected with `400 invalid_request`.
+        example: '21742633143463906290569050155826241533067272736897614950488156847949938836455'
+      - name: timeframe_seconds
+        in: query
+        required: true
+        schema:
+          type: integer
+          enum:
+          - 1
+          - 60
+          - 300
+          - 900
+          - 3600
+          - 14400
+          - 86400
+        description: |
+          Candle bucket width in seconds. Any value outside this set is rejected with `400 invalid_request`. Only 1 and 60 are stored directly; 300/900/3600/14400/86400 are always served as rollups.
+        example: 3600
+      - name: start
+        in: query
+        required: true
+        schema:
+          type: string
+        description: |
+          Window start, inclusive (before alignment). Accepts RFC 3339 (`2024-01-15T10:00:00Z` or with a numeric offset), a bare datetime (`2024-01-15T10:00:00`, treated as UTC), or a bare date (`2024-01-15`, treated as UTC midnight). Unparseable values return `400 invalid_request`.
+        example: '2026-07-15T00:00:00Z'
+      - name: end
+        in: query
+        required: true
+        schema:
+          type: string
+        description: |
+          Window end, exclusive (before alignment). Same accepted formats as `start`. Must be strictly after `start` or the request is rejected with `400 invalid_request: end must be after start`.
+        example: '2026-07-16T00:00:00Z'
+      - name: outcome
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+          default: 0
+        description: |
+          Zero-based outcome index (e.g. 0=Yes, 1=No for a binary market, or an index into a multi-outcome market's token list). Defaults to 0. Negative or non-integer values return `400 invalid_request`.
+        example: 0
+      - name: fmt
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - binary
+        description: 'Set to `binary` to receive the columnar binary frame instead of JSON. Equivalent
+          to sending `Accept: application/x-kairos-candles`.'
+      responses:
+        '200':
+          description: |
+            Candle series for the requested window. `{"candles":[]}` (empty array, `no-store`) is a valid 200 response, not an error — it means the window is authoritatively empty.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandleListResponse'
+              examples:
+                hourlyCandles:
+                  value:
+                    candles:
+                    - contract_id: '21742633143463906290569050155826241533067272736897614950488156847949938836455'
+                      timeframe_seconds: 3600
+                      bucket_start: '2026-07-15T00:00:00+00:00'
+                      open: 61.5
+                      high: 63.0
+                      low: 60.8
+                      close: 62.4
+                      volume: 184230
+                      token_id: '704721957297303853272349184'
+            application/x-kairos-candles:
+              schema:
+                $ref: '#/components/schemas/CandleBinaryFrame'
+        '304':
+          description: Not Modified — `If-None-Match` matched the current ETag. Empty body.
+        '400':
+          description: Malformed or invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                unknownProvider:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: unknown provider "foo"
+                badTimeframe:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: 'invalid timeframe_seconds (valid: 1, 60, 300, 900, 3600, 14400, 86400)'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Upstream candle fetch failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+  /v1/candles/batch:
+    post:
+      operationId: postCandlesBatch
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit admitted up front + a deferred charge of 1 per 5000 requested bars summed over every item
+      summary: Get up to 200 candle series in one request
+      tags:
+      - Candles
+      x-kairos-bucket: light
+      description: |
+        Batched form of `GET /v1/candles`: fetches up to 200 independent
+        `(provider, contract_id, timeframe_seconds, start, end, outcome)`
+        series concurrently and returns them in request order, with
+        **per-index partial failure** — one item's validation or fetch
+        error does not fail the others.
+
+        Each item is validated and aligned exactly as in `GET /v1/candles`
+        (same clamping, rollup, and inversion rules). Body accepts either a
+        `requests` array or a legacy `items` alias; if `requests` is
+        non-empty it is used, otherwise `items` is used.
+        `timeframe_seconds` and `outcome` in each item may be a JSON number
+        or a numeric string. The request body is capped at 4 MiB.
+
+        **Rate limiting / cost.** Admitted at the base cost of 1
+        `light`-bucket unit. Larger batches — more items, wider windows,
+        finer timeframes — consume more of your quota; any excess is
+        charged as a deferred extra charge against your next request.
+
+        **Caching.** Batch responses are always `Cache-Control: no-store`
+        and never carry an ETag.
+
+        **Binary format.** Pass `?fmt=binary` or
+        `Accept: application/x-kairos-candles` to receive a single
+        multi-result binary frame (`num_results = len(requests)`) — one
+        columnar result section per request index, in input order. An item
+        that failed sets the high bit (`0x80000000`) of its section's
+        `count`, so it stays distinguishable from a genuinely empty window;
+        mask the bit off to read the (always zero) count. Per-item error
+        messages are only available in the JSON response.
+
+        **Failure semantics.** Returns `500` only when *every* item in the
+        batch failed. Otherwise `200` with a mix of populated and
+        empty/errored entries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CandleBatchRequest'
+            example:
+              requests:
+              - provider: polymarket
+                contract_id: '21742633143463906290569050155826241533067272736897614950488156847949938836455'
+                timeframe_seconds: 3600
+                start: '2026-07-15T00:00:00Z'
+                end: '2026-07-16T00:00:00Z'
+                outcome: 0
+              - provider: kalshi
+                contract_id: KXHIGHNY-26JUL15-T50
+                timeframe_seconds: 60
+                start: '2026-07-15T12:00:00Z'
+                end: '2026-07-15T13:00:00Z'
+      responses:
+        '200':
+          description: Per-index results (populated, empty, or errored). Order matches the request array.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandleBatchResponse'
+              examples:
+                mixedResult:
+                  value:
+                    results:
+                    - index: 0
+                      candles:
+                      - contract_id: '21742633143463906290569050155826241533067272736897614950488156847949938836455'
+                        timeframe_seconds: 3600
+                        bucket_start: '2026-07-15T00:00:00+00:00'
+                        open: 61.5
+                        high: 63.0
+                        low: 60.8
+                        close: 62.4
+                        volume: 184230
+                    - index: 1
+                      candles: []
+                      error: unknown provider "acme"
+            application/x-kairos-candles:
+              schema:
+                $ref: '#/components/schemas/CandleBinaryFrame'
+        '400':
+          description: Malformed body, empty/oversized `requests` array.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                tooLarge:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: batch size 250 exceeds maximum 200
+                empty:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: requests array is required
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Every item in the batch failed (validation or fetch).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                default:
+                  value:
+                    error:
+                      code: internal
+                      message: all batch items failed
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+  /v1/trades:
+    get:
+      operationId: getTradeHistory
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 heavy unit per started 250 rows of `limit` (2 units at limit=500)
+      summary: Recent trade tape for a contract
+      description: |
+        Returns the most recent individual trades for a single (provider, contract_id) pair,
+        newest first, deduplicated by trade id. Only rows with `price > 0 AND price <= 100 AND size > 0` are eligible.
+
+        **Price unit**: `price` is on the integer-cents scale **0–100 for every provider**
+        (Kalshi, Polymarket, predict.fun, Hyperliquid alike) — it is NOT a 0–1 probability and
+        NOT already divided into dollars. Multiply `size * price / 100` to get USD notional.
+        `price` is returned as a float because some venues (e.g. Kalshi) report sub-penny ticks.
+
+        **Window semantics**: the query window is `[now - window_seconds, before_or_now]`. The
+        lower bound is always computed from the *current* server time, not from `before` —
+        passing a `before` older than `now - window_seconds` can invert the window. If the
+        primary window yields zero rows, the handler transparently retries with an unbounded
+        lower bound `[0, before_or_now]` so contracts with no recent activity still return
+        their most recent historical trades. `has_more` reflects an internal over-fetch of
+        `limit + 1` rows, truncated back to `limit` before serialization.
+
+        **Rate-limit cost (HEAVY bucket)**: priced by requested depth — a larger `limit`
+        consumes more of your quota.
+
+        **Caching**: responses are cached for 3s per replica (with singleflight coalescing) to
+        absorb duplicate concurrent requests, and the implicit `now` upper bound is quantized to
+        that same 3s so the cache is usable at all. The HTTP response itself is
+        `Cache-Control: private, max-age=5` with no ETag — this route never returns 304.
+        Responses ≥1KB are gzip-compressed when the client sends `Accept-Encoding: gzip`.
+      tags:
+      - Trades
+      parameters:
+      - name: provider
+        in: query
+        required: true
+        description: |
+          Venue identifier, case-insensitive. Resolved against the central provider registry; `kalshi_offchain` is an alias for `kalshi` and `dome` is an alias for `polymarket`. `opinion` resolves but is a disabled provider — valid only for historic reads.
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - kalshi_offchain
+          - polymarket
+          - dome
+          - opinion
+          - predictfun
+          - hyperliquid
+        example: polymarket
+      - name: contract_id
+        in: query
+        required: true
+        description: Venue-scoped contract/token identifier to fetch trades for.
+        schema:
+          type: string
+        example: '0x8b1c119419f622e21fc576ec8e9c2c07b2c1b09babf0e1f3d1cb9bfc1a8f9c2'
+      - name: window_seconds
+        in: query
+        required: false
+        description: |
+          Lookback window, in seconds, measured back from the current server time (not from `before`). Valid range [3600, 86400]; out-of-range or non-integer values are rejected with 400, not clamped.
+        schema:
+          type: integer
+          minimum: 3600
+          maximum: 86400
+          default: 86400
+        example: 86400
+      - name: limit
+        in: query
+        required: false
+        description: |
+          Maximum number of trades to return, newest first. Valid range is [1, 500]; the default is also 500. Drives the rate-limit cost — see the operation description.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 500
+        example: 100
+      - name: before
+        in: query
+        required: false
+        description: |
+          Upper bound of the window as a positive Unix timestamp in seconds (exclusive: trades with `trade_ts < before`). Omit to use the current time. Must be a positive integer or the request is rejected with 400.
+        schema:
+          type: integer
+          format: int64
+          minimum: 1
+        example: 1737480000
+      responses:
+        '200':
+          description: |
+            Trade page for the window, newest first. `trades` may be empty (and `oldest_available_ts` null) if the contract has no recorded trades at all, even after the unbounded fallback query.
+          headers:
+            X-RateLimit-Bucket:
+              schema:
+                type: string
+                example: heavy
+            X-RateLimit-Tier:
+              schema:
+                type: string
+                example: api-key
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+            X-RateLimit-Reset:
+              schema:
+                type: integer
+                description: Unix timestamp when the rate-limit window resets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TradeHistoryResponse'
+              example:
+                trades:
+                - trade_id: 0x9f2a...c11
+                  contract_id: '0x8b1c119419f622e21fc576ec8e9c2c07b2c1b09babf0e1f3d1cb9bfc1a8f9c2'
+                  size: 250
+                  price: 62.5
+                  outcome: 'Yes'
+                  timestamp: 1737479998.412
+                  token_id: 10945...3321
+                  taker_address: '0xabc1234567890abcdef1234567890abcdef1234'
+                  side: buy
+                has_more: true
+                oldest_available_ts: 1737479950.001
+                coverage_hours: 0.01
+        '400':
+          description: |
+            Validation failure: missing `provider`, unrecognized `provider`, missing `contract_id`, `window_seconds`/`limit` outside their bounds, or a non-positive / non-integer `before`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: limit must be an integer in [1, 500]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The trade-history query failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: heavy
+  /v1/trades/metrics:
+    get:
+      operationId: getTradeMetrics
+      x-kairos-auth: public
+      x-kairos-rate-limit: 1 light unit per request
+      summary: Aggregate trade volume/pressure metrics for a contract window
+      description: |
+        Returns aggregated volume and buy-pressure metrics for a (provider, contract_id) over
+        a trailing window, computed from the same deduplicated trade data as `/v1/trades`.
+
+        **Two query shapes depending on provider**, because the platform cannot generically
+        infer which side of a market is "Yes":
+        - **Kalshi**: `outcome_0` is the side where `outcome` or `token_id`
+          (case-insensitive) equals `"yes"`, `outcome_1` is `"no"`.
+        - **All other providers**: volumes are grouped by `token_id` and the **top 2 tokens by
+          volume** are reported as `outcome_0`/`outcome_1` — a volume ranking, not a
+          guaranteed Yes/No mapping.
+
+        USD volume is always `size * price / 100` (price is cents 0–100 for every provider).
+        `outcome_0_volume_share_pct` defaults to 50.0 when both outcome volumes are zero.
+        `coverage_pct` measures how much of the requested window is actually backed by data
+        and is 0 when no trades are found in the window.
+
+        **Rate-limit cost (LIGHT bucket)**: flat 1 unit per request.
+
+        **Caching**: responses are cached for 10s per replica (with singleflight coalescing) to
+        absorb duplicate concurrent requests. `Cache-Control: private, max-age=5`, no ETag —
+        this route never returns 304.
+      tags:
+      - Trades
+      parameters:
+      - name: provider
+        in: query
+        required: true
+        description: |
+          Venue identifier, case-insensitive. `kalshi_offchain` aliases `kalshi`; `dome` aliases `polymarket`. Whether `provider` resolves to Kalshi determines which aggregation query runs — see the operation description.
+        schema:
+          type: string
+          enum:
+          - kalshi
+          - kalshi_offchain
+          - polymarket
+          - dome
+          - opinion
+          - predictfun
+          - hyperliquid
+        example: polymarket
+      - name: contract_id
+        in: query
+        required: true
+        description: Venue-scoped contract/token identifier to compute metrics for.
+        schema:
+          type: string
+        example: '0x8b1c119419f622e21fc576ec8e9c2c07b2c1b09babf0e1f3d1cb9bfc1a8f9c2'
+      - name: window_seconds
+        in: query
+        required: false
+        description: |
+          Trailing window, in seconds, measured back from the current server time. Valid range [3600, 86400]; out-of-range or non-integer values are rejected with 400.
+        schema:
+          type: integer
+          minimum: 3600
+          maximum: 86400
+          default: 86400
+        example: 3600
+      responses:
+        '200':
+          description: |
+            Aggregated metrics for the window. Present with all-zero volumes (and `coverage_pct: 0`) rather than a 404 when no trades exist.
+          headers:
+            X-RateLimit-Bucket:
+              schema:
+                type: string
+                example: light
+            X-RateLimit-Tier:
+              schema:
+                type: string
+                example: api-key
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+            X-RateLimit-Reset:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TradeMetricsResponse'
+              example:
+                metrics:
+                  volume_usd: 184032.55
+                  outcome_0_volume_usd: 121004.1
+                  outcome_1_volume_usd: 63028.45
+                  outcome_0_volume_share_pct: 65.8
+                  trade_count: 5123
+                  window_seconds: 3600
+                  coverage_pct: 97.2
+        '400':
+          description: |
+            Validation failure: missing `provider`, unrecognized `provider`, missing `contract_id`, or `window_seconds` outside [3600, 86400].
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: window_seconds must be an integer in [3600, 86400]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: The trade-metrics query failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: light
+  /v1/perpetuals/{venue}/{instrument}/snapshot:
+    get:
+      operationId: getPerpetualSnapshot
+      x-kairos-auth: public
+      x-kairos-rate-limit: 6 heavy units per request (the snapshot fans out to several venue resources)
+      summary: Get a live perpetual market-data snapshot
+      tags:
+      - Perpetuals
+      description: |
+        Production beta, sourced directly from the selected venue by the Market Data API.
+        Returns a canonical ordered book, recent trades, one-minute candles,
+        funding observations, and typed market state. Financial values are
+        exact decimal strings. Prices are direct venue prices, never 0–100
+        prediction probabilities. Quantities and volumes retain the declared
+        `base_asset` or `contracts` unit. Do not derive notional for contract
+        quantities without authoritative instrument metadata, and never apply
+        the prediction-market `/ 100` formula. Each request costs 6 units in
+        the HEAVY rate-limit bucket because it fans out to multiple venue
+        resources.
+        Responses are never cacheable by clients; the Market Data API uses a bounded
+        one-second replica-local cache to coalesce bursts.
+      parameters:
+      - name: venue
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [hyperliquid, polymarket_perps, kalshi_margin]
+      - name: instrument
+        in: path
+        required: true
+        description: |
+          Venue-native instrument identifier, such as BTC, 6, or KXBTCPERP.
+          Hyperliquid support is limited to standard main-dex perps in every
+          environment; HIP-3 `dex:coin` identifiers are rejected. BTC and other
+          standard listings are quoted in USDT, while HYPE and PURR are
+          USDC-quoted exceptions. All three collateralize and settle in USDC.
+          Their canonical identities are `hl-mainnet-btc-usdt`,
+          `hl-mainnet-hype-usdc`, and `hl-mainnet-purr-usdc`.
+        schema:
+          type: string
+      - name: depth
+        in: query
+        description: |
+          Requested book depth per side. When omitted the default is the venue's own ceiling —
+          20 for `hyperliquid` (its `l2Book` returns no more), 500 for `polymarket_perps` and
+          `kalshi_margin`. A value outside [1, 500], or one that is not an integer, is rejected
+          with 400.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+      responses:
+        '200':
+          description: Live canonical venue snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PerpetualSnapshot'
+        '400':
+          description: |
+            `unsupported perpetual venue` (a `venue` outside the enum), `depth must be an integer`, `depth must be between 1 and 500`, or `invalid perpetual instrument` — the instrument is empty, longer than 128 bytes, or does not match the venue's identifier grammar (`^[A-Za-z0-9][A-Za-z0-9._-]*$` for Hyperliquid, which is what rejects HIP-3 `dex:coin`; a positive integer for `polymarket_perps`; `^KX[A-Z0-9]+PERP$` for `kalshi_margin`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_request
+                  message: invalid perpetual instrument
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/IPNotWhitelisted'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: '`internal` / `authentication backend unavailable` — the API-key path could not
+            reach the credential store.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: internal
+                  message: authentication backend unavailable
+        '502':
+          description: |
+            `upstream` / `perpetual venue data is unavailable or invalid`. Covers every non-validation failure: the venue returned a non-2xx status or an undecodable body, the 12s composite fetch deadline expired, or the assembled snapshot failed canonical validation (crossed or unsorted book, non-exact decimal, unknown market status, bad candle interval, unknown funding sign convention).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          $ref: '#/components/responses/RateLimiterUnavailable'
+      x-kairos-bucket: heavy
+components:
+  securitySchemes:
+    apiKeyClientId:
+      type: apiKey
+      in: header
+      name: X-Client-Id
+      description: Credential client id (`kairos_ck_...`). Must be sent together with X-Api-Key and X-Api-Secret.
+    apiKeyKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: 64-char hex API key. Must be sent together with X-Client-Id and X-Api-Secret.
+    apiKeySecret:
+      type: apiKey
+      in: header
+      name: X-Api-Secret
+      description: 64-char hex API secret. Must be sent together with X-Client-Id and X-Api-Key.
+  responses:
+    Unauthorized:
+      description: |
+        No valid credential presented. Every path returns `code: unauthorized`; the triggers differ:
+
+        - An `Authorization` header on a deployment where bearer auth is not enabled (`bearer authentication is not enabled`).
+        - A bearer token that fails verification (`invalid or expired session`), or whose token/session has been revoked (`session has been revoked`).
+        - An incomplete or wrong API-key header set. Sending *any* of `X-Client-Id`, `X-Api-Key`, `X-Api-Secret` commits the request to the API-key path, so a partial set is rejected rather than silently degrading to anonymous limits (`valid X-Client-Id, X-Api-Key, and X-Api-Secret headers are required`).
+        - No credential material at all while the anonymous free tier is unavailable — switched off for the deployment, forced off through the runtime kill switch, or not yet resolvable on a replica that has never read the flag (it fails closed).
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          description: '`Bearer realm="market-data-api"` on bearer-verification failure, `APIKey realm="market-data-api",
+            header="X-Client-Id, X-Api-Key, X-Api-Secret"` on missing/invalid API-key credentials. Absent
+            on the revoked-session and bearer-disabled paths.'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: unauthorized
+              message: valid X-Client-Id, X-Api-Key, and X-Api-Secret headers are required
+    IPNotWhitelisted:
+      description: API key presented from a source IP not in that credential's whitelist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: ip_not_whitelisted
+              message: source IP not in credential whitelist
+    RateLimited:
+      description: |
+        Two different gates return this status, both with `code: rate_limited`:
+
+        - **Per-credential (or per-IP, when anonymous) weighted budget exhausted.** The message is `rate limit exceeded`, or, for anonymous callers, `anonymous rate limit exceeded — request an API key for higher limits (…)`. `Retry-After` is the whole number of seconds until the current one-minute window rolls over, floored at 1. All four `X-RateLimit-*` headers are present.
+        - **Per-IP admission gate.** An in-process, pre-authentication guard that keeps a flood off the shared credential cache and database. The message is `too many requests from this address` and `Retry-After` is a flat `60`. Because this fires *before* authentication, the response carries **no** `X-RateLimit-*` headers at all.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until the caller may retry — window-rollover seconds for the weighted limiter,
+            a flat 60 for the IP admission gate.
+        X-RateLimit-Bucket:
+          schema:
+            type: string
+            enum:
+            - light
+            - heavy
+        X-RateLimit-Tier:
+          schema:
+            type: string
+            enum:
+            - anonymous
+            - api-key
+            - user
+        X-RateLimit-Remaining:
+          schema:
+            type: integer
+        X-RateLimit-Reset:
+          schema:
+            type: integer
+            description: Unix timestamp (seconds) when the current window resets.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: rate_limited
+              message: rate limit exceeded
+    RateLimiterUnavailable:
+      description: |
+        The rate limiter is unreachable. Fails CLOSED — the request is rejected rather than let through unmetered.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: rate_limiter_unavailable
+              message: rate limiter temporarily unavailable
+  schemas:
+    PerpetualExactDecimalString:
+      type: string
+      pattern: '^(?:0|-?[1-9][0-9]*(?:\.[0-9]*[1-9])?|-?0\.[0-9]*[1-9])$'
+      description: |
+        Normalized, exact base-10 decimal. No exponent notation, leading zeros,
+        trailing fractional zeros, NaN, or infinity. May be negative.
+      examples: ['0', '-0.00025', '65192.5']
+    PerpetualPositiveDecimalString:
+      type: string
+      pattern: '^(?:[1-9][0-9]*(?:\.[0-9]*[1-9])?|0\.[0-9]*[1-9])$'
+      description: Normalized, exact base-10 decimal strictly greater than zero.
+      examples: ['0.001', '65192.5']
+    PerpetualNonNegativeDecimalString:
+      type: string
+      pattern: '^(?:0|[1-9][0-9]*(?:\.[0-9]*[1-9])?|0\.[0-9]*[1-9])$'
+      description: Normalized, exact base-10 decimal greater than or equal to zero.
+      examples: ['0', '1250.75']
+    PerpetualBookLevel:
+      type: object
+      additionalProperties: false
+      required:
+      - price
+      - quantity
+      - order_count
+      properties:
+        price:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          description: Direct venue price. This is not a 0–100 probability.
+        quantity:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          description: Quantity in the enclosing book's `native_volume_unit`.
+        order_count:
+          type:
+          - integer
+          - 'null'
+          description: Venue-reported order count at this level, or null when unavailable.
+    PerpetualOrderBookSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+      - bids
+      - asks
+      - event_time_ns
+      - received_time_ns
+      - source_sequence
+      - sequence_domain
+      - feed_mode
+      - depth
+      - requested_depth
+      - source_depth_limit
+      - depth_limited
+      - native_volume_unit
+      properties:
+        bids:
+          type: array
+          description: Price levels ordered strictly highest to lowest.
+          items:
+            $ref: '#/components/schemas/PerpetualBookLevel'
+        asks:
+          type: array
+          description: Price levels ordered strictly lowest to highest.
+          items:
+            $ref: '#/components/schemas/PerpetualBookLevel'
+        event_time_ns:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Venue event time in Unix nanoseconds, or null when unavailable.
+        received_time_ns:
+          type: integer
+          format: int64
+          description: Kairos receive time in Unix nanoseconds.
+        source_sequence:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Venue-native source sequence, or null for an unsequenced source.
+        sequence_domain:
+          type: string
+          minLength: 1
+          description: Scope in which `source_sequence` has meaning.
+        feed_mode:
+          type: string
+          enum: [snapshot_only]
+          description: The preview exposes complete REST snapshots, not deltas.
+        depth:
+          type: integer
+          minimum: 0
+          maximum: 500
+          description: Number of levels returned on the deeper populated side.
+        requested_depth:
+          type: integer
+          minimum: 1
+          maximum: 500
+          description: Depth requested by the caller.
+        source_depth_limit:
+          type:
+          - integer
+          - 'null'
+          minimum: 1
+          description: |
+            Authoritative maximum depth imposed by the source endpoint, or null
+            when the source does not declare a fixed limit.
+        depth_limited:
+          type: boolean
+          description: |
+            True when the returned depth is below `requested_depth` because of
+            an identified source limit. False does not imply both sides contain
+            the requested number of populated levels.
+        native_volume_unit:
+          type: string
+          enum: [base_asset, contracts]
+          description: Native quantity unit for every level in this book.
+    PerpetualInstrumentContext:
+      type: object
+      additionalProperties: false
+      required:
+      - base_asset_id
+      - quote_asset_id
+      - collateral_asset_id
+      - settlement_asset_id
+      - price_unit
+      - quantity_unit
+      - contract_multiplier
+      - notional_formula
+      properties:
+        base_asset_id:
+          type: string
+          minLength: 1
+        quote_asset_id:
+          type: string
+          minLength: 1
+          description: |
+            Asset in which direct prices are expressed. Hyperliquid standard
+            main-dex perpetuals use USDT.
+        collateral_asset_id:
+          type: string
+          minLength: 1
+          description: |
+            Asset securing margin. This is independent of the quote asset;
+            Hyperliquid standard main-dex perpetuals use USDC collateral.
+        settlement_asset_id:
+          type: string
+          minLength: 1
+          description: |
+            Asset in which settlement or realized PnL is denominated.
+            Hyperliquid uses USDC, Polymarket Perps uses pUSD, and Kalshi
+            Margin uses USD.
+        price_unit:
+          type: string
+          minLength: 1
+          description: |
+            Explicit unit relationship for every direct price in the snapshot.
+            A perpetual price is never a 0–100 prediction probability.
+        quantity_unit:
+          type: string
+          enum: [base_asset, contracts]
+          description: |
+            Native quantity unit used by books and trades. Candle volume declares
+            its own `native_volume_unit` and may differ; for example, a venue can
+            quote book/trade quantities as contracts but kline volume as base asset.
+        contract_multiplier:
+          anyOf:
+          - $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          - type: 'null'
+          description: |
+            Authoritative venue contract multiplier, or null when unavailable.
+            Consumers must not invent a multiplier.
+        notional_formula:
+          type: string
+          minLength: 1
+          description: |
+            Machine-readable formula identity describing any supported notional
+            conversion. It is not the prediction-market `size * price / 100`
+            formula.
+    PerpetualPriceObservation:
+      type: object
+      additionalProperties: false
+      required:
+      - price_type
+      - value
+      - observed_time_ns
+      properties:
+        price_type:
+          type: string
+          minLength: 1
+          description: Venue-backed price identity, such as mark, index, oracle, or mid.
+        value:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          description: Direct venue price; never a prediction probability.
+        observed_time_ns:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Observation time in Unix nanoseconds, or null when unavailable.
+    PerpetualMeasureObservation:
+      type: object
+      additionalProperties: false
+      required:
+      - measure_type
+      - value
+      - unit
+      properties:
+        measure_type:
+          type: string
+          minLength: 1
+          description: Measure identity, such as open_interest or open_interest_notional.
+        value:
+          $ref: '#/components/schemas/PerpetualNonNegativeDecimalString'
+        unit:
+          type: string
+          minLength: 1
+          description: Explicit venue-native or derived unit, such as base_asset, contracts, or usd.
+    PerpetualMarketState:
+      type: object
+      additionalProperties: false
+      required:
+      - event_time_ns
+      - status
+      - prices
+      - measures
+      - next_funding_time_ns
+      properties:
+        event_time_ns:
+          type: integer
+          format: int64
+          description: Market-state event time in Unix nanoseconds.
+        status:
+          type: string
+          enum: [active, inactive, delisted, unknown]
+        prices:
+          type: array
+          items:
+            $ref: '#/components/schemas/PerpetualPriceObservation'
+        measures:
+          type: array
+          items:
+            $ref: '#/components/schemas/PerpetualMeasureObservation'
+        next_funding_time_ns:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Next funding time in Unix nanoseconds, or null when unavailable.
+    PerpetualPublicTrade:
+      type: object
+      additionalProperties: false
+      required:
+      - trade_id
+      - price
+      - quantity
+      - quantity_unit
+      - side
+      - event_time_ns
+      properties:
+        trade_id:
+          type: string
+          description: Venue-native public trade identifier.
+        price:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          description: Direct venue execution price; never a 0–100 probability.
+        quantity:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          description: Exact quantity in `quantity_unit`.
+        quantity_unit:
+          type: string
+          enum: [base_asset, contracts]
+        side:
+          type: string
+          enum: [buy, sell]
+        event_time_ns:
+          type: integer
+          format: int64
+          description: Venue trade time in Unix nanoseconds.
+    PerpetualTradeCandle:
+      type: object
+      additionalProperties: false
+      required:
+      - interval
+      - interval_start_ns
+      - interval_end_ns
+      - open
+      - high
+      - low
+      - close
+      - native_volume
+      - native_volume_unit
+      - trade_count
+      - finality
+      properties:
+        interval:
+          type: string
+          description: Venue candle interval. The preview currently requests one minute.
+          example: 1m
+        interval_start_ns:
+          type: integer
+          format: int64
+          description: Inclusive start of the candle's half-open interval, in Unix nanoseconds.
+        interval_end_ns:
+          type: integer
+          format: int64
+          description: Exclusive end of the candle's half-open interval, in Unix nanoseconds.
+        open:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+        high:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+        low:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+        close:
+          $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+        native_volume:
+          $ref: '#/components/schemas/PerpetualNonNegativeDecimalString'
+          description: |
+            Exact volume in this candle's `native_volume_unit`; no cross-venue
+            notional is implied. This unit is independent of
+            `instrument_context.quantity_unit`.
+        native_volume_unit:
+          type: string
+          enum: [base_asset, contracts]
+          description: |
+            Native unit reported by the candle source. It may differ from the
+            book and trade quantity unit for the same instrument.
+        trade_count:
+          type:
+          - integer
+          - 'null'
+          description: Venue-reported trade count, or null when unavailable.
+        finality:
+          type: string
+          enum: [open, closed_unconfirmed]
+          description: |
+            `open` means the interval has not closed. `closed_unconfirmed` means
+            its half-open interval has ended, but the preview does not claim an
+            immutable or venue-confirmed final candle.
+    PerpetualFundingRate:
+      type: object
+      additionalProperties: false
+      required:
+      - rate
+      - phase
+      - effective_time_ns
+      - calculated_time_ns
+      - rate_period_seconds
+      - payment_interval_seconds
+      - sign_convention
+      - funding_price
+      - funding_price_type
+      properties:
+        rate:
+          $ref: '#/components/schemas/PerpetualExactDecimalString'
+          description: |
+            Exact signed funding rate in the venue's reported period convention.
+            Do not infer percentage scaling or annualize without the period fields.
+        phase:
+          type: string
+          enum: [estimate, final]
+        effective_time_ns:
+          type: integer
+          format: int64
+        calculated_time_ns:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Calculation time in Unix nanoseconds, or null when unavailable.
+        rate_period_seconds:
+          type:
+          - integer
+          - 'null'
+          description: Period represented by `rate`, or null when the venue does not provide it.
+        payment_interval_seconds:
+          type:
+          - integer
+          - 'null'
+          description: Funding payment interval, or null when unavailable.
+        sign_convention:
+          type: string
+          const: positive_longs_pay
+        funding_price:
+          anyOf:
+          - $ref: '#/components/schemas/PerpetualPositiveDecimalString'
+          - type: 'null'
+          description: Venue funding price, or null when unavailable.
+        funding_price_type:
+          type:
+          - string
+          - 'null'
+          description: Identity of `funding_price`, such as mark, or null with no price.
+    PerpetualSnapshot:
+      type: object
+      additionalProperties: false
+      description: |
+        Live perpetual snapshot, in beta. Prices are direct venue prices.
+        Quantities retain native units. This object intentionally carries no
+        synthesized notional: consumers must inspect `instrument_context` and
+        must not convert contract quantities when `contract_multiplier` is null.
+      required:
+      - venue
+      - environment
+      - integration_id
+      - canonical_instrument_id
+      - venue_instrument_id
+      - instrument_context
+      - book
+      - market_state
+      - trades
+      - candles
+      - funding
+      - source
+      - fetched_at_ns
+      properties:
+        venue:
+          type: string
+          enum: [hyperliquid, polymarket_perps, kalshi_margin]
+        environment:
+          type: string
+          minLength: 1
+          description: Venue environment for this source identity.
+        integration_id:
+          type: string
+          minLength: 1
+          description: Kairos integration and routing identity.
+        canonical_instrument_id:
+          type: string
+          minLength: 1
+          description: Stable Kairos perpetual instrument identity.
+        venue_instrument_id:
+          type: string
+          description: Exact venue-native instrument identifier.
+        instrument_context:
+          $ref: '#/components/schemas/PerpetualInstrumentContext'
+        book:
+          $ref: '#/components/schemas/PerpetualOrderBookSnapshot'
+        market_state:
+          $ref: '#/components/schemas/PerpetualMarketState'
+        trades:
+          type: array
+          items:
+            $ref: '#/components/schemas/PerpetualPublicTrade'
+          description: Recent public trades in venue-native quantity units.
+        candles:
+          type: array
+          items:
+            $ref: '#/components/schemas/PerpetualTradeCandle'
+          description: One-minute trade candles in venue-native volume units.
+        funding:
+          type: array
+          items:
+            $ref: '#/components/schemas/PerpetualFundingRate'
+          description: Final or estimated funding observations using positive_longs_pay sign convention.
+        source:
+          type: string
+          const: venue_public_api
+        fetched_at_ns:
+          type: integer
+          format: int64
+          description: Kairos fetch completion time in Unix nanoseconds.
+    ErrorResponse:
+      type: object
+      description: Canonical error envelope emitted by every Market Data API endpoint.
+      required:
+      - error
+      properties:
+        error:
+          type: object
+          required:
+          - code
+          - message
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code.
+              example: invalid_request
+            message:
+              type: string
+              description: Human-readable detail.
+              example: market_ids exceeds maximum 200
+    MarketOutcome:
+      type: object
+      description: One outcome/token entry within a market.
+      required:
+      - outcome
+      - normalized_outcome
+      - token_id
+      properties:
+        outcome:
+          type: string
+          description: Display-layer outcome label as provided by the venue. For kalshi, this can legitimately
+            be duplicated across YES/NO (it's a team/threshold subtitle, not a binary identity) — use
+            `outcome_index`/`side` for execution logic on those markets.
+          example: 'Yes'
+        normalized_outcome:
+          type: string
+          description: Lowercased/normalized form of `outcome`.
+          example: 'yes'
+        token_id:
+          type: string
+          description: Venue-specific outcome/token identifier.
+          example: '18812649149814341758733697580460697418474693998558159483117'
+        outcome_index:
+          type: integer
+          description: Stable binary position (0 or 1). Only present for providers keyed directly by market
+            id (e.g. kalshi), and only for the first two outcome entries.
+          example: 0
+        side:
+          type: string
+          enum:
+          - 'yes'
+          - 'no'
+          description: Stable binary side matching `outcome_index`. Same provider scope as `outcome_index`.
+          example: 'yes'
+    Market:
+      type: object
+      description: Full market metadata document. Resolution-state fields (`resolution_status`,
+        `payout_numerators`, `resolved_ts`, `proposed_price`, `challenge_window_ends_at`) are
+        present in the payload only when set — the overwhelming majority of markets are
+        unresolved and omit all five.
+      required:
+      - exchange_id
+      - market_id
+      - condition_id
+      - event_id
+      - title
+      - neg_risk
+      - outcomes
+      - raw
+      properties:
+        exchange_id:
+          type: string
+          description: Canonical provider name.
+          example: polymarket
+        market_id:
+          type: string
+          example: '1897040'
+        condition_id:
+          type: string
+          description: On-chain condition id for CTF venues; empty string for kalshi.
+          example: 0xabc123...
+        event_id:
+          type: string
+          description: Grouping event id (multi-market events); may be empty.
+          example: evt-4521
+        title:
+          type: string
+          example: Will BTC close above $120k on July 31?
+        neg_risk:
+          type: boolean
+          description: Whether this market is part of a Polymarket negative-risk group.
+          example: false
+        tick_size:
+          type:
+          - number
+          - 'null'
+          description: Minimum price increment (0, 1) exclusive.
+          example: 0.01
+        taker_base_fee_bps:
+          type:
+          - integer
+          - 'null'
+          example: 200
+        fees_enabled:
+          type:
+          - boolean
+          - 'null'
+        category:
+          type:
+          - string
+          - 'null'
+          example: Crypto
+        group_slug:
+          type:
+          - string
+          - 'null'
+          example: btc-price-2026
+        fee_type:
+          type:
+          - string
+          - 'null'
+          example: standard
+        status:
+          type:
+          - string
+          - 'null'
+          description: Venue-reported market status, e.g. active/closed. Populated inconsistently across
+            providers.
+          example: active
+        image:
+          type:
+          - string
+          - 'null'
+          description: Display image URL.
+        icon:
+          type:
+          - string
+          - 'null'
+          description: Display icon URL.
+        end_date:
+          type:
+          - string
+          - 'null'
+          description: ISO8601 UTC market end/close time.
+          example: '2026-07-31T23:59:59Z'
+        open_time:
+          type:
+          - string
+          - 'null'
+          description: ISO8601 UTC market open/listing time.
+          example: '2026-01-01T00:00:00Z'
+        resolution_status:
+          type: string
+          description: Present only when the market has resolution state.
+          example: resolved
+        payout_numerators:
+          type: array
+          items:
+            type: integer
+            format: uint64
+          description: Present only when non-empty (i.e. the market has resolved with a payout vector).
+          example:
+          - 1
+          - 0
+        resolved_ts:
+          type: string
+          description: ISO8601 UTC. Present only when set.
+          example: '2026-07-16T00:00:00Z'
+        proposed_price:
+          type: number
+          description: Present only when set (a resolution price has been proposed).
+          example: 1.0
+        challenge_window_ends_at:
+          type: string
+          description: ISO8601 UTC. Present only when set.
+          example: '2026-07-16T02:00:00Z'
+        outcomes:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarketOutcome'
+        raw:
+          type: object
+          description: Full, unmodified provider-specific market document. Shape varies by
+            provider. Treat as opaque/pass-through.
+    MarketBatchRequest:
+      type: object
+      description: Request body for POST /v1/markets/batch.
+      required:
+      - provider
+      - market_ids
+      properties:
+        provider:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        market_ids:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          maxItems: 200
+          description: Up to 200 market ids for the given provider.
+    MarketBatchResponse:
+      type: object
+      description: Response body for POST /v1/markets/batch.
+      required:
+      - exchange_id
+      - markets
+      - misses
+      properties:
+        exchange_id:
+          type: string
+          example: polymarket
+        markets:
+          type: object
+          description: Map of market_id → Market, for every requested id that was found.
+          additionalProperties:
+            $ref: '#/components/schemas/Market'
+        misses:
+          type: array
+          items:
+            type: string
+          description: market_ids from the request that were not found.
+    MarketIdentifierResolveRequestItem:
+      type: object
+      required:
+      - provider
+      - identifier
+      - scope
+      properties:
+        provider:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - kalshi_offchain
+          - dome
+        identifier:
+          type: string
+          description: Venue-specific identifier to resolve. Must be non-empty after trimming.
+          example: '18812649149814341758733697580460697418474693998558159483117'
+        scope:
+          type: string
+          enum:
+          - market
+          - outcome
+          description: '`market` resolves via the venue''s market id/ticker/condition-like identifier;
+            `outcome` resolves via an outcome/token id. No other scope values are accepted (case-insensitive
+            on input).'
+    MarketIdentifierResolveRequestBody:
+      type: object
+      required:
+      - requests
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarketIdentifierResolveRequestItem'
+          minItems: 1
+          maxItems: 200
+    MarketIdentifierResolveResult:
+      type: object
+      required:
+      - provider
+      - identifier
+      - scope
+      - found
+      - market_id
+      properties:
+        provider:
+          type: string
+          description: Provider exactly as submitted in the request (not canonicalized).
+          example: kalshi_offchain
+        identifier:
+          type: string
+        scope:
+          type: string
+          enum:
+          - market
+          - outcome
+        found:
+          type: boolean
+        market_id:
+          type:
+          - string
+          - 'null'
+          description: Canonical Kairos market_id, or null when unresolved.
+    MarketIdentifierResolveResponse:
+      type: object
+      required:
+      - results
+      properties:
+        results:
+          type: array
+          description: Same length and order as the request's `requests` array.
+          items:
+            $ref: '#/components/schemas/MarketIdentifierResolveResult'
+    MarketListResponse:
+      type: object
+      description: Response body for GET /v1/markets.
+      required:
+      - exchange_id
+      - markets
+      - count
+      - next_cursor
+      - has_more
+      properties:
+        exchange_id:
+          type: string
+          example: kalshi
+        markets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Market'
+        count:
+          type: integer
+          description: Number of markets in this page (`markets.length`).
+          example: 100
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Opaque cursor for the next page, or null when this is the last page.
+        has_more:
+          type: boolean
+    ResolutionsResponse:
+      type: object
+      description: Map of market_id → resolved YES-side fraction (0–1). Markets with no resolution yet
+        are omitted entirely — there is no `null`/`false` placeholder for "unresolved".
+      required:
+      - resolutions
+      properties:
+        resolutions:
+          type: object
+          additionalProperties:
+            type: number
+            minimum: 0
+            maximum: 1
+          example:
+            KXBTC-26JUL: 1
+            KXETH-26JUL: 0.5
+    ResolutionStatus:
+      type: object
+      description: One-row resolution lifecycle snapshot for a single market.
+      required:
+      - provider
+      - market_id
+      - condition_id
+      - status
+      - proposed_price
+      - proposed_at
+      - challenge_window_ends_at
+      - proposer
+      - disputer
+      - dispute_count
+      - reset_count
+      - payout_numerators
+      - resolved_ts
+      - last_event_ts
+      properties:
+        provider:
+          type: string
+          description: Canonical provider name.
+          example: polymarket
+        market_id:
+          type: string
+          description: Echoes the requested market_id/ticker.
+          example: '516710'
+        condition_id:
+          type: string
+          description: On-chain condition id (CTF venues); empty string for kalshi.
+          example: 0xcond123
+        status:
+          type: string
+          description: Lifecycle status. Observed values include
+            `proposed`, `disputed`, and `resolved`; not an exhaustive enum.
+          example: proposed
+        proposed_price:
+          type:
+          - number
+          - 'null'
+          description: Normalized proposed settlement price, or null if none proposed yet.
+          example: 0.5
+        proposed_at:
+          type:
+          - string
+          - 'null'
+          description: ISO8601 UTC.
+          example: '2026-07-15T09:30:00+00:00'
+        challenge_window_ends_at:
+          type:
+          - string
+          - 'null'
+          description: ISO8601 UTC. Null until a proposal starts the challenge window.
+        proposer:
+          type: string
+          description: Proposer address; empty string if none.
+          example: 0xprop
+        disputer:
+          type: string
+          description: Disputer address; empty string if undisputed.
+        dispute_count:
+          type: integer
+          example: 1
+        reset_count:
+          type: integer
+          example: 0
+        payout_numerators:
+          type: array
+          items:
+            type: integer
+            format: uint64
+          description: Empty array until resolved.
+        resolved_ts:
+          type:
+          - string
+          - 'null'
+          description: ISO8601 UTC. Null until resolved.
+        last_event_ts:
+          type: string
+          description: ISO8601 UTC timestamp of the most recent lifecycle event.
+          example: '2026-07-15T09:30:00+00:00'
+    ResolutionEvent:
+      type: object
+      description: One entry in a market's resolution lifecycle timeline. Optional fields are omitted
+        from the JSON entirely when unset/empty/zero, matching the codebase's omit-empty wire style —
+        they are NOT emitted as null.
+      required:
+      - event_type
+      - source
+      - event_ts
+      properties:
+        event_type:
+          type: string
+          description: e.g. proposed, disputed, reset, settled_offchain.
+          example: proposed
+        source:
+          type: string
+          description: Origin of the event, e.g. polygon (on-chain UMA) or kalshi_api.
+          example: polygon
+        event_ts:
+          type: string
+          description: ISO8601 UTC.
+          example: '2026-07-01T10:00:00+00:00'
+        price_norm:
+          type: number
+          description: Normalized price associated with this event, when present.
+          example: 1.0
+        too_early:
+          type: boolean
+          description: Only present (and true) when the UMA "too early" flag was set.
+        payout_numerators:
+          type: array
+          items:
+            type: integer
+            format: uint64
+          description: Only present when non-empty.
+          example:
+          - 1
+          - 0
+        proposer:
+          type: string
+          example: 0xprop
+        disputer:
+          type: string
+        bond:
+          type: string
+          description: Raw on-chain bond amount (base-unit decimal string, not float — avoids precision
+            loss).
+          example: '500000000000'
+        reward:
+          type: string
+          description: Raw on-chain reward amount (base-unit decimal string).
+          example: '5000000'
+        expiration_ts:
+          type: string
+          description: ISO8601 UTC.
+          example: '2026-07-01T12:00:00+00:00'
+        request_timestamp:
+          type: string
+          description: ISO8601 UTC.
+          example: '2026-07-01T09:00:00+00:00'
+        tx_hash:
+          type: string
+          example: '0xdead'
+        block_number:
+          type: integer
+          format: uint64
+          description: Only present when non-zero.
+          example: 123
+    ResolutionEventsResponse:
+      type: object
+      required:
+      - provider
+      - market_id
+      - market_key
+      - events
+      properties:
+        provider:
+          type: string
+          example: kalshi
+        market_id:
+          type: string
+          description: Echoes the requested market_id.
+          example: TICK-A
+        market_key:
+          type: string
+          description: The key events were actually queried by — equals market_id for kalshi; equals the
+            resolved condition_id for CTF venues.
+          example: TICK-A
+        events:
+          type: array
+          description: Chronological, oldest first. Capped at 200 events.
+          items:
+            $ref: '#/components/schemas/ResolutionEvent'
+    Mark:
+      type: object
+      required:
+      - contract_id
+      - token_id
+      - price
+      properties:
+        contract_id:
+          type: string
+          example: '0xabc123'
+        token_id:
+          type: string
+          example: '18812649149814341758733697580460697418474693998558159483117'
+        price:
+          type: number
+          description: Last trade price on the 0–100 scale (matches candles/trades; divide by 100 for
+            a 0–1 probability).
+          example: 63.5
+    MarksResponse:
+      type: object
+      required:
+      - marks
+      properties:
+        marks:
+          type: array
+          description: One entry per pair that has ever traded, in request order. Never-traded pairs are
+            omitted.
+          items:
+            $ref: '#/components/schemas/Mark'
+    CandleObject:
+      type: object
+      description: One OHLCV bucket. Prices are on a 0-100 scale (percentage probability).
+      required:
+      - contract_id
+      - timeframe_seconds
+      - bucket_start
+      - open
+      - high
+      - low
+      - close
+      - volume
+      properties:
+        contract_id:
+          type: string
+          description: Echo of the request's `contract_id` (the caller-supplied id, not the resolved canonical
+            market id).
+          example: '21742633143463906290569050155826241533067272736897614950488156847949938836455'
+        timeframe_seconds:
+          type: integer
+          enum:
+          - 1
+          - 60
+          - 300
+          - 900
+          - 3600
+          - 14400
+          - 86400
+          description: Bucket width in seconds, echoing the request.
+          example: 3600
+        bucket_start:
+          type: string
+          description: Bucket start timestamp, UTC, always rendered with an explicit `+00:00` offset (not
+            `Z`).
+          example: '2026-07-15T00:00:00+00:00'
+        open:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+          description: Opening price (0-100 scale).
+          example: 61.5
+        high:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+          description: High price in the bucket (0-100 scale).
+          example: 63.0
+        low:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+          description: Low price in the bucket (0-100 scale).
+          example: 60.8
+        close:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+          description: Closing price (0-100 scale).
+          example: 62.4
+        volume:
+          type: integer
+          format: int64
+          description: Traded volume in the bucket, provider-native units.
+          example: 184230
+        token_id:
+          type: string
+          description: Resolved per-outcome CLOB token id. Omitted entirely from the JSON object when
+            empty.
+          example: '704721957297303853272349184'
+    CandleListResponse:
+      type: object
+      description: Response body of `GET /v1/candles` in JSON mode.
+      required:
+      - candles
+      properties:
+        candles:
+          type: array
+          items:
+            $ref: '#/components/schemas/CandleObject'
+          description: Candles in ascending `bucket_start` order. Empty when the aligned window is authoritatively
+            empty.
+    CandleBatchItem:
+      type: object
+      description: One series request inside a batch. Same validation rules as the `GET /v1/candles` query
+        parameters.
+      required:
+      - provider
+      - contract_id
+      - timeframe_seconds
+      - start
+      - end
+      properties:
+        provider:
+          type: string
+          enum:
+          - kalshi
+          - polymarket
+          - opinion
+          - predictfun
+          - hyperliquid
+          - dome
+          - kalshi_offchain
+          example: polymarket
+        contract_id:
+          type: string
+          maxLength: 128
+          example: '21742633143463906290569050155826241533067272736897614950488156847949938836455'
+        timeframe_seconds:
+          description: Bucket width in seconds. Accepted as a JSON number or a numeric string. Valid values
+            1, 60, 300, 900, 3600, 14400, 86400.
+          oneOf:
+          - type: integer
+          - type: string
+          example: 3600
+        start:
+          type: string
+          description: Same accepted formats as `GET /v1/candles`'s `start` parameter (RFC 3339, bare
+            datetime, or bare date).
+          example: '2026-07-15T00:00:00Z'
+        end:
+          type: string
+          description: Same accepted formats as `GET /v1/candles`'s `end` parameter.
+          example: '2026-07-16T00:00:00Z'
+        outcome:
+          description: Zero-based outcome index. Accepted as a JSON number or a numeric string. Defaults
+            to 0.
+          oneOf:
+          - type: integer
+          - type: string
+          default: 0
+          example: 0
+    CandleBatchRequest:
+      type: object
+      description: |
+        Request body of `POST /v1/candles/batch`. Provide either `requests` or the legacy `items` alias — if `requests` is non-empty it takes precedence, otherwise `items` is used. At least one entry is required across the two fields, and the effective array may not exceed 200 entries.
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/CandleBatchItem'
+          maxItems: 200
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CandleBatchItem'
+          maxItems: 200
+          description: Legacy alias for `requests`, used only when `requests` is absent or empty.
+    CandleBatchResult:
+      type: object
+      description: Result for one input item, at the same array position as the request.
+      required:
+      - index
+      - candles
+      properties:
+        index:
+          type: integer
+          description: Zero-based position in the input `requests`/`items` array.
+          example: 0
+        candles:
+          type: array
+          items:
+            $ref: '#/components/schemas/CandleObject'
+          description: Empty when the item's window was authoritatively empty OR when the item errored
+            (check `error`).
+        error:
+          type: string
+          description: Present only when this item failed validation or fetch. When present, `candles`
+            is always `[]`.
+          example: unknown provider "acme"
+    CandleBatchResponse:
+      type: object
+      description: Response body of `POST /v1/candles/batch` in JSON mode.
+      required:
+      - results
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/CandleBatchResult'
+    CandleBinaryFrame:
+      type: string
+      format: binary
+      description: |
+        Columnar binary candle frame (`Content-Type: application/x-kairos-candles`), returned by both candle endpoints when negotiated via `?fmt=binary` or an `Accept: application/x-kairos-candles` header. Byte layout (little-endian): `u8 magic=0xCA, u8 version=1, u16 num_results`, then for each section `u32 index, u32 count`, followed by six columnar arrays of length `count`: `u32[] t` (bucket start, epoch seconds), `u16[] o,h,l,c` (prices scaled ×100 of the 0-100 float, clamped to [0, 10000]), and `i64[] vol` (volume ×100). In a batch frame, a failed item sets the high bit (`0x80000000`) of its section's `count` — mask it off before using the count, and treat a set bit as "this series errored" rather than "no data". The error message itself is only available in the JSON response.
+    TradeRecord:
+      type: object
+      description: |
+        A single deduplicated trade row. `token_id`, `metadata`, `taker_address`, and `side` are omitted entirely from the JSON (not emitted as null/empty) when the underlying value is empty — `metadata` is additionally omitted when it equals the default `"{}"`.
+      required:
+      - trade_id
+      - contract_id
+      - size
+      - price
+      - outcome
+      - timestamp
+      properties:
+        trade_id:
+          type: string
+          description: Venue-scoped trade identifier (part of the dedup key together with provider_id
+            and contract_id).
+          example: '0x9f2ac3f1b0e2f4a9c8d7b6a5f4e3d2c1b0a9f8e7'
+        contract_id:
+          type: string
+          description: Echoes the requested contract_id.
+          example: '0x8b1c119419f622e21fc576ec8e9c2c07b2c1b09babf0e1f3d1cb9bfc1a8f9c2'
+        size:
+          type: integer
+          format: int64
+          description: Trade size, truncated to an integer.
+          example: 250
+        price:
+          type: number
+          description: |
+            Trade price on the **0–100 cents scale, for every provider** (never a 0–1 probability, never already-divided dollars). May include sub-cent fractions on venues with sub-penny ticks (e.g. Kalshi). USD notional = size * price / 100.
+          minimum: 0
+          maximum: 100
+          example: 62.5
+        outcome:
+          type: string
+          description: Outcome label as stored on the trade row (venue-dependent free text, e.g. "Yes"/"No").
+          example: 'Yes'
+        timestamp:
+          type: number
+          description: Unix timestamp in seconds, with fractional (millisecond) precision preserved.
+          example: 1737479998.412
+        token_id:
+          type: string
+          description: Venue outcome-token identifier, when the venue is token-keyed (e.g. Polymarket
+            CTF token id). Omitted when empty.
+          example: '109451234567890332112345678903321'
+        metadata:
+          type: string
+          description: Raw JSON-encoded metadata blob from the ingestion pipeline, passed through as a
+            string (not parsed). Omitted when empty or the literal "{}".
+          example: '{"maker_order_id":"0xabc"}'
+        taker_address:
+          type: string
+          description: On-chain taker address, when known. Omitted when empty.
+          example: '0xabc1234567890abcdef1234567890abcdef1234'
+        side:
+          type: string
+          description: Canonical trade side as stored on the row. Omitted when empty.
+          example: buy
+    TradeHistoryResponse:
+      type: object
+      required:
+      - trades
+      - has_more
+      - oldest_available_ts
+      - coverage_hours
+      properties:
+        trades:
+          type: array
+          description: Trades in the resolved window, newest first, capped at `limit` entries.
+          items:
+            $ref: '#/components/schemas/TradeRecord'
+        has_more:
+          type: boolean
+          description: |
+            True when the number of trades returned equals the requested `limit`, meaning more trades likely exist beyond this page.
+          example: true
+        oldest_available_ts:
+          type:
+          - number
+          - 'null'
+          description: |
+            Unix timestamp (seconds, fractional) of the oldest trade in the returned page, or null when `trades` is empty. Reflects the oldest trade *in this response*, not necessarily the oldest trade ever recorded for the contract.
+          example: 1737479950.001
+        coverage_hours:
+          type: number
+          description: |
+            Hours between `oldest_available_ts` and the request time, rounded to 1 decimal place. 0.0 when `trades` is empty.
+          example: 0.01
+    TradeMetrics:
+      type: object
+      required:
+      - volume_usd
+      - outcome_0_volume_usd
+      - outcome_1_volume_usd
+      - outcome_0_volume_share_pct
+      - trade_count
+      - window_seconds
+      - coverage_pct
+      properties:
+        volume_usd:
+          type: number
+          description: Total USD notional traded in the window (size * price / 100, summed), rounded to
+            2 decimals.
+          example: 184032.55
+        outcome_0_volume_usd:
+          type: number
+          description: |
+            USD volume attributed to "outcome 0". For Kalshi this is the "yes" side; for all other providers it is whichever token had the highest volume in the window (not guaranteed to be "Yes"). Rounded to 2 decimals.
+          example: 121004.1
+        outcome_1_volume_usd:
+          type: number
+          description: |
+            USD volume attributed to "outcome 1". For Kalshi this is the "no" side; for all other providers it is the second-highest-volume token in the window. Rounded to 2 decimals.
+          example: 63028.45
+        outcome_0_volume_share_pct:
+          type: number
+          description: |
+            outcome_0_volume_usd as a percentage of (outcome_0 + outcome_1) volume, rounded to 1 decimal. Defaults to 50.0 when both outcome volumes are zero.
+          minimum: 0
+          maximum: 100
+          example: 65.8
+        trade_count:
+          type: integer
+          format: int64
+          description: Number of deduplicated trades in the window.
+          example: 5123
+        window_seconds:
+          type: integer
+          description: Echoes the effective `window_seconds` request parameter.
+          example: 3600
+        coverage_pct:
+          type: number
+          description: |
+            Percentage of the requested window actually covered by data, clamped to [0, 100]. 0 when no trades are found. Rounded to 1 decimal.
+          example: 97.2
+    TradeMetricsResponse:
+      type: object
+      required:
+      - metrics
+      properties:
+        metrics:
+          $ref: '#/components/schemas/TradeMetrics'

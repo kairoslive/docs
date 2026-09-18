@@ -1,0 +1,228 @@
+---
+title: "Fees"
+description: "Kairos platform fee policy — live fee tiers, per-venue exchange fees, and fee quotes"
+---
+
+Two separate charges can apply to a fill: the **Kairos platform fee**, set by your fee tier, and the **venue's own exchange fee**, set by the exchange. They are computed independently and reported separately. This page explains how each is calculated and where to read the live numbers.
+
+<Warning>
+**Never assume either charge is zero.** Price an order with the
+[Fee Quote endpoint](/rest/orders#fee-quote), which returns both
+components plus the all-in cost.
+</Warning>
+
+| Charge       | Set by                    | Basis                       | Where to read it                        |
+| ------------ | ------------------------- | --------------------------- | --------------------------------------- |
+| Platform fee | Kairos, via your fee tier | Basis points on notional    | `fees.getUserTier` / `fees.getFeeTiers` |
+| Exchange fee | The venue                 | A per-venue formula (below) | Fee quote, or the venue's own schedule  |
+
+## Kairos Platform Fee
+
+Your platform fee uses the maker or taker schedule from the fee tier that
+applies to you at fill time. A tier can use a flat rate:
+
+```text
+platform fee = notional × bps / 10,000
+```
+
+where `notional = fill quantity × fill price`. Maker and taker carry separate
+rates, so a resting limit order and a marketable order on the same market can
+be charged differently.
+
+A curve tier instead stores ordered `{ price, feeBps }` control points for each
+side. Kairos linearly interpolates the effective basis-point rate at the fill's
+actual share price, then applies that rate to notional. Curves cover the complete
+price range from `0` through `1`; the `makerFeeBps` and `takerFeeBps` fields on a
+curve tier expose its peak rates for backwards-compatible displays. Read
+`feeModel`, `makerFeeCurve`, and `takerFeeCurve` to price the full schedule.
+
+A parabolic tier stores an edge rate and a center rate for each side. For a fill
+price `p` between `0` and `1`, Kairos evaluates the exact symmetric schedule:
+
+```text
+effective bps = edge bps + 4 × (center bps − edge bps) × p × (1 − p)
+```
+
+The configured edge rate applies at `p = 0` and `p = 1`; the configured center
+rate applies at `p = 0.50`. Read `makerFeeEdgeBps`, `makerFeeCenterBps`,
+`takerFeeEdgeBps`, and `takerFeeCenterBps` when `feeModel` is `parabolic`.
+
+### How volume tiers apply
+
+Your rolling 7-day and 30-day matched volume determines your position on the
+volume ladder. Tier changes take effect on the next fill, and volume tiers are
+recomputed as your rolling volume changes.
+
+## Live fee schedule
+
+<Note>
+  Rendered from the live `fees.getFeeTiers` configuration. Last schedule update: **2026-09-02T03:28:36Z**. Rates are configuration, not a fixed schedule — the fee quote shown before an order is authoritative.
+</Note>
+
+### Volume ladder
+
+| Tier | 7-day volume | 30-day volume | Rate model | Gas |
+| --- | --- | --- | --- | --- |
+| [Kairos Starter](#kairos-starter) | $0 | $0 | Parabolic | Sponsored |
+| [Kairos Bronze](#kairos-bronze) | $0 | $50,000 | Parabolic | Sponsored |
+| [Kairos Silver](#kairos-silver) | $0 | $99,900 | Parabolic | Sponsored |
+| [Kairos Gold](#kairos-gold) | $0 | $1,000,000 | Parabolic | Sponsored |
+
+### Kairos Starter
+
+- **7-day volume** — $0
+- **30-day volume** — $0
+- **Network gas** — Sponsored
+- **Maker rate** — `0 + 4 × (0 − 0) × p × (1 − p) bps`
+- **Taker rate** — `10 + 4 × (50 − 10) × p × (1 − p) bps`
+
+
+| Fill price | Maker rate | Taker rate | Taker fee on 100 shares |
+| --- | --- | --- | --- |
+| 10¢ | 0 bps | 24.40 bps | $0.0244 |
+| 25¢ | 0 bps | 40 bps | $0.1000 |
+| 50¢ | 0 bps | 50 bps | $0.2500 |
+| 75¢ | 0 bps | 40 bps | $0.3000 |
+| 90¢ | 0 bps | 24.40 bps | $0.2196 |
+
+### Kairos Bronze
+
+- **7-day volume** — $0
+- **30-day volume** — $50,000
+- **Network gas** — Sponsored
+- **Maker rate** — `0 + 4 × (0 − 0) × p × (1 − p) bps`
+- **Taker rate** — `9 + 4 × (40 − 9) × p × (1 − p) bps`
+
+
+| Fill price | Maker rate | Taker rate | Taker fee on 100 shares |
+| --- | --- | --- | --- |
+| 10¢ | 0 bps | 20.16 bps | $0.0202 |
+| 25¢ | 0 bps | 32.25 bps | $0.0806 |
+| 50¢ | 0 bps | 40 bps | $0.2000 |
+| 75¢ | 0 bps | 32.25 bps | $0.2419 |
+| 90¢ | 0 bps | 20.16 bps | $0.1814 |
+
+### Kairos Silver
+
+- **7-day volume** — $0
+- **30-day volume** — $99,900
+- **Network gas** — Sponsored
+- **Maker rate** — `0 + 4 × (0 − 0) × p × (1 − p) bps`
+- **Taker rate** — `8 + 4 × (30 − 8) × p × (1 − p) bps`
+
+
+| Fill price | Maker rate | Taker rate | Taker fee on 100 shares |
+| --- | --- | --- | --- |
+| 10¢ | 0 bps | 15.92 bps | $0.0159 |
+| 25¢ | 0 bps | 24.50 bps | $0.0612 |
+| 50¢ | 0 bps | 30 bps | $0.1500 |
+| 75¢ | 0 bps | 24.50 bps | $0.1837 |
+| 90¢ | 0 bps | 15.92 bps | $0.1433 |
+
+### Kairos Gold
+
+- **7-day volume** — $0
+- **30-day volume** — $1,000,000
+- **Network gas** — Sponsored
+- **Maker rate** — `0 + 4 × (0 − 0) × p × (1 − p) bps`
+- **Taker rate** — `5 + 4 × (25 − 5) × p × (1 − p) bps`
+
+
+| Fill price | Maker rate | Taker rate | Taker fee on 100 shares |
+| --- | --- | --- | --- |
+| 10¢ | 0 bps | 12.20 bps | $0.0122 |
+| 25¢ | 0 bps | 20 bps | $0.0500 |
+| 50¢ | 0 bps | 25 bps | $0.1250 |
+| 75¢ | 0 bps | 20 bps | $0.1500 |
+| 90¢ | 0 bps | 12.20 bps | $0.1098 |
+
+## Exchange Fees
+
+Venue fees are charged by the exchange, not by Kairos, and are on top of the
+platform fee. Polymarket and Predict.fun charge **takers only** — a resting
+maker order pays no exchange fee there. Kalshi is the exception.
+
+### Polymarket
+
+```text
+fee = shares × rate × p × (1 − p)
+```
+
+`p` is the share price and `rate` is the market's category fee curve. The fee
+peaks at `p = 0.50` and tapers toward both extremes, and the result is rounded
+to five decimal places.
+
+| Category                                   | Rate | Taker fee per 100 shares at 50¢ |
+| ------------------------------------------ | ---- | ------------------------------- |
+| Crypto                                     | 0.07 | $1.75                           |
+| Sports, Economics, Culture, Weather, Other | 0.05 | $1.25                           |
+| Finance, Politics, Mentions, Tech          | 0.04 | $1.00                           |
+| Geopolitics                                | 0    | $0.00                           |
+
+Markets with fees disabled charge nothing regardless of category. These rates
+mirror Polymarket's published schedule and can change on their side.
+
+<Warning>
+**A resting Polymarket buy still needs balance headroom for a fee it may never
+pay.** Polymarket's CLOB **reserves** the taker-fee estimate at placement even
+for an order expected to rest. The fee quote reports this separately as the
+venue reserve.
+</Warning>
+
+### Predict.fun
+
+```text
+fee = (feeRateBps / 10,000) × min(p, 1 − p) × shares
+```
+
+`feeRateBps` is per market and read from live market metadata. When it cannot
+be resolved, the quote falls back to a 200 bps (2%) base and flags itself as an
+estimate. Like Polymarket's curve, the fee peaks at `p = 0.50`.
+
+### Kalshi
+
+```text
+fee = scale × contracts × p × (1 − p)
+```
+
+The `scale` depends on the market's series ticker — the part before the first
+`-`. Unknown series fall back to Standard.
+
+| Series tier                          | Maker scale | Taker scale | Taker fee per 100 contracts at 50¢ |
+| ------------------------------------ | ----------- | ----------- | ---------------------------------- |
+| Standard                             | 0           | 0.07        | $1.75                              |
+| Non-standard (most sports and macro) | 0.07        | 0.0175      | $0.44                              |
+| Index (S&P 500 / Nasdaq)             | 0           | 0.035       | $0.88                              |
+| Fee-free series                      | 0           | 0           | $0.00                              |
+
+> **On the non-standard series the inversion bites: the _maker_ pays the higher
+> scale.** Resting an order there is the expensive side, not the cheap one.
+
+> **Kalshi fee quotes are estimates.** Kalshi does not expose a fee API, so
+> Kairos maintains this schedule by hand from Kalshi's published table. Confirm
+> against Kalshi's published schedule for anything rate-sensitive.
+
+## Fee Quotes
+
+`GET /orders/fee-quote` prices a hypothetical order against the live book and
+returns the platform fee, the exchange fee, the venue reserve, the total fee,
+and the all-in cost — see [Fee Quote](/rest/orders#fee-quote). Fee quotes
+are supported for `kalshi`, `polymarket`, and `predictfun`.
+
+Quotes are marked as estimates: they price off a point-in-time book, and a
+market order's realised average price (and therefore its fee) depends on what
+the book looks like at execution.
+
+For a live stream of quotes as you size an order, subscribe to
+`subscribe_fee_quote` on the order-execution socket — see
+[Fee Quote WebSocket](/websocket/fee-quote).
+
+## Network Costs
+
+Beyond exchange fees, on-chain venues can carry network costs and collateral
+conversion steps that are not Kairos platform fees.
+
+<Note>
+**The fee quote's total cost covers the platform and exchange fees only** — it
+does not include network or conversion costs.
+</Note>

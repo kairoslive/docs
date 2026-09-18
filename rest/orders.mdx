@@ -1,0 +1,563 @@
+---
+title: "Orders"
+description: "Submit, query, and cancel orders on the custodial (Kairos-signed) order lane"
+---
+
+Submit, cancel, and query orders on the custodial lane, where Kairos signs and routes on your behalf — see [External Execution](/external-execution/overview) for the self-custody signing lane. Use this page when you are placing orders from a bot or backend and need the exact request shape, status semantics, and error codes.
+
+Full parameter reference and a live tester for every endpoint below: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://execution.kairos.trade
+```
+
+## Authentication
+
+Every endpoint on this page requires a Kairos API key or session JWT plus a per-operation scope (`trade:execute` or `trade:read`) — there is no anonymous tier on this service, it moves money.
+
+```
+X-Client-Id: kairos_ck_...
+X-Api-Key: <64 hex chars>
+X-Api-Secret: <64 hex chars>
+```
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+Order submission is rate-limited to 5/sec per user by default (sliding window); API keys with a per-key override are checked against both windows (the override window is per-minute). **Idempotent replays (matching `client_order_id`) never consume a slot** — the one exception is a Predict.fun request that passes an outcome token id as `market_id`, which is charged before the canonicalisation lookup.
+
+The order-submitting and cancelling endpoints also sit behind a mutation gate that runs *before* user auth, so a bad API-key triple there is a **`403`**, not a `401`; the read endpoints (`GET /orders`, `GET /orders/{order_id}`, `GET /orders/fee-quote`) return `401`. Repeated auth failures from one source IP are throttled at 10/min and then return `429`.
+
+## Submit Order
+
+```
+POST /orders
+Scope: trade:execute
+```
+
+Validates, persists, and enqueues the order. Call it once per order you want on a venue; track the outcome via `GET /orders/{order_id}`, `GET /orders` polling, or (lowest latency) the `/ws` socket's `order_update` / `fill` events.
+
+Auth: API key or session JWT, scope `trade:execute`. Rate limit: 5/sec per user by default.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` | string | Yes | — | A registered exchange: `polymarket`, `kalshi`, `predictfun`, `opinion`, `hyperliquid`, … (`kalshi_offchain` is a deprecated alias of `kalshi`, still accepted) |
+| `market_id` | string | Yes | — | Market/contract identifier. For Polymarket: numeric Gamma market id, `0x` condition id, or a full CLOB token id. For Hyperliquid: numeric HIP-4 outcome id |
+| `side` | string | Yes | — | `buy` or `sell`, case-insensitive |
+| `kind` | string | Yes | — | `market` or `limit` |
+| `quantity` | number | Yes | — | > 0, ≤ 1,000,000. Buy orders also subject to `MIN_ORDER_QUANTITY` (default `1.0`); sells have no minimum so a position can always be fully closed |
+| `price` | number | Yes | — | > 0, ≤ venue max (typically `1.0`). Executable price in the selected outcome's own dollars — required even for market orders. Limit orders: the resting price. Market orders: the live same-outcome quote (ask for buys, bid for sells). For Kalshi `No`, send the displayed `No` price; do not complement it client-side |
+| `outcome` | string | Required except Polymarket token-only requests | — | Outcome label (e.g. `"Yes"`, `"No"`). For Kalshi, only `"Yes"`/`"No"` are valid — display labels are not |
+| `token_id` | string | Provider-specific | — | Polymarket: full CLOB id, >15 digits. Hyperliquid: `#<encoding>`. Outcome-token identifier; Hyperliquid uses it to select the side-specific book, see [Hyperliquid orders](#hyperliquid-orders) |
+| `time_in_force` | string | No | `GTC` | `GTC`, `FOK`, `IOC`, `FAK`, or `GTD`, case-insensitive; empty/whitespace also means `GTC`. An unrecognised value is rejected `400`, never downgraded. See [Time-in-Force](#time-in-force) |
+| `post_only` | boolean | No | `false` | Maker-only: the venue must reject the order rather than let it cross. Limit orders on `GTC`/`GTD` only, and only on venues advertising `supports_post_only` — anything else is rejected `400` rather than silently downgraded to a taker order |
+| `expiration_minutes` | integer | GTD only | — | `1`–`43200` (30 days) |
+| `client_order_id` | string | No | Auto-generated | Idempotency key — a retry with the same `(user, exchange_id, market_id, client_order_id)` returns the existing order instead of duplicating, and does not consume a rate-limit slot. Un-keyed retries are NOT deduped |
+| `trigger_price` | number | No | — | Same bounds as `price`. Stop/take-profit trigger |
+| `max_slippage_cents` | integer | No | — | `1`–`99` |
+| `max_slippage` | number | No | — | `[0, 0.5]`. **Deprecated** — use `max_slippage_cents` |
+| `max_retries` | integer | No | `0` | `0`–`20`. Retry attempts for transient failures; a value above `20` is rejected `400` |
+| `bot_id` | string | No | — | Copy-trading / strategy attribution |
+| `source` | string | No | From auth method | `manual`, `bot`, `copytrade`, or `api`. Defaults from auth method when omitted (API key → `api`, `bot_id` present → `bot`, else `manual`) |
+| `gas_sponsored` | boolean | No | — | **Not implemented server-side yet** — accepted but currently has no effect |
+| `user_id` | string | No | — | **Ignored** — the authenticated caller is always used |
+| `orderbook_levels` | array | No | — | **Ignored / deprecated** — the executor always fetches a fresh book |
+
+<Note>
+**Gotcha:** API-key BUYs have a $5 minimum notional. `quantity × price` below `$5` is rejected `400` (`VALIDATION_INVALID_ORDER`). The rule applies only to BUYs authenticated with an API key — session-JWT callers and all SELLs are exempt.
+</Note>
+
+```bash
+curl -X POST https://execution.kairos.trade/orders \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "exchange_id": "polymarket",
+    "market_id": "570362",
+    "outcome": "Yes",
+    "side": "buy",
+    "kind": "limit",
+    "quantity": 100,
+    "price": 0.45,
+    "time_in_force": "GTC"
+  }'
+```
+
+### Response
+
+```json
+{
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "queued"
+}
+```
+
+On an idempotent hit (existing `client_order_id`), `status` is the existing order's current status instead of `"queued"`.
+
+<Note>
+**Gotcha:** `queued` is only Kairos's acceptance acknowledgement — an async ack, not confirmation the order is live on the venue, accepted, or filled. Predict.fun in particular confirms settlement asynchronously on BSC; poll `GET /orders/{order_id}` or consume order updates for the authoritative result.
+</Note>
+
+### Time-in-Force
+
+| Value | Name | Description |
+|---|---|---|
+| `GTC` | Good-til-Cancelled | Resting; stays active until filled or cancelled (default) |
+| `GTD` | Good-til-Date | Resting; expires after `expiration_minutes` |
+| `FOK` | Fill-or-Kill | Immediate taker; fill entirely or cancel |
+| `IOC` | Immediate-or-Cancel | Immediate taker; fill what's available, cancel the rest |
+| `FAK` | Fill-and-Kill | Same as IOC (Polymarket-specific alias) |
+
+Predict.fun maps `FOK` to `isFillOrKill=true` and maps `FAK`/`IOC` to
+`isFillOrKill=false`. `GTC` and `GTD` omit that immediate-fill flag and rest
+until their signed expiration. A Predict.fun `GTC` limit receives a 30-day
+signed expiration, while a `GTD` limit uses `expiration_minutes`; market orders
+always use the venue's fixed five-minute expiration.
+
+### Hyperliquid orders
+
+HIP-4 has a separate book for each binary side. Use the numeric outcome id as
+`market_id`, include the selected display label in `outcome`, and pass the side
+coin from `OrderbookSnapshot.token_ids` as `token_id` (for example `#1010` or
+`#1011`). If deriving it, `encoding = 10 * market_id + side_index`, where the
+first outcome is side `0` and the second is side `1`. A bare `market_id` falls
+back to side `0`, so `token_id` is required to trade side `1`.
+
+Quantities are whole shares; fractional values are floored and values below one
+share are rejected. Hyperliquid maps `GTC`/`GTD` to venue GTC and
+`IOC`/`FAK`/`FOK` to venue IOC. Only single-order cancellation is supported;
+selected-order batch cancel, cancel-all, and fee quotes are unavailable.
+
+Trading also requires a previously authorized Hyperliquid agent and sufficient
+spot USDC. Bridge deposits arrive in the perp balance and must be moved to spot
+before they can fund HIP-4 orders; see [Portfolio balances](/rpc/portfolio).
+
+```json
+{
+  "exchange_id": "hyperliquid",
+  "market_id": "101",
+  "token_id": "#1011",
+  "outcome": "No",
+  "side": "buy",
+  "kind": "limit",
+  "quantity": 25,
+  "price": 0.42,
+  "time_in_force": "GTC"
+}
+```
+
+## Get Order
+
+```
+GET /orders/{order_id}
+Scope: trade:read
+```
+
+Returns the full order, including `raw` (the unredacted venue response) and `metadata`. Call it to resolve the authoritative state of an order you submitted.
+
+Auth: API key or session JWT, scope `trade:read`. You can only view your own orders.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `order_id` (path) | uuid | Yes | — | A Kairos order UUID. A non-UUID value is rejected `400` by the path parser before the handler runs |
+
+```bash
+curl "https://execution.kairos.trade/orders/550e8400-e29b-41d4-a716-446655440000" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "user_id": "...",
+  "exchange_id": "polymarket",
+  "market_id": "570362",
+  "token_id": "12345678901234567890",
+  "outcome": "Yes",
+  "outcome_id": "12345678901234567890",
+  "side": "buy",
+  "kind": "limit",
+  "quantity": "100",
+  "price": "0.45",
+  "price_bps": 4500,
+  "time_in_force": "GTC",
+  "post_only": false,
+  "expires_at": null,
+  "status": "live",
+  "filled_quantity": "0",
+  "avg_fill_price": null,
+  "avg_fill_price_bps": null,
+  "exchange_order_id": "0xabc...",
+  "client_order_id": null,
+  "wallet_id": "...",
+  "trigger_price": null,
+  "trigger_price_bps": null,
+  "gas_sponsored": true,
+  "gas_amount": null,
+  "maker_address": null,
+  "tx_hash": null,
+  "fee_amount": null,
+  "fee_currency": null,
+  "bot_id": null,
+  "source": "api",
+  "metadata": {},
+  "holding_wallet": "",
+  "error_message": null,
+  "created_at": "2026-02-06T12:00:00Z",
+  "updated_at": "2026-02-06T12:00:01Z"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `status` | string | See [Order Status Types](#order-status-types) |
+| `price` / `avg_fill_price` | string | Decimal, 0–1 scale. `price_bps` / `avg_fill_price_bps` carry the same value ×10000 |
+| `raw` | object\|null | Full venue request/response, for audit. Present here; stripped on `GET /orders` |
+| `holding_wallet` | string | On-chain wallet holding the resulting shares (Safe proxy for upgraded/external-signing users, EOA otherwise). Empty string for non-Polymarket orders |
+| `source` | string | `manual`, `bot`, `copytrade`, `api`, or `fastlane` (external-signing lane) |
+| `post_only` | boolean | Maker-only guarantee as submitted |
+| `failure` | object\|null | Structured failure detail; **omitted entirely** when the order has not failed. `error_message` stays populated for existing consumers |
+
+## List Orders
+
+```
+GET /orders
+Scope: trade:read
+```
+
+Returns the caller's orders, newest first (`submittedAt DESC, id DESC`), so `limit` + `offset` paginate deterministically. For deep or long-lived paging prefer the `before_id` cursor, which cannot skip rows when the set shifts underneath you.
+
+Auth: API key or session JWT, scope `trade:read`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `status` | string | No | — | A comma-separated set: a single status (`"filled"`) or several (`"live,partial"`). Matched literally against the stored value, so use the wire values from [Order Status Types](#order-status-types). Omit for all statuses |
+| `exchange_id` | string | No | — | Filter to one venue |
+| `active_only` | boolean | No | `false` | Only genuinely working orders. Unlike a status filter it also excludes a `partial` market/`FAK`/`IOC`/`FOK` order whose remainder was killed at submit |
+| `limit` | integer | No | `50` | Max 500. Values above 500 are clamped, not rejected |
+| `offset` | integer | No | `0` | ≥ 0. Page _p_ (0-indexed) of size _n_ is `limit=n&offset=p*n`. **Ignored when `before_id` is set** |
+| `before_id` | uuid | No | — | Must be one of your own orders. Keyset cursor: return rows strictly older than that order on the stable `(submittedAt, id)` key. Unlike `offset` it cannot skip rows when the active set shifts between pages |
+| `user_id` | string | No | — | **Ignored** — the authenticated caller is always used |
+
+```bash
+# Most recent live + partially-filled Polymarket orders
+curl "https://execution.kairos.trade/orders?status=live,partial&exchange_id=polymarket" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+Order rows in the same shape as [Get Order](#get-order), newest first.
+
+> **Gotcha:** this is a lighter payload than Get Order. `raw` and `metadata` are stripped to `null` on every row to keep this cheap to poll (`raw` alone can be ~100 KB/order) — the `outcome` label is preserved by falling back to `metadata.outcome` before stripping. Fetch a single order via `GET /orders/{order_id}` for the full row.
+
+> Need current position exposure rather than order state? `GET /positions/exposure` (scope `position:read`) is documented in the [API Reference](/api-reference).
+
+## Cancel Order
+
+```
+POST /orders/{order_id}/cancel
+Scope: trade:execute
+```
+
+Cancels one order by its Kairos order id. The response reflects a post-cancel re-read, so `filled_quantity` / `avg_fill_price` capture any fill that landed during the round-trip.
+
+Auth: API key or session JWT, scope `trade:execute`. Behind the mutation gate, so a bad API-key triple is a `403`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `order_id` (path) | uuid | Yes | — | A Kairos order UUID. A non-UUID value is rejected `400` by the path parser before the handler runs |
+
+No request body.
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/550e8400-e29b-41d4-a716-446655440000/cancel \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "order_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message": "Order cancelled on exchange",
+  "filled_quantity": "25",
+  "avg_fill_price": "0.44"
+}
+```
+
+<Note>
+**Gotcha:** this endpoint almost always returns `200`, even on failure to cancel. Non-2xx is reserved for auth/ownership/not-found/infrastructure failures — a `success: false` body with a `message` covers an already-terminal order or a venue that currently refuses the cancel (still live — retry). Branch on `success`, not the status code.
+</Note>
+
+`filled_quantity` / `avg_fill_price` are **omitted** (not `null`) when nothing filled, and on the early-return paths — already-terminal, cancel-race, pre-exchange cancel — where the value would be unknown.
+
+Example `message` values: `"Order cancelled on exchange"` and `"Order cancelled (pre-exchange)"` on success; when `success` is `false`, `"Order cannot be cancelled - status is Filled"` (also `Cancelled` / `Expired`), `"Order already failed"`, `"Order is being submitted to exchange. Please try again in a moment."`, or `"Could not confirm cancellation on the exchange: <reason>"` — the last one means the order may still be live, so retry.
+
+## Batch Cancel Selected Orders
+
+```
+POST /orders/cancel-batch
+Scope: trade:execute
+```
+
+Cancels a specific list of order ids. **The whole selection is validated before any venue request is sent** — every order must exist, belong to you, be non-terminal, have an exchange order id, and share one `exchange_id`. If validation fails, nothing is cancelled. Supported on Polymarket, Kalshi, and Predict.fun; other venues return `400`.
+
+Auth: API key or session JWT, scope `trade:execute`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `order_ids` | string[] | Yes | — | Max 100, deduped server-side. Kairos order UUIDs |
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-batch \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "order_ids": [
+      "550e8400-e29b-41d4-a716-446655440000",
+      "660e8400-e29b-41d4-a716-446655440000"
+    ]
+  }'
+```
+
+### Response
+
+```json
+{
+  "success": true,
+  "cancelled_count": 2,
+  "noop_count": 0,
+  "failed_count": 0,
+  "cancelled_order_ids": [
+    "550e8400-e29b-41d4-a716-446655440000",
+    "660e8400-e29b-41d4-a716-446655440000"
+  ],
+  "noop_order_ids": [],
+  "failures": []
+}
+```
+
+`noop_count` covers orders the venue reports as already terminal or absent — still handled, not a failure. **Fill-during-cancel noops are never counted as cancelled**; fill reconciliation remains authoritative. Venue-side partial failures land in `failures` and are not marked cancelled locally.
+
+Validation failures are bare statuses with an empty body: `404` if any id is unknown, `403` if any order belongs to someone else, **`409` if any order is already terminal or has not reached the venue yet**, and `400` for an empty list, more than 100 ids, a mixed-exchange selection, or a venue with no batch cancel. A venue-side failure of the batch call itself is `500`.
+
+## Cancel All Orders
+
+```
+POST /orders/cancel-all
+Scope: trade:execute
+```
+
+Kill-switch endpoint: cancels every open order on `exchange_id` (optionally scoped to `market_id`) via the venue's native cancel-all, then reconciles local rows up to whatever the venue reports cancelled.
+
+Auth: API key or session JWT, scope `trade:execute`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` | string | Yes | — | Exchange to cancel on |
+| `market_id` | string | No | — | Restrict to a specific market |
+| `user_id` | string | No | — | **Ignored** — authenticated user is always used |
+
+```bash
+curl -X POST https://execution.kairos.trade/orders/cancel-all \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "exchange_id": "polymarket",
+    "market_id": "570362"
+  }'
+```
+
+### Response
+
+```json
+{
+  "cancelled_count": 3,
+  "failed_count": 0,
+  "cancelled_order_ids": ["550e...", "551e...", "552e..."]
+}
+```
+
+`cancelled_count` is the venue's authoritative count. If the venue reports `0`, no local rows are touched — the GTC poller / fill workers reconcile from there rather than the endpoint blindly marking rows cancelled.
+
+<Note>
+**Gotcha:** unlike single/batch cancel, a caller-input error here is a real `400`, not a `success: false` 200. This is the kill-switch path, so a bad request must read differently from "the venue kept orders resting."
+</Note>
+
+### Per-venue semantics
+
+| Venue | `market_id` filter accepts | Mechanism |
+|---|---|---|
+| Polymarket | Numeric market id or `0x…` condition id | Native venue cancel-all |
+| Kalshi | Raw Kalshi ticker | Native venue cancel-all |
+| Predict.fun | Numeric market id only — a hex/non-decimal value is rejected `400` before any venue call | **Synthetic**, see below |
+
+**Predict.fun cancel-all is synthetic and non-atomic.** The venue has no native cancel-all, so Kairos lists all open orders (paginated), applies the optional market filter, and cancels in batches of ≤100 (the venue's per-request cap):
+
+- **Fill-during-cancel race** — an order can fill between listing and its cancel batch; the venue reports it as a no-op, never counted in `cancelled_count`.
+- **Partial success is possible** — one batch can succeed while a later one fails, returning `PREDICTFUN_CANCEL_ALL_PARTIAL` with how many were already cancelled; retrying sweeps the remainder.
+- **A failed or incomplete listing never cancels** — a failed listing errors instead of reporting "nothing to cancel"; exceeding the 2,000-order pagination safety cap (20 pages × 100) fails with `PREDICTFUN_CANCEL_ALL_LIST_OVERFLOW` rather than sweeping partial data.
+
+Both are venue codes, so they arrive as `error_details.metadata.code` on a `502` whose `error_details.code` is `EXCHANGE_ERROR` — match on the metadata code, not the top-level one.
+
+## Fee Quote
+
+```
+GET /orders/fee-quote
+Scope: trade:read
+```
+
+Prices a trade before you submit it — a market order (`order_type=market`, `price` omitted) walks the live book for `quantity`; a limit order (`order_type=limit`) requires `price` as the resting quote. Shares the exact computation used by the WebSocket [Fee Quote (RFQ)](/websocket/fee-quote) stream, so the two surfaces never disagree.
+
+Auth: API key or session JWT, scope `trade:read`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` | string | Yes | — | `polymarket`, `kalshi`, or `predictfun` (`kalshi_offchain` accepted as an alias) |
+| `quantity` | string | Yes | — | > 0. Decimal string, shares/contracts |
+| `side` | string | Yes | — | `buy` or `sell`, case-insensitive. The quote walks the ask side for buy, bid side for sell |
+| `order_type` | string | Yes | — | `market` or `limit`, case-insensitive |
+| `market_id` | string | One of `market_id`/`token_id` | — | Condition id (Polymarket). Required for Polymarket if `token_id` omitted |
+| `token_id` | string | One of `market_id`/`token_id` | — | CLOB token id (Polymarket) — preferred over `market_id` |
+| `price` | string | Limit only | — | `(0, 1]`. Resting price; required when `order_type=limit`. **Ignored for `market`** — the book is always walked |
+
+```bash
+curl "https://execution.kairos.trade/orders/fee-quote?exchange_id=polymarket&market_id=570362&side=buy&order_type=market&quantity=100" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+Every validation failure here is a bare `400` with an empty body (unsupported exchange, bad `side`/`order_type`, non-positive `quantity`, `price` outside `(0, 1]`, a limit quote with no `price`, or a Polymarket quote with neither id). A missing scope or a disabled provider is `403`.
+
+### Response
+
+```json
+{
+  "avg_price_usdc": "0.452000",
+  "filled_size": "100",
+  "requested_size": "100",
+  "sufficient_liquidity": true,
+  "notional_usdc": "45.200000",
+  "platform_fee_usdc": "2.750000",
+  "exchange_fee_usdc": "0.180000",
+  "venue_reserve_fee_usdc": "0.180000",
+  "total_fee_usdc": "2.930000",
+  "exchange_fee_note": "0.08% taker fee",
+  "total_cost_usdc": "48.130000",
+  "pricing_unavailable": false,
+  "is_estimate": true
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `avg_price_usdc` | string | Price per share on the 0–1 scale (despite the `usdc` suffix): VWAP of the executable slice for a market order, or the limit price for a limit order |
+| `exchange_fee_note` | string\|null | Human-readable fee description; `null` when the venue has none |
+| `sufficient_liquidity` | boolean | `false` when the book can't fill `requested_size` |
+| `venue_reserve_fee_usdc` | string | What the venue actually reserves to accept the order — can exceed `exchange_fee_usdc` (Polymarket CLOB reserves the taker estimate on a resting limit order since it can't know it'll stay maker). **Size affordability checks off this field, not `exchange_fee_usdc`.** |
+| `total_cost_usdc` | string | All-in: buy → notional + fees; sell → notional − fees |
+| `pricing_unavailable` | boolean | `true` means no executable price was found — every numeric field is a `"0"` placeholder and **must not be rendered as a real quote** |
+| `is_estimate` | boolean | Always `true` — authoritative fee is computed at fill time |
+
+<Note>
+**Gotcha:** the response is `200` even when no price could be found. Check `pricing_unavailable` before rendering a quote.
+</Note>
+
+## Order Status Types
+
+| Status | Description | Terminal |
+|---|---|---|
+| `pending` | Accepted; covers internal `queued`/`locked`/`executing`/`orphaned` states, which `GET /orders` reports at their granular value | No |
+| `live` | Active on the exchange | No |
+| `partial` | Some quantity filled. Active while a resting order remains live, but it may be terminal after an immediate remainder is killed or after cancellation/expiry. | Depends on venue state |
+| `filled` | Fully filled | Yes |
+| `cancelled` | Cancelled by user | Yes |
+| `expired` | GTD order reached expiration | Yes |
+| `failed` | Could not execute — see `error_message` | Yes |
+
+For market orders and explicit immediate TIFs (`FAK`, `IOC`, and `FOK`), a
+venue kill with zero fills is `failed`, not `cancelled`. A partial immediate
+execution is terminal, but reconciliation may persist it as either `partial`
+or `filled`.
+
+<Warning>
+**Gotcha:** treat `status` as authoritative. Do not infer completion by comparing `filled_quantity` with `quantity`: `quantity` is the gross requested size, while Predict.fun BUY fills record the net shares received after share-denominated fees. A fully executed order can therefore have `filled_quantity < quantity`.
+</Warning>
+
+## Errors
+
+Order submission and cancel-all return a structured body:
+
+```json
+{
+  "error": "Quantity must be positive",
+  "code": "ValidationInvalidSize",
+  "error_details": {
+    "code": "VALIDATION_INVALID_SIZE",
+    "message": "Quantity must be positive",
+    "actions": []
+  }
+}
+```
+
+`error_details.details` and `error_details.metadata` are **omitted when absent**, never `null`. `actions` is always present (possibly empty); each entry is `{ "action", "label", "primary" }` with a snake_case `action` such as `review_order`, `retry`, `add_funds`, `enable_trading`, `contact_support`.
+
+<Note>
+**Gotcha:** `code` and `error_details.code` are not the same casing. Top-level `code` is a legacy PascalCase debug string (`ValidationInvalidSize`); `error_details.code` is the canonical SCREAMING_SNAKE_CASE wire code (`VALIDATION_INVALID_SIZE`) — new integrations should match on `error_details.code`.
+</Note>
+
+**Only `POST /orders` and `POST /orders/cancel-all` return this envelope.** `GET /orders`, `GET /orders/{order_id}`, `GET /orders/fee-quote`, single cancel and batch cancel return a bare status with an empty body — rely on the status code alone there. Failures raised by the auth layer itself (on any endpoint) return `{"error": "<generic message>"}` with no `error_details`.
+
+The Code column below holds the `error_details.code` value where this page names one for that status, and `—` where the response carries no documented code.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `VALIDATION_INVALID_SIZE`, `VALIDATION_INVALID_ORDER`, `EXCHANGE_UNSUPPORTED`, `FUNDS_INSUFFICIENT_USDC`, `FUNDS_INSUFFICIENT_BALANCE` | Invalid input — bad `side`/`kind`, missing or out-of-range `quantity`/`price`, quantity below `MIN_ORDER_QUANTITY` on a buy or above 1,000,000, API-key buy under the $5 notional minimum, unrecognised `time_in_force`, `expiration_minutes` outside `1`–`43200` on a GTD, `max_slippage`/`max_slippage_cents`/`max_retries` out of range, a TIF or `post_only` the venue does not support, unsupported `exchange_id` (`EXCHANGE_UNSUPPORTED`), insufficient balance (`FUNDS_INSUFFICIENT_USDC`) or position shortfall (`FUNDS_INSUFFICIENT_BALANCE`), a closed market, slippage exceeded, a FOK that could not fill, empty/oversized/mixed-exchange batch cancel, malformed `market_id` on Predict.fun cancel-all, unknown `exchange_id` on cancel-all, non-UUID `{order_id}` | Fix the request and resend — retrying it unchanged returns the same error. On the funds codes, add collateral or reduce size first |
+| `401` | — | Missing/invalid/expired/revoked auth on a read endpoint | Re-authenticate; check the API-key triple or refresh the session JWT |
+| `403` | `AUTH_INSUFFICIENT_SCOPE`, `AUTH_CREDENTIALS_INVALID` | Missing required scope (`AUTH_INSUFFICIENT_SCOPE`), API-key access disabled for that venue, source IP not on the key's allowlist, trading not enabled or no Turnkey identity for the caller (`AUTH_CREDENTIALS_INVALID`), an order owned by another user, or a failed API-key triple on a mutating endpoint | Not retryable as sent. Grant the scope, allowlist the IP, enable trading, or stop addressing another user's order. On a mutating endpoint, check the triple — a bad one is `403` here, not `401` |
+| `404` | `VALIDATION_MARKET_NOT_FOUND` | Order not found, or the market could not be resolved | Verify the order id or `market_id`; resend only with a corrected identifier |
+| `409` | — | Batch cancel selected an order that is already terminal or has not reached the venue | Re-read the orders, drop the terminal/not-yet-placed ids, and resubmit the batch. Nothing was cancelled |
+| `422` | `ORDERBOOK_UNAVAILABLE` | Market order couldn't be priced — live orderbook missing or stale | Retry once the book is available, or submit a limit order with an explicit `price` |
+| `429` | `VALIDATION_INVALID_ORDER` | Per-user (or per-key override) order rate limit exceeded, a venue rate limit relayed back, or too many failed auth attempts from one IP | Back off and retry. Match on the status, not the code. Idempotent replays with a matching `client_order_id` do not consume a slot |
+| `500` | `DATABASE_ERROR`, `INTERNAL_ERROR` | Internal failure (DB error, signing error, pre-trade failure, unresolved cancel) | Re-read the order with `GET /orders/{order_id}` before resubmitting; report to support with the response body |
+| `502` | `EXCHANGE_ERROR`, `NETWORK_ERROR` | Venue rejected the order or the exchange call failed | Read `error_details.code` (and `error_details.metadata.code` on Predict.fun cancel-all) before retrying — a venue rejection will repeat, a network failure may not |
+| `503` | `MARKET_PAUSED` | Execution disabled by a circuit breaker, lock contention, or the API-key provider-access lookup was unavailable | Retry later; nothing was placed |
+| `504` | `NETWORK_TIMEOUT` | Upstream timeout | The order may still have reached the venue — re-read with `GET /orders/{order_id}` (or resend with the same `client_order_id`) rather than blindly resubmitting |
+
+<Warning>
+**Gotcha:** two entries above read oddly. A **429 rate limit carries `error_details.code = VALIDATION_INVALID_ORDER`** (match the status, not the code), and **insufficient funds is a `400`, not a `402`** — this service never returns `402`.
+</Warning>
+
+Common `error_details.code` values on order submit: `VALIDATION_INVALID_SIZE`, `VALIDATION_INVALID_PRICE`, `VALIDATION_INVALID_ORDER`, `VALIDATION_MARKET_NOT_FOUND`, `EXCHANGE_UNSUPPORTED`, `EXCHANGE_ERROR`, `FUNDS_INSUFFICIENT_USDC`, `FUNDS_INSUFFICIENT_BALANCE`, `ALLOWANCE_CTF_NOT_SET`, `MARKET_PAUSED`, `MARKET_NOT_READY`, `MARKET_INSUFFICIENT_LIQUIDITY`, `MARKET_FOK_NOT_FILLED`, `ORDERBOOK_UNAVAILABLE`, `AUTH_CREDENTIALS_INVALID`, `AUTH_CREDENTIALS_NOT_FOUND`, `AUTH_INSUFFICIENT_SCOPE`, `AUTH_POLYMARKET_API_KEY_INVALID`, `SIGNATURE_ERROR`, `NETWORK_ERROR`, `NETWORK_TIMEOUT`, `DATABASE_ERROR`, `INTERNAL_ERROR`.

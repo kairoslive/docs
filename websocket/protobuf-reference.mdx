@@ -1,0 +1,356 @@
+---
+title: "Protobuf Schema"
+description: "Protocol Buffer schema definitions and compilation guide"
+---
+
+The market data WebSocket uses Protocol Buffers (protobuf) for binary message encoding. This page is where you get the `.proto` files, compile them for your language, and see working decoder code for the frames the gateway sends. Read it before your first connection to [the stream](/websocket/market-data-websocket); come back to it whenever a field decodes to a value that looks wrong by orders of magnitude.
+
+## Getting the Proto Files
+
+**[Download all proto files (zip)](https://assets.kairos.trade/proto/kairos-proto-v1.zip)**
+
+Or download individual files and place them in a `proto/kairos/v1/` directory:
+
+| File | Description |
+|------|-------------|
+| [common.proto](https://assets.kairos.trade/proto/kairos/v1/common.proto) | `Provider` and `MarketCategory` enums, `PriceLevel`, `TradeSide` |
+| [websocket_control.proto](https://assets.kairos.trade/proto/kairos/v1/websocket_control.proto) | Subscribe, unsubscribe, fetch, ping/pong, `ErrorResponse`, `MarketResolvedNotice`, and the `ArbSubscription` filter messages |
+| [tick_size.proto](https://assets.kairos.trade/proto/kairos/v1/tick_size.proto) | `TickSizeUpdate` / `TickRange` — the tick-grid change frame (tag `0x1C`) delivered on the `orderbook` topic |
+| [orderbook.proto](https://assets.kairos.trade/proto/kairos/v1/orderbook.proto) | Orderbook snapshots and deltas, incl. per-snapshot `price_scale` / `size_scale` |
+| [trade.proto](https://assets.kairos.trade/proto/kairos/v1/trade.proto) | Trade and TradeBatch |
+| [candle.proto](https://assets.kairos.trade/proto/kairos/v1/candle.proto) | OHLC candles |
+| [price_update.proto](https://assets.kairos.trade/proto/kairos/v1/price_update.proto) | Price updates |
+| [volume.proto](https://assets.kairos.trade/proto/kairos/v1/volume.proto) | Volume statistics |
+| [lvc.proto](https://assets.kairos.trade/proto/kairos/v1/lvc.proto) | Tick-level quotes, depth, tick sizes |
+| [arb.proto](https://assets.kairos.trade/proto/kairos/v1/arb.proto) | Filtered matched-market and arbitrage batches |
+| [synthetic.proto](https://app.kairos.trade/proto/kairos/synthetic/v1/synthetic.proto) | Synthetic book definitions, snapshots, deltas, levels, and recipes |
+
+The synthetic schema belongs under `proto/kairos/synthetic/v1/`, not
+`proto/kairos/v1/`. Synthetic data frames also carry a version byte after their
+type tag. See the [Synthetic Book Stream tutorial](/websocket/synthetic-books).
+
+Your local directory structure should look like:
+
+```
+proto/
+  kairos/v1/
+    common.proto
+    orderbook.proto
+    trade.proto
+    candle.proto
+    price_update.proto
+    volume.proto
+    lvc.proto
+    arb.proto
+    tick_size.proto
+    websocket_control.proto
+```
+
+## Compiling Proto Files
+
+### Python
+
+```bash
+pip install protobuf grpcio-tools
+
+python -m grpc_tools.protoc \
+  --proto_path=proto/ \
+  --python_out=generated/ \
+  proto/kairos/v1/*.proto
+```
+
+### Go
+
+```bash
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+
+protoc \
+  --proto_path=proto/ \
+  --go_out=generated/ \
+  proto/kairos/v1/*.proto
+```
+
+### C++
+
+```bash
+protoc \
+  --proto_path=proto/ \
+  --cpp_out=generated/ \
+  proto/kairos/v1/*.proto
+```
+
+### TypeScript / JavaScript
+
+```bash
+npm install protobufjs
+
+npx pbjs -t static-module -w es6 \
+  -o generated/kairos.js \
+  proto/kairos/v1/*.proto
+
+npx pbts -o generated/kairos.d.ts generated/kairos.js
+```
+
+### Rust
+
+Add to `Cargo.toml`:
+```toml
+[build-dependencies]
+prost-build = "0.13"
+```
+
+In `build.rs`:
+```rust
+fn main() {
+    prost_build::compile_protos(
+        &["proto/kairos/v1/common.proto",
+          "proto/kairos/v1/orderbook.proto",
+          "proto/kairos/v1/trade.proto",
+          "proto/kairos/v1/candle.proto",
+          "proto/kairos/v1/price_update.proto",
+          "proto/kairos/v1/volume.proto",
+          "proto/kairos/v1/lvc.proto",
+          "proto/kairos/v1/arb.proto",
+          "proto/kairos/v1/tick_size.proto",
+          "proto/kairos/v1/websocket_control.proto"],
+        &["proto/"],
+    ).unwrap();
+}
+```
+
+## `OrderbookSnapshot` carries its own scales
+
+`OrderbookSnapshot` has two fields that a naive decoder will miss:
+
+| Field | Number | Meaning |
+|---|---|---|
+| `price_scale` | 9 | Divisor for this snapshot's `PriceLevel.price`. `0` = the global 10,000. |
+| `size_scale` | 10 | Divisor for this snapshot's `PriceLevel.size_scaled`. `0` = the publisher's usual, provider-specific scale. |
+
+Every prediction-market provider sends `0` for both, so existing decoders are
+unaffected.
+
+<Note>
+**Gotcha: perpetual snapshots set the scales per snapshot.** A consumer that
+hard-codes 10,000 will read perpetual prices wrong by orders of magnitude.
+Always divide by the snapshot's own scale:
+</Note>
+
+```python
+price = level.price / (snapshot.price_scale or 10000)
+```
+
+`OrderbookDelta` has no scale fields — it is only emitted by providers that
+publish on the default scale. Perpetual books publish whole baselines, never
+deltas, which is what makes a per-snapshot scale safe: two snapshots at
+different scales are never merged.
+
+### Both carry an ownership `epoch`
+
+| Message | Field | Number | Meaning |
+|---|---|---|---|
+| `OrderbookSnapshot` | `epoch` | 8 | Owning streamer-instance fencing token |
+| `OrderbookDelta` | `epoch` | 6 | Same token, for the delta stream |
+
+The epoch is bumped when ownership of a contract transfers between streamer
+instances. `0` means unfenced (legacy publishers).
+
+<Note>
+**Gotcha: drop any frame from a lower epoch.** Two streamer instances have
+independent sequence spaces, so a decoder must discard any frame whose
+`epoch` is **below** the highest it has seen for that contract — otherwise a
+brief double-publish during a handoff collides the two sequence spaces and
+freezes the book.
+</Note>
+
+Full rationale and the perpetual encoding rules are in
+[Price and size scaling](/websocket/market-data-websocket#price-and-size-scaling).
+
+## Reading Messages in Code
+
+Every binary WebSocket message has a 1-byte type tag prefix.
+
+> **Always dispatch on the type tag first.** Never assume the payload is a specific message type. New tags may be added in future versions — clients that decode blindly will break.
+
+> **Gotcha: a sequence gap means a full resync, with no tolerance.** The
+> example below stops applying deltas the moment `delta.seq` runs ahead of
+> `expected_seq` (or `snapshot_seq` stops matching) and waits for a fresh
+> snapshot from a `FetchRequest`. Skipping that check silently corrupts the
+> local book by mixing levels from two baselines. See
+> [Sequencing and recovery](/websocket/market-data-websocket#sequencing-and-recovery).
+
+Example in Python:
+
+```python
+import websocket
+from kairos.v1 import orderbook_pb2, trade_pb2, candle_pb2
+from kairos.v1 import price_update_pb2, volume_pb2, websocket_control_pb2
+
+TAG_ORDERBOOK = 0x02
+TAG_CANDLE = 0x03
+TAG_TRADE = 0x04
+TAG_PRICE = 0x05
+TAG_VOLUME = 0x06
+TAG_ORDERBOOK_DELTA = 0x0F
+
+# Local book state per contract for delta reconstruction
+local_books = {}            # contract_id -> {"bids": {price: size}, "asks": {price: size}, ...}
+expected_seqs = {}          # contract_id -> next expected delta seq
+snapshot_seqs = {}          # contract_id -> seq of the snapshot our local book is based on
+pending_resync = set()      # contracts waiting for a fresh snapshot after a gap
+
+def request_resync(ws, contract_id, provider):
+    """Send a FetchRequest to get a fresh snapshot from the server."""
+    fetch = websocket_control_pb2.FetchRequest()
+    fetch.contract_id = contract_id
+    fetch.provider = provider
+    ws.send(bytes([0x16]) + fetch.SerializeToString(),
+            opcode=websocket.ABNF.OPCODE_BINARY)
+
+def on_message(ws, message):
+    tag = message[0]
+    payload = message[1:]
+
+    if tag == TAG_ORDERBOOK:
+        ob = orderbook_pb2.OrderbookSnapshot()
+        ob.ParseFromString(payload)
+        # Replace local book entirely. Keep the snapshot's own scales with the
+        # book — never assume 10,000, or perpetual prices decode wrong.
+        local_books[ob.contract_id] = {
+            "price_scale": ob.price_scale or 10000,
+            "size_scale": ob.size_scale,  # 0 = provider's legacy size scale
+            "outcomes": [
+                {
+                    "bids": {lvl.price: lvl.size_scaled for lvl in o.bids.levels},
+                    "asks": {lvl.price: lvl.size_scaled for lvl in o.asks.levels},
+                }
+                for o in ob.outcomes
+            ]
+        }
+        expected_seqs[ob.contract_id] = ob.seq + 1
+        snapshot_seqs[ob.contract_id] = ob.seq
+        pending_resync.discard(ob.contract_id)
+        print(f"Orderbook snapshot: {ob.contract_id}, seq={ob.seq}")
+
+    elif tag == TAG_ORDERBOOK_DELTA:
+        delta = orderbook_pb2.OrderbookDelta()
+        delta.ParseFromString(payload)
+        cid = delta.contract_id
+
+        # Skip deltas while waiting for resync — applying them would corrupt the book
+        if cid in pending_resync:
+            return
+        if cid not in local_books:
+            return  # No baseline yet — wait for snapshot
+
+        # Verify the delta is based on our snapshot
+        our_snapshot = snapshot_seqs.get(cid, 0)
+        if delta.snapshot_seq and our_snapshot and delta.snapshot_seq != our_snapshot:
+            pending_resync.add(cid)
+            request_resync(ws, cid, "polymarket")
+            return
+
+        # Sequence continuity check
+        expected = expected_seqs.get(cid)
+        if expected is not None:
+            if delta.seq < expected:
+                return  # Stale, drop
+            if delta.seq > expected:
+                # Gap — stop applying and request a fresh snapshot
+                pending_resync.add(cid)
+                request_resync(ws, cid, "polymarket")
+                return
+
+        # Apply delta to local book
+        for i, outcome_delta in enumerate(delta.outcomes):
+            if i >= len(local_books[cid]["outcomes"]):
+                continue
+            local = local_books[cid]["outcomes"][i]
+            for side_name, side_delta in (("bids", outcome_delta.bids),
+                                           ("asks", outcome_delta.asks)):
+                for lvl in side_delta.levels:
+                    if lvl.size_scaled == 0:
+                        local[side_name].pop(lvl.price, None)
+                    else:
+                        local[side_name][lvl.price] = lvl.size_scaled
+
+        expected_seqs[cid] = delta.seq + 1
+        print(f"Applied delta: {cid}, seq={delta.seq}")
+
+    elif tag == TAG_TRADE:
+        batch = trade_pb2.TradeBatch()
+        batch.ParseFromString(payload)
+        for trade in batch.trades:
+            print(f"Trade: {trade.outcome} @ {trade.price / 10000:.4f}")
+
+    elif tag == TAG_CANDLE:
+        candle = candle_pb2.Candle()
+        candle.ParseFromString(payload)
+        for o in candle.outcomes:
+            print(f"Candle {o.name}: O={o.open/10000} H={o.high/10000} L={o.low/10000} C={o.close/10000}")
+
+    elif tag == TAG_PRICE:
+        update = price_update_pb2.PriceUpdate()
+        update.ParseFromString(payload)
+        print(f"Price: mid={update.mid_price / 10000:.4f}")
+
+    elif tag == TAG_VOLUME:
+        vol = volume_pb2.Volume()
+        vol.ParseFromString(payload)
+        print(f"Volume 24h: {vol.volume_24h_scaled}")
+
+    else:
+        # Unknown tag — silently ignore for forward compat
+        pass
+```
+
+## Handling ErrorResponse (tag `0x17`)
+
+The server reports in-band, recoverable errors (malformed subscribe, unknown or unauthorized topic, rate limit, subscription limit, failed snapshot recovery, unknown tag, text frame received) as an `ErrorResponse` protobuf:
+
+| Field | Type | Number | Description |
+|-------|------|--------|-------------|
+| `message` | string | 1 | Human-readable error description |
+| `action` | string | 2 | Which client action triggered the error: `"subscribe"`, `"unsubscribe"`, `"rate_limit"`, `"fetch"`, `"fetch_rate_limit"`, `"fetch_error:{provider}:{contract_id}"`, `"fetch_waiting:{provider}:{contract_id}"`, or empty for generic errors |
+
+The two `fetch_*` forms embed the market they refer to, so match `action` by
+prefix rather than equality. The full catalogue of messages is in
+[Market Data → In-band ErrorResponse](/websocket/market-data-websocket#in-band-errorresponse-tag-0x17).
+
+The connection stays open after an `ErrorResponse` — only the offending message is dropped. Decode and surface it for diagnostics:
+
+```python
+from kairos.v1 import websocket_control_pb2
+
+TAG_ERROR = 0x17
+
+def on_message(ws, message):
+    tag = message[0]
+    payload = message[1:]
+
+    if tag == TAG_ERROR:
+        err = websocket_control_pb2.ErrorResponse()
+        err.ParseFromString(payload)
+        # Log / surface; do NOT auto-reconnect on this alone — the connection is still healthy
+        print(f"Server error (action={err.action!r}): {err.message}")
+        return
+    # ... other tags
+```
+
+For server-initiated **close codes** (`4001` JWT expiry/revocation, `4002` anonymous session lifetime, `4003` anonymous lease lost, `1006` slow consumer / idle timeout), upgrade-time `401`/`429`/`503` rejections, and recommended reconnect behavior, see [Market Data → Errors & Disconnection](/websocket/market-data-websocket#errors-disconnection).
+
+## Sending a Subscribe Request
+
+```python
+from kairos.v1 import websocket_control_pb2
+
+TAG_SUBSCRIBE = 0x10
+
+sub = websocket_control_pb2.SubscribeRequest()
+sub.contract_id = "570362"
+sub.provider = "polymarket"
+sub.topics.extend(["orderbook", "trades", "price"])
+
+payload = bytes([TAG_SUBSCRIBE]) + sub.SerializeToString()
+ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
+```

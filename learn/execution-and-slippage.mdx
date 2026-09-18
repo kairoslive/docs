@@ -1,0 +1,120 @@
+---
+title: "Execution & Slippage"
+description: "Buying up, selling down, slippage, partial fills, and retries"
+---
+
+The price you see is the price of the *first* few shares, not all of them. This chapter explains why a big order costs more per share than a small one, what slippage is, and how Kairos keeps a retry from quietly filling you at a worse price.
+
+## How Orders Get Filled
+
+When you place an order, the exchange tries to match you with the other side. The way your order fills depends on what's sitting on the order book.
+
+## Buying Up (Walking the Book)
+
+When you buy more shares than are available at the best price, your order **walks up the book** — filling at progressively higher prices.
+
+**Example:** You market buy 200 shares.
+
+| Price | Available | You Get | Cost |
+|-------|-----------|---------|------|
+| $0.55 | 80 | 80 | $44.00 |
+| $0.57 | 150 | 120 | $68.40 |
+| $0.60 | 200 | — | — |
+| **Total** | | **200** | **$112.40** |
+
+Your average price: **$0.562** instead of $0.55. That $0.012 difference is slippage.
+
+## Selling Down
+
+The same thing happens when you sell — your order **walks down the book** through the bids, filling at progressively lower prices.
+
+**Example:** You sell 300 shares at market:
+
+| Price | Shares Filled | Cost |
+|-------|--------------|------|
+| $0.52 | 120 | $62.40 |
+| $0.50 | 180 | $90.00 |
+| **Total** | **300** | **$152.40 (avg $0.508)** |
+
+## What Is Slippage?
+
+**Slippage** is the difference between the price you expected and the price you actually got.
+
+<Note>
+**Slippage = Actual Price - Expected Price**
+</Note>
+
+**Example:** You expected to buy at $0.55, but your average fill was $0.562:
+
+| | |
+|---|---|
+| Expected | $0.55 |
+| Actual (avg) | $0.562 |
+| **Slippage** | **$0.012 per share** |
+
+Slippage happens when:
+- **Your order is large** relative to the depth at the best price
+- **The market is thin** (not much liquidity)
+- **The market moves** between when you place and when it fills
+
+## How to Reduce Slippage
+
+| Technique | How It Helps |
+|-----------|-------------|
+| **Use limit orders** | Caps the worst price you'll accept |
+| **Trade smaller sizes** | Less walking of the book |
+| **Check the depth first** | See how much is available at each price |
+| **Trade liquid markets** | Tighter spreads, more depth |
+
+## Partial Fills
+
+Sometimes your order only partially fills. This happens when:
+
+- There aren't enough shares at your limit price
+- You're using IOC and only some shares are available
+- Another trader grabbed shares at the same price before you
+
+> **Example:** Buy 100 at $0.55, IOC — only 60 available.
+>
+> **Filled:** 60 shares at $0.55 | **Unfilled:** 40 shares (cancelled)
+
+With GTC, the unfilled 40 would rest on the book and wait.
+
+## Retries
+
+Sometimes an order doesn't fill on the first attempt — the exchange is momentarily busy, a network blip, or someone else grabbed the shares before you.
+
+When this happens, Kairos **automatically retries** within your slippage bounds:
+
+- Kairos re-sends the order to the exchange automatically — usually within milliseconds
+- Your **slippage tolerance** is respected — retries never fill at a worse price than you've accepted
+- **If the price has moved outside your slippage bounds, the retry stops and the order fails** rather than filling at a bad price
+
+**How Kairos does this:**
+
+- **You authorise the band** by sending `max_slippage_cents` (1–99) with the order.
+- **Re-pricing always starts from your original price**, plus that budget — never from the previous retry's price, so repeated retries cannot ratchet upward.
+- **A retry is only issued when it moves toward the current touch.** If the market has left your authorised band, the order stops with a `SlippageExceeded` error naming your limit.
+- **Without `max_slippage_cents` there is nothing to re-price against**, so a failed attempt is simply re-sent unchanged.
+- **Retries are budgeted.** `max_retries` (0–20, after the first attempt) caps how many are attempted.
+- **Only failures a better price could plausibly fix earn a re-price.** Network errors, timeouts, and rate limits never reached the matching engine, so Kairos re-sends those unchanged rather than spending your slippage budget on its own flakiness.
+
+## Price Impact — The Bigger Picture
+
+Every trade moves the market slightly. When you buy, you remove asks and push the price up. When you sell, you remove bids and push the price down. This is called **price impact**.
+
+| | Before Your Buy | After Your Buy |
+|---|---|---|
+| Best Ask | $0.55 | $0.57 |
+
+You consumed the $0.55 level. Large orders have more price impact — this is why institutional traders often split large orders into smaller pieces.
+
+## Key Takeaways
+
+- **Market orders** trade fast but may slip
+- **Limit orders** prevent slippage but may not fill
+- **Depth matters** — always check how much is available
+- **Bigger orders** = more slippage and price impact
+- **Retries** are normal — they happen automatically
+
+**Next:** [Positions & PnL](/learn/positions-and-pnl) — what you're holding once the order fills, and how the profit is counted.

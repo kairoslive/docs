@@ -32,22 +32,22 @@ Together these APIs expose **155 endpoints** covering every stage of the trading
 ## Key Capabilities
 
 <CardGroup cols={2}>
-  <Card title="Live Market Data" icon="chart-line" href="/api/market-data/overview">
+  <Card title="Live Market Data" icon="chart-line" href="/market-data/overview">
     Stream orderbooks, trades, candles, and perpetual snapshots across all venues — no API key required.
   </Card>
-  <Card title="Smart Order Routing" icon="route" href="/api/execution/overview">
+  <Card title="Smart Order Routing" icon="route" href="/rest/orders">
     Submit orders to any venue through one endpoint. Kairos handles venue-specific signing, collateral, and settlement.
   </Card>
-  <Card title="Combos & Parlays" icon="layer-group" href="/api/execution/overview">
+  <Card title="Combos & Parlays" icon="layer-group" href="/rest/orders">
     Price and execute multi-leg combo positions on Polymarket via the RFQ gateway, and close or redeem them later.
   </Card>
-  <Card title="Trader Analytics" icon="magnifying-glass-chart" href="/api/data/overview">
+  <Card title="Trader Analytics" icon="magnifying-glass-chart" href="/api-reference">
     Inspect realized PnL timeseries, open positions, and trade history for any wallet address across venues.
   </Card>
-  <Card title="Sports Markets" icon="trophy" href="/api/data/overview">
+  <Card title="Sports Markets" icon="trophy" href="/api-reference">
     Access live, upcoming, and futures sports markets matched across Polymarket and Kalshi with enriched metadata.
   </Card>
-  <Card title="Institutional Auctions" icon="gavel" href="/api/agora/overview">
+  <Card title="Institutional Auctions" icon="gavel" href="/api-reference">
     Run private RFQ auctions with firm quotes, role-filtered views, and a durable WebSocket event timeline.
   </Card>
 </CardGroup>
@@ -114,10 +114,10 @@ If you'd rather generate a client from an OpenAPI spec, download the YAML files 
   <Card title="Authentication" icon="key" href="/authentication">
     Learn how to obtain an API key and authenticate requests.
   </Card>
-  <Card title="Market Data API Reference" icon="book" href="/api/market-data/overview">
+  <Card title="Market Data API Reference" icon="book" href="/market-data/overview">
     Explore all 15 Market Data endpoints.
   </Card>
-  <Card title="Execution API Reference" icon="bolt" href="/api/execution/overview">
+  <Card title="Execution API Reference" icon="bolt" href="/rest/orders">
     Explore all 59 Execution endpoints including order routing and combos.
   </Card>
 </CardGroup>

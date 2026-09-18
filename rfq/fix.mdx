@@ -1,0 +1,360 @@
+---
+title: "FIX Protocol"
+description: "Kairos FIX 4.4 and FIXT 1.1 / FIX 5.0 SP2 RFQ session contract"
+---
+
+This page is the FIX session and message contract for the RFQ Network: which
+ports and dictionaries to use, how Logon authenticates, the four application
+messages you can send, the Kairos extension tags, and how rejections are
+reported. Read it if you connect over FIX; the same domain rules are described
+for HTTP clients in [REST and streaming](/rfq/rest-and-streaming).
+
+Kairos exposes TLS-protected FIX endpoints for clients that require session
+sequencing, resend semantics, and low-latency RFQ commands.
+
+## Connectivity
+
+| Protocol | Port | Dictionary |
+| --- | ---: | --- |
+| FIX 4.4 compatibility | `9820` | `spec/kairos/FIX44.xml` |
+| FIXT 1.1 transport | `9821` | `spec/kairos/FIXT11.xml` |
+| FIX 5.0 SP2 application | `9821` | `spec/kairos/FIX50SP2.xml` |
+
+Both listeners terminate TLS 1.2/1.3 at the network load balancer and are
+source-CIDR allowlisted; the regional RFQ listeners sit behind
+`<region>.rfq.kairos.trade`, and the unified Kairos FIX edge is
+`fix.kairos.trade`. Contact Kairos onboarding for connectivity, certificates,
+credentials, and the versioned dictionary bundle.
+
+<Note>
+**Gotcha: the unified edge has two extra requirements.** Clients connecting
+through `fix.kairos.trade` are provisioned as static counterparty sessions
+with a mandatory per-session `AllowedRemoteAddresses`, and **every application
+message on that edge must additionally carry `KairosProduct(9200)=RFQ`**. That
+gateway loads a strict union dictionary covering RFQ, auction, order-entry,
+and drop-copy messages; the RFQ bundle below is the scoped client subset.
+</Note>
+
+[Download the current Kairos RFQ FIX v1 dictionary bundle](https://assets.kairos.trade/fix/kairos-rfq-fix-v1.zip).
+Each release contains both session variants, the application dictionary, the
+protocol README, and `SHA256SUMS`. Versioned archives are immutable; the v1 URL
+tracks the latest backwards-compatible v1 release.
+
+## Logon
+
+### Credentials
+
+| Tag | Field | Value |
+| ---: | --- | --- |
+| 49 | `SenderCompID` | The API credential client ID (`ApiCredential.clientId`) |
+| 56 | `TargetCompID` | `KAIROS` |
+| 553 | `Username` | The API key plaintext |
+| 554 | `Password` | The API secret plaintext |
+| 1137 | `DefaultApplVerID` | `9` (FIX 5.0 SP2) — FIXT sessions only |
+
+Credentials are the ordinary Kairos API credential pair, created and revoked
+through the admin API-key procedures; Kairos stores only hashes and returns the
+plaintext once.
+
+### Session parameters
+
+| Setting | Value |
+| --- | --- |
+| Heartbeat interval | 30 seconds |
+| `CheckLatency` | On, with a 30-second `MaxLatency` — **a skewed clock is rejected at the session layer** |
+| Session hours | 24 hours a day (`StartTime` = `EndTime` = `00:00:00`) |
+| `ResetOnLogon` | Off by default, so sequence numbers and the resend window survive a reconnect |
+| `RefreshOnLogon` | Reloads persisted state on each Logon |
+| Sequence / resend / gap fill | QuickFIX semantics, persisted in a file store independent of RFQ domain state |
+
+### Authorization
+
+The credential's scopes gate every application message, and its `ipWhitelist` is
+revalidated during authentication, so a Logon from an unlisted source is refused
+even on an allowlisted CIDR. Revoked credentials reject new Logons immediately;
+existing sessions reauthenticate when their five-minute relay token expires.
+Aegis checks bearer JWT revocation for HTTP/WebSocket clients and is not on the
+FIX Logon path.
+
+<Note>
+**Gotcha: scopes are enforced per message, not at Logon.** A session logs on
+successfully and then has individual commands rejected. The one exception is a
+credential whose scopes entitle it to no product at all, which is refused at
+Logon.
+</Note>
+
+### Logon failures
+
+| Logon reject text | When it happens | What to do |
+| --- | --- | --- |
+| `invalid FIX credentials` | Credential or source-address failure | Verify `Username`/`Password` and that the source IP is on the credential's allowlist |
+| `FIX authentication is unavailable` | The credential authority could not be reached | Retry with backoff; this is not a credential problem |
+
+A failed Logon is answered with a Logon reject and a disconnect.
+
+## Application messages
+
+| Direction | MsgType | Message | Scope |
+| --- | ---: | --- | --- |
+| Client → Kairos | `R` | QuoteRequest | `rfq:create` |
+| Client → Kairos | `S` | Quote (create or revise) | `rfq:quote` |
+| Client → Kairos | `AJ` | QuoteResponse (`694=1`) | `rfq:accept` |
+| Client → Kairos | `Z` | QuoteCancel | `rfq:create` or `rfq:quote` |
+| Kairos → Client | `AI` | QuoteStatusReport | — |
+| Either | `j` | BusinessMessageReject | — |
+
+Session messages `0` Heartbeat, `1` TestRequest, `2` ResendRequest, `3` Reject,
+`4` SequenceReset, `5` Logout, and `A` Logon are also supported. Any other
+application `MsgType` is rejected as unsupported.
+
+Command identifiers double as idempotency keys: `QuoteReqID(131)` for `R`,
+`QuoteID(117)` for `S`, and `QuoteRespID(693)` for `AJ`.
+
+### QuoteRequest (`35=R`)
+
+Creates a requester RFQ.
+
+| Tag | Field | Required | Values | Description |
+| ---: | --- | :-: | --- | --- |
+| 131 | `QuoteReqID` | Y | — | Idempotency key and `client_rfq_id` |
+| 15 | `Currency` | Y | — | — |
+| 38 | `OrderQty` | Y | positive decimal | Package quantity |
+| 126 / 62 | `ExpireTime` / `ValidUntilTime` | * | — | One of 126 or 62 is required |
+| 9002 | `KairosLegsJSON` | Y | — | Non-empty JSON leg array |
+| 9001 | `KairosRequestedSides` | * | `bid`, `offer`, `bid,offer` | — |
+| 54 | `Side` | * | — | Fallback when 9001 is absent |
+| 9003 | `KairosVenues` | N | — | CSV venue fanout |
+| 9004 | `KairosPriorityVenue` | N | — | — |
+| 9007 | `KairosMinimumPartial` | N | — | — |
+
+Example — a two-sided RFQ, one tag per line for readability (a real message is
+SOH-delimited on the wire):
+
+```
+8=FIX.4.4
+9=<body length>
+35=R                                     # MsgType — QuoteRequest
+49=<your-client-id>                      # SenderCompID
+56=KAIROS                                # TargetCompID
+34=2                                     # MsgSeqNum
+52=20260810-17:00:00.000                 # SendingTime (UTC)
+131=desk-rfq-20260810-001                # QuoteReqID — idempotency key
+15=USD                                   # Currency
+38=100                                   # OrderQty — package quantity
+126=20260810-18:00:00.000                # ExpireTime
+9001=bid,offer                           # KairosRequestedSides
+9002=[{"leg_id":"yes","ratio":"1","source_venue":"kalshi","market_id":"MARKET-TICKER","outcome":"yes"}]
+9003=kalshi                              # KairosVenues
+9004=kalshi                              # KairosPriorityVenue
+9007=10                                  # KairosMinimumPartial
+10=<checksum>
+```
+
+On `fix.kairos.trade`, add `9200=RFQ` (`KairosProduct`) to this and every other
+application message.
+
+### Quote (`35=S`)
+
+Creates or revises a market-maker quote.
+
+| Tag | Field | Required | Values | Description |
+| ---: | --- | :-: | --- | --- |
+| 117 | `QuoteID` | Y | — | Idempotency key; on a revision it also names the quote |
+| 9000 | `KairosRFQID` | * | — | One of 9000 or 131 is required |
+| 131 | `QuoteReqID` | * | — | — |
+| 126 / 62 | `ExpireTime` / `ValidUntilTime` | Y | — | Applies to every priced side |
+| 132 + 134 | `BidPx` + `BidSize` | N | — | Must be supplied together |
+| 133 + 135 | `OfferPx` + `OfferSize` | N | — | Must be supplied together |
+| 9011 | `KairosMinimumQuoteQuantity` | N | — | Falls back to 110 `MinQty`, then `1` |
+| 9010 | `KairosSourceVenue` | N | — | Only valid on a venue-originated RFQ |
+| 9006 | `KairosQuoteRevision` | N | `1` or absent creates; `>1` revises | A revision must be exactly `current + 1` |
+
+At least one complete price/size pair is required.
+
+Example — a two-sided quote against a venue-originated RFQ:
+
+```
+8=FIX.4.4
+9=<body length>
+35=S                                     # MsgType — Quote
+49=<your-client-id>
+56=KAIROS
+34=7
+52=20260810-17:01:12.000
+117=mm-quote-0001                        # QuoteID — idempotency key
+9000=rfq_01H…                            # KairosRFQID
+126=20260810-17:06:00.000                # ExpireTime — applies to both sides
+132=0.47                                 # BidPx
+134=50                                   # BidSize
+133=0.52                                 # OfferPx
+135=50                                   # OfferSize
+9010=kalshi                              # KairosSourceVenue
+9011=5                                   # KairosMinimumQuoteQuantity
+10=<checksum>
+```
+
+To revise it, resend `35=S` with the same `QuoteID(117)` and
+`9006=<current + 1>`.
+
+### QuoteResponse (`35=AJ`)
+
+Accepts (hits or lifts) a quote.
+
+| Tag | Field | Required | Values | Description |
+| ---: | --- | :-: | --- | --- |
+| 693 | `QuoteRespID` | Y | — | Idempotency key |
+| 694 | `QuoteRespType` | Y | `1` only | Hit/lift. No other value is supported |
+| 117 | `QuoteID` | Y | — | — |
+| 54 | `Side` | Y | `1` = take the offer, `2` = take the bid | — |
+| 38 | `OrderQty` | Y | — | — |
+| 44 | `Price` | Y | — | Must equal the quoted level price |
+| 9005 | `KairosMappingSnapshotID` | Y | — | — |
+| 9006 | `KairosQuoteRevision` | Y | positive integer | — |
+
+Acceptance binds the quote revision, side, quantity, expected price, and mapping
+snapshot.
+
+Example — lifting the offer for 25:
+
+```
+8=FIX.4.4
+9=<body length>
+35=AJ                                    # MsgType — QuoteResponse
+49=<your-client-id>
+56=KAIROS
+34=11
+52=20260810-17:02:03.000
+693=accept-0001                          # QuoteRespID — idempotency key
+694=1                                    # QuoteRespType — hit/lift
+117=mm-quote-0001                        # QuoteID
+54=1                                     # Side — 1 selects the offer
+38=25                                    # OrderQty
+44=0.52                                  # Price — must equal the quoted level
+9005=snap_01H…                           # KairosMappingSnapshotID
+9006=1                                   # KairosQuoteRevision
+10=<checksum>
+```
+
+### QuoteCancel (`35=Z`)
+
+Withdraws a quote or cancels an RFQ, depending on which identifier you send.
+
+| Tag sent | Effect | Scope |
+| --- | --- | --- |
+| `QuoteID(117)` | Withdraws that quote | `rfq:quote` |
+| `KairosRFQID(9000)` | Cancels that RFQ | `rfq:create` |
+| `QuoteReqID(131)` | Cancels that RFQ (fallback when 9000 is absent) | `rfq:create` |
+
+One of the three is required.
+
+<Note>
+**Gotcha: QuoteCancel derives its idempotency key from the resource ID,** not
+from a client-supplied identifier — unlike every other command on this
+session.
+</Note>
+
+### QuoteStatusReport (`35=AI`)
+
+Sent for every accepted command.
+
+| Tag | Field | Description |
+| ---: | --- | --- |
+| 131 | `QuoteReqID` | — |
+| 117 | `QuoteID` | — |
+| 9000 | `KairosRFQID` | — |
+| 9005 | `KairosMappingSnapshotID` | — |
+| 9008 | `KairosAcceptanceID` | — |
+| 9009 | `KairosState` | The RFQ, quote, or acceptance state, from the same vocabulary the REST API uses — see [Lifecycle states](/rfq/rest-and-streaming#lifecycle-states) |
+| 9006 | `KairosQuoteRevision` | — |
+
+Empty values are omitted rather than sent blank.
+
+## Kairos extension tags
+
+Tags `9000–9011` are the version 1.0 Kairos extension range.
+
+| Tag | Name | Type | Meaning |
+| ---: | --- | --- | --- |
+| 9000 | `KairosRFQID` | STRING | Stable RFQ ID |
+| 9001 | `KairosRequestedSides` | STRING | `bid`, `offer`, or `bid,offer` |
+| 9002 | `KairosLegsJSON` | STRING | Normalized non-empty leg array |
+| 9003 | `KairosVenues` | STRING | CSV venue targets |
+| 9004 | `KairosPriorityVenue` | STRING | Preferred home-region venue |
+| 9005 | `KairosMappingSnapshotID` | STRING | Immutable mapping snapshot |
+| 9006 | `KairosQuoteRevision` | INT | Positive quote revision |
+| 9007 | `KairosMinimumPartial` | QTY | Minimum RFQ partial quantity |
+| 9008 | `KairosAcceptanceID` | STRING | Acceptance/execution ID |
+| 9009 | `KairosState` | STRING | Current lifecycle state |
+| 9010 | `KairosSourceVenue` | STRING | Originating venue |
+| 9011 | `KairosMinimumQuoteQuantity` | QTY | Minimum executable quote quantity |
+
+### Data formats
+
+| Kind | Format |
+| --- | --- |
+| Decimals | FIX decimal strings |
+| Timestamps | UTC, `YYYYMMDD-HH:MM:SS[.sss]`. RFC 3339 is also accepted on inbound expiries |
+| IDs | Case-sensitive opaque strings |
+
+The server loads these dictionaries with unknown messages, unknown fields,
+out-of-order fields, and invalid messages rejected. Rules that XML cannot
+express — such as requiring either an RFQ ID or request ID, or at least one
+complete bid/offer pair — are enforced by the same deterministic application
+validator used by REST.
+
+## Rejections
+
+### Session-layer: `Reject(35=3)`
+
+Standard `SessionRejectReason(373)` values:
+
+| `373` | When it happens | What to do |
+| ---: | --- | --- |
+| `0` | Invalid tag number | Remove the tag; it is not in the loaded dictionary |
+| `1` | Required tag missing | Add the tag named in the message's field tables above |
+| `2` | Tag not defined for this message type | Move the value to the message that defines it |
+| `4` | Tag specified without a value | Send a value or omit the tag |
+| `5` | Value is incorrect | Check the Values column for that tag |
+| `6` | Incorrect data format for value | Check [Data formats](#data-formats) |
+| `11` | Invalid MsgType | Send only `R`, `S`, `AJ`, `Z`, or a session message |
+| `13` | Tag appears more than once | De-duplicate the tag |
+| `14` | Tag specified out of required order | Emit fields in dictionary order |
+
+### Application-layer: `BusinessMessageReject(35=j)`
+
+`BusinessRejectRefID(379)` echoes `QuoteReqID(131)` or, failing that,
+`QuoteID(117)`.
+
+| `BusinessRejectReason(380)` | When it happens | What to do |
+| ---: | --- | --- |
+| `0` (Other) | An application message arrived on a session that has not authenticated | Complete Logon before sending commands |
+| `3` (Unsupported Message Type) | Application `MsgType` outside `R`, `S`, `AJ`, `Z` | Send a supported message |
+| `5` (Conditionally Required Field Missing) | **Every** business failure: missing or malformed tag, unsupported `Side(54)` or `QuoteRespType(694)`, missing scope, and any domain rejection — stale revision, expired quote, insufficient remaining quantity, unknown resource, or conflicting state | Read `Text(58)`; `380` alone does not distinguish these |
+
+<Note>
+**Gotcha: `380=5` is not a reliable discriminator.** Nearly every business
+failure arrives under it, so branch on `Text(58)` rather than on the reason
+code.
+</Note>
+
+### On the unified edge (`fix.kairos.trade`)
+
+RFQ commands are relayed to the RFQ service, and a rejection returns `380=0`
+with a stable machine-readable code in `Text(58)`:
+
+| `Text(58)` code | When it happens | What to do |
+| --- | --- | --- |
+| `RFQ_COMMAND_INVALID` | Envelope or field validation failed | Fix the message against the field tables above |
+| `RFQ_COMMAND_REJECTED` | Domain validation failed | Re-read the resource state |
+| `RFQ_RESOURCE_NOT_FOUND` | Unknown RFQ, quote, or acceptance | Confirm the id and that it is yours |
+| `RFQ_RESOURCE_CONFLICT` | Terminal or otherwise conflicting state | Re-read the resource; do not retry blindly |
+| `RFQ_COMMAND_FAILED` | Anything else, including stale revision, expired quote, and insufficient size | Re-read the quote and resubmit against the current revision |
+| `RFQ_RELAY_NOT_ENABLED` | Inbound RFQ command execution is not enabled on that deployment | Contact onboarding; retrying will not help |
+
+An idempotent replay is acknowledged with `QuoteStatusReport(AI)` carrying
+`KairosState(9009)` of `duplicate`.
+
+## Machine-readable contract
+
+The complete message-by-message field contract and business rules are included
+in `spec/kairos/README.md` beside the dictionary files.

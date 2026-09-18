@@ -5,3 +5,8 @@
 # Draft content
 drafts/
 *.draft.mdx
+
+# Internal tooling and migration artifacts (not published pages)
+scripts/
+sources/
+AGENTS.md

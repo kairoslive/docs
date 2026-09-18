@@ -1,0 +1,323 @@
+---
+title: "Authentication"
+description: "API keys, JWTs, and scopes for the Data and Order Execution APIs"
+---
+
+Every protected Kairos endpoint takes one of two credentials: an **API key triple** for programmatic access, or a **session JWT** for user-facing apps. This page covers both — how to send them, what they unlock, and how each service reports an auth failure. Start with the quickstart; read the per-service detail when something returns `401` or `403`.
+
+If you only need read-only market data and don't want a credential at all, use the [Market Data API's free tier](/market-data/authentication) instead.
+
+## Quickstart
+
+**1. Create an API key** in the Kairos dashboard. You get three values, shown
+**once**, at creation:
+
+| Header | Value |
+|--------|-------------|
+| `X-Client-Id` | `kairos_ck_` followed by 24 hex characters |
+| `X-Api-Key` | 64 hex characters |
+| `X-Api-Secret` | 64 hex characters |
+
+**2. Export them:**
+
+```bash
+export CLIENT_ID=kairos_ck_your_client_id
+export API_KEY=your_api_key
+export API_SECRET=your_client_secret
+```
+
+**3. Send all three headers on every request.** This candles read needs no
+special scope, so it is the fastest way to confirm your credential works:
+
+```bash
+curl "https://data.kairos.trade/candles?provider=kalshi&contract_id=PRES-2024-DEM&timeframe_seconds=3600&start=2024-01-01T00:00:00Z&end=2024-01-02T00:00:00Z" \
+  -H "X-Client-Id: $CLIENT_ID" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "X-Api-Secret: $API_SECRET"
+```
+
+A `200` means you are authenticated. A `401` means the triple is wrong or
+incomplete — see [Authentication Responses](#authentication-responses).
+
+**4. To trade**, point the same three headers at
+`https://execution.kairos.trade` and make sure your key carries the
+`trade:execute` scope. See [Scopes](#scopes).
+
+<Note>
+**The three headers travel together.** Sending `X-Client-Id` pins the request
+to the API-key path: there is no fallback to an `Authorization: Bearer` header
+on the same request. A partial triple is a `401`, not a downgrade to anonymous.
+</Note>
+
+## Which Surface Takes Which Credential
+
+Four Kairos surfaces accept credentials, and they do not behave identically.
+Check this table before assuming a key that works on one will work on another.
+
+| Surface | API key | Session JWT | Anonymous | Scopes enforced |
+|---|---|---|---|---|
+| Data API (`data.kairos.trade`) | Yes | Yes | Only explicitly public routes | Yes — `trade:read`, `position:read` |
+| Order Execution (`execution.kairos.trade`) | Yes | Yes | No — only `GET /health` | Yes — all three |
+| RPC | Yes, on opt-in procedures only; never admin procedures | Yes | Public procedures only | Yes — via `read`/`trade` mapping |
+| [Market Data API](/market-data/overview) (`md.kairos.trade`) | Yes | Yes | **Yes — free tier, rate-limited per IP** | **No** — any active credential passes |
+
+<Note>
+**Two asymmetries to plan around.** Presenting a credential to the Market Data
+API raises your rate limit but grants no additional scope-gated data. And JWT
+sessions bypass scope checks entirely on the Data API — a behaviour you cannot
+reproduce with an API key.
+</Note>
+
+## API Key Authentication (Programmatic Access)
+
+The recommended credential for bots, backends, and anything non-interactive.
+
+### Supported Endpoints
+
+API key auth works on all read-only data endpoints:
+
+| Module | Endpoints |
+|--------|-----------|
+| Candles | `GET /candles`, `POST /candles/batch` |
+| Trades | `GET /trades/kalshi`, `GET /trades/polymarket`, `GET /trades/history`, `GET /trades/metrics` |
+| Search | `GET /search/markets`, `GET /search/markets-and-events`, `GET /search/simple`, `GET /search/suggest` |
+| Markets | `GET /markets/batch-prices`, `POST /markets/details`, `GET /markets/metadata` |
+| Discover | All discover endpoints |
+| Trader analytics | `GET /top-holders`, `GET /search-traders` |
+| PnL | `GET /pnl/providers`, `GET /pnl/{user_id}`, `GET /pnl/hover/{provider_id}/{wallet}/{contract_id}`, `GET /pnl/wallet-totals/{provider_id}/{wallet}` |
+
+It also works on the Order Execution API for trading endpoints, gated by scope.
+
+### Scopes
+
+Scopes answer **what** an API key may do.
+
+| Scope | Access |
+|-------|--------|
+| `trade:execute` | Submit/cancel orders and invoke supported execution mutations such as redeem and CTF split/merge |
+| `trade:read` | View trade history and metrics (`/trades/*`) |
+| `position:read` | View PnL and portfolio data (`/pnl/*`) |
+
+A key may also carry the wildcard scope `*`, which satisfies any requirement.
+
+Market data, discover, search, candle, top-holders, and search-traders endpoints require no specific scope — any active API key grants access. See [Order Types](/guides/order-types) for the scope each order-management call requires.
+
+> **The RPC API names its scope requirements differently.** An RPC procedure can
+> require the shorthand `read` or `trade`, which map onto the scopes above:
+> `read` is satisfied by either `position:read` or `trade:read`, and `trade` by
+> `trade:execute`. A `403` reading `API key missing required scope: read` is that
+> mapping, not a fourth scope.
+
+> **Scope is not the only gate on RPC.** Admin procedures never accept API-key
+> authentication, and non-admin procedures are opt-in — a procedure that has not
+> been enabled for API keys returns `403 FORBIDDEN` with
+> `This procedure does not accept API key authentication`, regardless of scope.
+
+**No anonymous tier for trading on Order Execution.** Every trading endpoint
+on `execution.kairos.trade` requires a credential or session JWT. The shallow
+`GET /health` load-balancer probe is public.
+
+### Platform Access
+
+Where scopes answer *what*, the platform-access gate answers **where**: Kairos can disable API-key access to an individual provider. This gate applies to:
+
+- `/trades/*` and `/pnl/*` routes that read one or more providers
+- Selected RPC procedures that explicitly enforce provider access, including positions, selected balances/portfolio reads, chart fills, PnL, copy-trading reads, combo history, and Polymarket balance reads
+- Order execution REST and WebSocket commands
+- Provider-scoped events sent to API-key WebSocket connections
+
+JWT/browser sessions are not affected. Candles, search, discover, and other general market-data routes are also outside this gate. `kalshi_offchain` uses the `kalshi` access decision.
+
+When access is disabled, the data API returns `403` with:
+
+```json
+{ "detail": "API access is disabled for polymarket" }
+```
+
+The detail may include an operator-supplied reason after the provider name. RPC returns `403 FORBIDDEN` with the same `API access is disabled for <provider>` message. Order Execution words it differently — `API-key access to <provider> is disabled` — and returns `403` with `error_details.code: "AUTH_INSUFFICIENT_SCOPE"` where the endpoint carries a structured envelope.
+
+<Note>
+**Order submit and cancel are status-only: a provider denial there is a
+bodyless `403`.** Match on the status code, not the body.
+</Note>
+
+If the access setting cannot be verified, the request fails closed (`503` on the data and execution APIs, `500 INTERNAL_SERVER_ERROR` on RPC). Treat that failure as transient rather than assuming access is enabled.
+
+Multi-provider requests fail as a whole when any included provider is disabled.
+Public `GET /providers/api-access` lists active providers currently enabled for
+API-key callers. If access settings cannot be loaded, it returns `503` instead
+of a partial list.
+
+### IP Whitelisting
+
+API keys can optionally be restricted to specific IP addresses; requests from a non-whitelisted IP receive `403 Forbidden`. An empty list means unrestricted. Matching is **exact string match on the address — CIDR ranges are not supported.**
+
+<Note>
+**The two APIs resolve your IP differently.** The Data API and RPC take the
+last `X-Forwarded-For` hop; the Order Execution API deliberately ignores
+forwarded headers and compares the **direct socket peer**. A key whitelisted
+for your public IP can therefore pass on `data.kairos.trade` and fail on
+`execution.kairos.trade` when your traffic is proxied. Whitelist the address
+your egress actually presents to each service.
+</Note>
+
+### Security
+
+- **Keys are hashed, not stored raw** — API keys and secrets are SHA-256 hashed before storage.
+- **Comparisons are constant-time** — credential checks resist timing attacks.
+
+## JWT Bearer Token (User Auth)
+
+The credential behind user-facing applications and browser sessions.
+
+**Header format:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Example request:**
+
+```bash
+curl "https://data.kairos.trade/api/markets/discover" \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+### Token Structure
+
+JWT tokens are RS256-signed and contain:
+
+| Claim | Type | Description |
+|-------|------|-------------|
+| `sub` | string | User ID |
+| `sid` | string | Session-lineage ID used by logout and logout-everywhere revocation |
+| `jti` | string | Unique token ID |
+| `ver` | integer | Token schema version — currently `1`; any other value is rejected `401` |
+| `email` | string \| absent | User email, when available |
+| `turnkeyOrgId` | string \| absent | Turnkey organization ID, when available |
+| `turnkeyUserId` | string \| absent | Turnkey user ID, when available |
+| `iss` | string | Issuer |
+| `aud` | string | Audience |
+| `iat` | integer | Issued at timestamp |
+| `exp` | integer | Expiration timestamp |
+
+`sub`, `sid`, `jti`, `ver`, `iat`, and `exp` are all required — a token missing
+any of them is rejected.
+
+**Token properties:**
+
+- Issuer: `kairos.trade`
+- Audience: `kairos-api`
+- Algorithm: RS256
+- Expiration: at most 24 hours, capped by the underlying Turnkey session expiry
+
+### Lifetime and Revocation
+
+- **Refresh grace** — an expired token can still be exchanged for a fresh one for **4 hours** past `exp`. Beyond that you must log in again.
+- **Session lineage** — a `sid` lives at most **28 hours** (24h token life + the 4h grace), after which no token in that lineage refreshes.
+- **Revocation** — tokens are revocable two ways: by exact token, and by `sid` (logout-everywhere). A revoked token fails `401` even before it expires.
+
+### Transport
+
+Send `Authorization: Bearer <token>`. Browser sessions may instead present the
+`turnkey_session_jwt` cookie. WebSocket clients pass the token in
+`Sec-WebSocket-Protocol`.
+
+<Note>
+**Query-parameter authentication is not supported** — it was removed.
+</Note>
+
+## Authentication Responses
+
+The services use different error envelopes, and the Data API distinguishes
+failure modes that Order Execution deliberately collapses. **Match on the status
+code first; treat the message as diagnostic.**
+
+### Data API (`data.kairos.trade`)
+
+Body shape is `{ "detail": "<message>" }`. The `Code` column below is the exact
+`detail` string.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `401` | `Authentication required (JWT token / API key / admin secret)` | No credentials on an endpoint that accepts API keys | Send the API-key triple or a bearer token |
+| `401` | `X-Api-Key and X-Api-Secret required with X-Client-Id` | Partial API-key triple | Send all three headers together |
+| `401` | `Invalid API credentials` | Unknown client id, or key/secret mismatch | Re-check the values from key creation; do not retry in a loop |
+| `401` | `Token has expired - please log in again` | JWT past `exp` | Refresh within the 4-hour grace, else log in again |
+| `401` | `Token schema outdated - please log in again` | `ver` is not `1` | Log in again to get a current-schema token |
+| `401` | `Token has been revoked - please log in again` | Token revoked by `jti` | Log in again |
+| `401` | `Session has been revoked - please log in again` | Session revoked by `sid` | Log in again; the whole lineage is dead |
+| `401` | `Invalid token signature` / `Invalid token audience` / `Invalid token issuer` | Claim or signature mismatch | Check you are sending a Kairos-issued token for `kairos-api` |
+| `401` | `Malformed authentication token` | A required claim is missing | Do not hand-assemble tokens; use one issued by Kairos |
+| `403` | `IP not whitelisted` | Source IP is off the key's whitelist | Add your egress address, remembering the per-service resolution difference |
+| `403` | `API key missing required scope: <scope>` | Scope gate | Issue a key carrying the named scope |
+| `403` | `API access is disabled for <provider>` | Provider access gate | Drop the provider from the request or contact Kairos |
+| `429` | `API key data rate limit exceeded` | Per-key limit | Honour `Retry-After` and back off |
+| `503` | `Unable to verify platform API access` | Provider gate failed closed | Retry — this is transient, not a permissions decision |
+
+A `401` on a missing credential also carries `WWW-Authenticate: Bearer`.
+
+### Order Execution API (`execution.kairos.trade`)
+
+Body shape is `{ "error": "<message>" }`. The messages are deliberately
+generic — the specific cause is never echoed back, so the `Code` column tells
+you less than the Data API's does.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `401` | `Missing authorization` | No credentials | Send the API-key triple or a bearer token |
+| `401` | `Invalid authorization header format` | Malformed `Authorization` header | Use exactly `Authorization: Bearer <token>` |
+| `401` | `Invalid token` | JWT failed validation | Obtain a fresh token |
+| `401` | `Token expired` | JWT past `exp` | Refresh within the 4-hour grace, else log in again |
+| `401` | `Token has been revoked` | Token or session revoked | Log in again |
+| `401` | `Invalid API credentials` | Any API-key problem, including a partial triple | Verify all three headers are present and correct |
+| `401` | `API credential has been revoked` | Key revoked | Create a new key |
+| `403` | `IP not whitelisted` | Source IP off the whitelist | Whitelist the **direct socket peer** this service sees |
+| `403` | `Insufficient scope` | Scope gate | Issue a key with `trade:execute` (or the scope the call needs) |
+| `429` | `Too many authentication attempts` | Per-IP failed-auth limiter | Stop retrying and back off |
+| `500` | `Authentication configuration error` | Server-side | Retry |
+
+<Note>
+**Repeated auth failures trip a per-IP brute-force limiter** that replaces the
+original error with `429`. Back off rather than retrying a bad credential.
+</Note>
+
+Handler-level scope and provider denials on endpoints with a structured
+envelope instead return `{ "error": ..., "error_details": { "code": "AUTH_INSUFFICIENT_SCOPE", ... } }` —
+see [Response Format](/guides/overview#response-format).
+
+### RPC API
+
+RPC wraps errors in the tRPC envelope:
+
+```json
+{ "error": { "message": "...", "code": -32001,
+  "data": { "code": "UNAUTHORIZED", "httpStatus": 401, "path": "<procedure>" } } }
+```
+
+`UNAUTHORIZED` is `401`, `FORBIDDEN` is `403`, `INTERNAL_SERVER_ERROR` is `500`.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `401` | `API key headers missing` | No API-key triple | Send all three headers |
+| `401` | `Invalid API credentials` | API-key validation failed | Re-check the values from key creation |
+| `403` | `Source IP is not in the credential's whitelist` | Source IP off the whitelist | RPC reads the last `X-Forwarded-For` hop — whitelist that address |
+| `403` | `API key missing required scope: <scope>` | Scope gate, via the `read`/`trade` mapping | Issue a key with a scope that satisfies the shorthand |
+| `403` | `Admin procedures are not available via API key` | Admin procedure called with a key | Use a session JWT; admin is never API-key accessible |
+| `403` | `This procedure does not accept API key authentication` | Procedure not opted in to API keys | Use a session JWT |
+| `500` | `Authentication backend unavailable` | Server-side | Retry — do not treat this as a bad key |
+
+## Endpoint Protection Levels
+
+| Protection Level | Description | Example Endpoints |
+|------------------|-------------|-------------------|
+| Public | No auth required | `GET /providers/configs`, `GET /providers/api-access`, `GET /sports/matching-markets`, `GET /sports/trending-matched` |
+| Data (Read-Only) | JWT or API Key | `GET /candles`, `GET /trades/history`, `GET /search/markets`, `GET /top-holders`, `GET /search-traders` |
+| User-scoped data | JWT or API key; own user only | `GET /pnl/{user_id}` |
+
+## Best Practices
+
+- **Store credentials securely** — never expose keys or tokens in client-side code or logs.
+- **Handle expiration** — refresh before the token's `exp`; lifetime is capped at 24 hours and can be shorter when the Turnkey session expires first.
+- **Use HTTPS** — all API requests must use HTTPS.
+- **Monitor usage** — track API-key usage for anomalies.

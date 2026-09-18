@@ -1,0 +1,92 @@
+---
+title: "Overview"
+description: "Trade through Kairos while holding your own keys, gas, and funds — the external self-signing (bring-your-own-signer) execution lane"
+---
+
+This page explains what the external execution lane is, who it is for, how to
+get access, and what you have to have in place before your first order. When
+you're ready to write code, go to [Signing & Order Lifecycle](/external-execution/signing).
+
+The **external execution lane** lets an approved market maker or institutional desk trade through Kairos's execution infrastructure while holding its own **keys, gas, and funds** — you sign orders locally with your own externally-owned account ([EOA](/learn/glossary)); Kairos builds the exact payload, verifies your signature, and forwards it to the venue.
+
+This is the low-latency, self-custody counterpart to the default Kairos path, where orders are signed for you by a managed key. **It exists for one reason: latency.** A managed signature makes a cross-region round-trip to a cloud HSM (~50–100 ms per order). On this lane you sign locally — sub-millisecond and free — so the only added latency is the network hop to your regional execution node, minimized with [regional colocation](/external-execution/regional-execution) and a persistent WebSocket signing channel. **Kairos never custodies your key and never moves funds you did not sign for.**
+
+## What you bring vs. what Kairos does
+
+| You bring | Kairos does |
+|---|---|
+| An EOA (any secp256k1 key — hardware wallet, HSM, hot key) | Builds the exact EIP-712 order payload for you to sign |
+| Funds in that wallet (e.g. pUSD on Polygon for Polymarket) | Verifies your signature (`ecrecover`) against your registered wallet |
+| Gas for on-chain operations (approvals, redemptions) | Submits to the venue, persists the order, tracks fills, positions, and PnL |
+| A signing endpoint or an open WebSocket connection | Runs the regional matching / execution plumbing |
+
+Every order Kairos submits on your behalf carries a signature that recovers to an address **registered to your account**. A signature over one order cannot be replayed onto another — the signed digest pins price, size, side, token, maker/signer, and venue (the verifying contract, which differs between standard and neg-risk markets). Expiration and `post_only` sit on the outer payload rather than inside Polymarket's signed `Order` struct; replay is instead foreclosed by the per-order `salt` and `timestamp`, and by single-use intents.
+
+## The account model
+
+You trade as a **pure EOA** (`signatureType = 0` on Polymarket): the wallet that signs is the wallet that makes the order and holds the funds. There is no Safe, proxy, or managed sub-org — the simplest, fully non-custodial shape. It signs orders (EIP-712), holds the settlement asset (e.g. pUSD on Polygon), and pays its own gas for any on-chain operation; owner, signer, and maker are always the same address.
+
+## Access
+
+This lane is **allow-listed per account**. Until Kairos approves your account, every external-execution endpoint returns:
+
+**403 Forbidden:**
+```json
+{ "error": "external-signing execution is not enabled for this account" }
+```
+
+To request access, contact your Kairos account manager. Approval is a deliberate manual step so the allow-list stays small and intentional.
+
+> **The gate is checked server-side on every request and fails closed.** If the check itself errors you get `403 external-signing authorization check failed` — never a `500`, never a pass-through. Both steps of a two-round-trip flow are gated independently, so an in-flight `payload_id` does not bypass the check at `/submit`.
+
+> **Gotcha: revocation is prompt, not atomic.** The flag is served from a short-lived cache, so expect a change to take effect within a couple of seconds — longer if the central database is degraded. Do not build anything that assumes an instant cutoff.
+
+## Getting started
+
+1. **Get allow-listed.** Contact your Kairos account manager. Until approved, every call is `403`.
+2. **Register your signing EOA(s).** Kairos only accepts signatures that recover to an address registered to your account. Send the address(es) during onboarding — you may register several (e.g. a primary and a backup HSM key); any of them can sign.
+3. **Fund your wallet.** Deposit the venue's settlement asset into your EOA on the venue's chain (for Polymarket: **pUSD** on Polygon). You control the deposit entirely; there is no custody step.
+4. **Set on-chain approvals.** Before the venue can move your collateral on a fill, your EOA needs one-time approvals (for Polymarket: `pUSD.approve` and `ConditionalTokens.setApprovalForAll` against the CTF Exchange, plus the NegRisk variants). Self-serve: call `POST /v2/onchain/intent` with `op: "approvals"`, sign each returned `signing_digest_hex` with your EOA, and post the signatures to `POST /v2/onchain/submit`. You supply the `nonce` and `gas_price_wei` and you pay the gas. Your account manager can also walk through this during onboarding.
+5. **Keep a small gas balance.** Order placement and cancellation on Polymarket are off-chain and gasless; gas is only needed for the on-chain operations above (a few cents of POL for approvals, more only if you later redeem resolved positions).
+6. **Get your credentials & node assignment.** Obtain your Kairos JWT (or a scoped API key issued at onboarding) and confirm which [regional execution node](/external-execution/regional-execution) you connect to for lowest latency.
+7. **Place your first order.** Follow the [Signing & Order Lifecycle](/external-execution/signing) walkthrough.
+
+### Onboarding checklist
+
+- Account approved for external execution (via your account manager)
+- Signing EOA(s) registered to your account
+- Wallet funded with the venue settlement asset (e.g. pUSD on Polygon)
+- On-chain approvals set (self-serve via `/v2/onchain/*`, or with your account manager)
+- Small native-gas balance (POL) on hand for approvals and any future redemptions
+- Kairos JWT / API key in hand
+- Regional node / colocation confirmed with Kairos
+
+## What's live today
+
+| Capability | Status |
+|---|---|
+| Allow-list gating (`403` until approved) | Live |
+| Limit orders (GTC / GTD) — buy & sell | Live |
+| Market orders (FOK / FAK / IOC) — buy & sell | Live |
+| Assisted two-round-trip signing (Kairos builds the payload) | Live |
+| One-round-trip self-built signed order over WebSocket | Live |
+| Order lifecycle — persisted order, fills, fees, positions | Live |
+| Fill / order-status events streamed over WebSocket | Live |
+| Off-chain cancels (single / batch / all) | Live — no signature required |
+| Polymarket orders | Live |
+| Predict.fun orders (REST, EOA accounts) | Live |
+| Self-signed on-chain ops (approvals, redeem, split/merge, unwrap) — `POST /v2/onchain/intent` + `POST /v2/onchain/submit`, Polygon only | Live |
+| Additional venues (Hyperliquid) | Coming soon |
+
+This page — and the rest of this section — documents only what you can integrate against today. See [Signing & Order Lifecycle](/external-execution/signing) for the full request/response flow and runnable code.
+
+## Security model in one paragraph
+
+You authenticate to your regional node with a Kairos JWT (or scoped API key). Every order Kairos submits is reconstructed **server-side from stored inputs**, and its signature is `ecrecover`'d to an address that **must** be registered to your account. Intents are single-use, short-TTL, and bound to the account that created them. A leaked intent id is useless without the matching signature, and a signature over one payload cannot be replayed onto another. You never supply a contract address or calldata — the only thing Kairos submits is bytes you signed.
+
+## See also
+
+- **[Signing & Order Lifecycle](/external-execution/signing)** — EIP-712 signing rules, the intent → sign → submit flow, the WebSocket one-round-trip path, order types, fills, and cancels, with runnable code.
+- **[Regional Execution Nodes](/external-execution/regional-execution)** — where to connect for the lowest latency, what's served regionally vs. centrally, and the live-position source-of-truth caveat.
+- **[API Reference](/api-reference)** — full request/response schemas for every endpoint referenced in this section.
+- **[REST › Orders](/rest/orders)** and **[WebSocket › Order Execution](/websocket/order-execution)** — the general execution API surface (custodial signing).

@@ -1,0 +1,104 @@
+---
+title: "Accounts and margin"
+description: "Trading-account identity, balances, collateral, and margin modes"
+---
+
+> **⚠ Nothing on this page is callable**
+>
+> **Design preview.** Private perps data and execution are not currently
+> available from Kairos. The canonical v2 schema defines **no** account,
+> balance, margin, or position message, so there is nothing here to call or
+> subscribe to — this page describes intended semantics, not an API.
+>
+> The public perpetual market-data surface is live in production behind
+> `PERPETUALS_PUBLIC_API_ENABLED`, but enabling that flag did **not** make this
+> page callable in any environment. See
+> [Overview](/perpetuals/overview).
+
+This page describes how Kairos intends to model trading-account identity,
+balances, collateral, and margin modes for perpetuals. Read it to understand
+the data model you will eventually integrate against; there is one live
+exception, noted under [Margin mode](#margin-mode).
+
+Private state is scoped to a trading account, not merely a Kairos user or wallet
+address. A trading account identifies the provider, environment, integration,
+venue account, and subaccount where applicable.
+
+## Account boundary
+
+This boundary prevents:
+
+- testnet and production balances from colliding
+- two credentials for one venue from sharing cursors
+- parent-account and subaccount positions from being merged
+- a public wallet label from becoming an authorization decision
+
+Credential bindings are separate from normalized financial records. Secrets
+are never included in events, analytics tables, or public identifiers.
+
+## Balances
+
+A balance record identifies the asset and account, then reports supported
+components such as total, available, locked, withdrawable, collateral value,
+and borrowed amount.
+
+Each component has an availability state.
+
+<Note>
+**`unknown`, `unsupported`, `stale`, and `temporarily unavailable` are not
+numeric zero.** Components from different observation times are also not
+combined into a fictitiously atomic balance.
+</Note>
+
+## Margin mode
+
+Positions and account-instrument configuration carry a normalized margin mode:
+
+| Mode | Meaning |
+|---|---|
+| `cross` | Eligible account collateral is shared |
+| `isolated` | Collateral is assigned to a position or instrument scope |
+| `strict_isolated` | A venue-enforced variant whose transfer and offset rules differ from ordinary isolated margin |
+| venue extension | Preserved when it cannot be represented safely by the common modes |
+
+The raw venue mode is retained. Kairos does not label an unknown mode as cross.
+
+**The one margin-adjacent fact a public surface carries today** is on
+`GET /perpetuals/instruments`: `isolated_only` and `max_leverage`, both
+nullable, plus a venue-specific `metadata` block.
+
+<Warning>
+**Kalshi's `max_leverage` there is a sampled estimate, not a rule.** It is
+labelled `semantics: "sampled_estimate"` for exactly that reason. Do not
+treat it as an enforceable venue limit.
+</Warning>
+
+## Account and position risk
+
+Account-level observations can include equity, margin used, maintenance
+requirement, available margin, leverage, and withdrawal capacity. Position
+observations can include isolated collateral and position-specific liquidation
+or maintenance values.
+
+Every derived risk value identifies its calculation source:
+
+- venue-reported
+- venue-rule calculation using versioned inputs
+- Kairos estimate
+
+An estimate is never presented as an enforceable venue value.
+
+## Configuration is state
+
+Leverage, margin mode, risk tier, and position mode can change while an
+instrument has no position. They therefore belong to an account-instrument
+configuration record, not only to an open-position row.
+
+## Reconciliation
+
+Private streams provide low-latency changes; authenticated snapshots establish
+authoritative state. Reconciliation compares event projections with a
+same-account snapshot and advances a durable cursor only after the resulting
+state commits successfully.
+
+Next: [Positions, orders, and fills](/perpetuals/positions-orders-and-fills).

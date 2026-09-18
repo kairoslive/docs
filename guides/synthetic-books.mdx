@@ -1,0 +1,424 @@
+---
+title: "Synthetic Books"
+description: "How weighted multi-market books work, what they represent, and when to use them"
+---
+
+A synthetic book is a live order book for a package of prediction-market
+outcomes. Instead of showing liquidity for one outcome, it shows the price and
+quantity available for trading all legs of a weighted formula together:
+
+```text
+S = w1*A + w2*B + ... + wn*N
+```
+
+Synthetic books are useful for comparing equivalent markets, isolating a price
+range, tracking logical relationships, and pricing weighted baskets. They turn
+several underlying books into one consistent view without pretending that a
+multi-venue package is an atomic trade.
+
+This guide covers the economic and market-data semantics. To consume a live
+book, follow the [Synthetic Book Stream tutorial](/websocket/synthetic-books).
+It includes the definition request format, connection details, protobuf schema,
+subscription example, delta handling, recovery rules, and limits.
+
+<Warning>
+**Formula creation is currently available to provisioned Synthetic Books
+integrations.** The public WebSocket is subscription-only: it accepts a
+canonical `synthetic_id`, not a formula. If your onboarding materials do not
+include the definition API URL and credentials, contact Kairos before
+implementing the creation step. **Do not attempt to derive a `synthetic_id`
+locally.**
+</Warning>
+
+## How to read a synthetic formula
+
+Each leg identifies one tradeable outcome and has a signed weight:
+
+- A positive weight means buying that outcome when buying the synthetic.
+- A negative weight means selling that outcome when buying the synthetic.
+- The absolute weight controls how much of that outcome one synthetic unit uses.
+
+For the common spread `S = A - B`:
+
+```text
+ask(S) = ask(A) - bid(B)
+bid(S) = bid(A) - ask(B)
+```
+
+The B leg uses the opposite side of its book because buying `A - B` requires
+buying A and selling B. Using `ask(B)` in the synthetic ask would describe the
+wrong trade.
+
+### Worked spread example
+
+Suppose the two source books show:
+
+| Outcome | Best bid | Best ask | Available quantity |
+| ------- | -------: | -------: | -----------------: |
+| A       |    $0.60 |    $0.62 |                100 |
+| B       |    $0.58 |    $0.59 |                 40 |
+
+Then the top of book for `A - B` is:
+
+```text
+ask = $0.62 - $0.58 = $0.04
+bid = $0.60 - $0.59 = $0.01
+```
+
+Only 40 synthetic units are available at that combination because B is the
+scarcer leg. The synthetic cannot advertise more package liquidity than can be
+executed across every required outcome.
+
+### Weights change both price and capacity
+
+One unit of `2*A - B` consumes two units of A and one unit of B. Its price and
+available quantity therefore differ from `A - B`. Weights are not simplified
+by dividing the entire formula: the unit definition is economically meaningful.
+
+## Book shapes
+
+Synthetic books can be presented at different levels of detail:
+
+| Shape              | Best for                                  | What it shows                                                                       |
+| ------------------ | ----------------------------------------- | ----------------------------------------------------------------------------------- |
+| Best bid and offer | Alerts, comparisons, and compact displays | The best executable synthetic bid and ask.                                          |
+| Aggregated depth   | Charts and package-liquidity views        | Multiple price levels with construction paths at the same price combined.           |
+| Decomposed depth   | Execution-aware integrations              | Price levels plus the source actions and quantities needed to construct each level. |
+
+Choose the smallest shape that answers the product's question. A display that
+only needs the current spread does not need detailed execution recipes.
+
+## Types of synthetic books
+
+The formulas below describe common uses. Their economic labels are declarations,
+not conclusions produced by Kairos. Always verify that the referenced markets use
+compatible resolution rules, sources, deadlines, and outcome definitions.
+
+### 1. Cross-venue relative-value spread
+
+```text
+SPREAD = VENUE_A_YES - VENUE_B_YES
+```
+
+Use this when two venues list outcomes believed to represent the same event. A
+negative ask can indicate that the displayed books offer a credit for buying the
+first outcome and selling the second.
+
+This is a relative-value signal, not proof of arbitrage. Venue fees, settlement
+differences, transfer constraints, and legging risk can remove the apparent edge.
+
+### 2. Strike range
+
+If `ABOVE_70` pays when a value finishes above 70 and `ABOVE_80` pays when it
+finishes above 80:
+
+```text
+RANGE_70_TO_80 = ABOVE_70 - ABOVE_80
+```
+
+When both contracts share the same measurement and resolution rules, the package
+isolates the interval `(70, 80]`. This pattern also works for election thresholds,
+temperature bands, and other nested outcomes.
+
+Boundary language matters. “Above 70” and “at least 70” are not interchangeable,
+and contracts using different observation times do not form a clean range.
+
+### 3. Binary complement
+
+For a complete binary market:
+
+```text
+COMPLEMENT = YES + NO
+```
+
+The terminal payout should total one unit. A synthetic book makes it easy to see
+the current cost and liquidity for acquiring or unwinding both sides together.
+
+Before treating the package as guaranteed, confirm that both outcomes belong to
+the same market and that invalid-market or cancellation rules affect them equally.
+
+### 4. Multi-outcome partition
+
+For mutually exclusive and collectively exhaustive outcomes:
+
+```text
+PARTITION = OUTCOME_A + OUTCOME_B + OUTCOME_C
+```
+
+This can represent an election field, award nominees, or a set of non-overlapping
+ranges. The package behaves like a guaranteed payout only if the outcomes cover the
+entire resolution universe exactly once.
+
+The arithmetic cannot determine whether a partition is logically complete. That
+relationship must be reviewed from the market rules.
+
+### 5. Implication spread
+
+If event A necessarily implies event B:
+
+```text
+IMPLICATION_GAP = A - B
+```
+
+The book can surface prices that appear inconsistent with the implication. For
+example, “candidate wins the election” may imply “candidate wins the nomination,”
+but only if both contracts refer to the same candidate, election cycle, and rules.
+
+### 6. Time or venue basis
+
+```text
+BASIS = NEAR_TERM_OUTCOME - LONG_TERM_OUTCOME
+```
+
+This tracks how the market prices the same underlying idea across expiries or
+observation windows. It is useful for monitoring changing expectations, but the
+two legs usually do not have identical settlement conditions and should not be
+described as guaranteed equivalents.
+
+### 7. Weighted basket or index
+
+```text
+INDEX = 0.5*A + 0.3*B + 0.2*C
+```
+
+A basket combines several outcomes into one weighted view. Possible uses include
+theme indexes, scenario portfolios, or a custom probability signal.
+
+Basket liquidity is constrained by the scarcest weight-adjusted leg. If C has only
+10 shares available, its 20% weight may still determine how many complete basket
+units can be constructed.
+
+### 8. Scaled hedge package
+
+```text
+HEDGE = 2*A - B
+```
+
+Scaled packages represent asymmetric exposure. They are useful when one outcome
+needs more notional than another, but the weights must reflect actual contract
+quantity rather than a desired dollar allocation after the fact.
+
+## Selecting the right structure
+
+| Goal                         | Typical formula          | Main review question                                  |
+| ---------------------------- | ------------------------ | ----------------------------------------------------- |
+| Compare equivalent listings  | `A - B`                  | Do the contracts really resolve identically?          |
+| Isolate a bounded interval   | `ABOVE_LOW - ABOVE_HIGH` | Are boundaries and observation times aligned?         |
+| Acquire every binary outcome | `YES + NO`               | Are cancellation and invalid-market rules shared?     |
+| Cover a multi-outcome field  | `A + B + C`              | Is the set exclusive and exhaustive?                  |
+| Test a logical relationship  | `A - B`                  | Does A necessarily imply B under the written rules?   |
+| Build a custom index         | `w1*A + w2*B + ...`      | Do the weights express quantity or merely preference? |
+
+## Prices, quantities, and fees
+
+Synthetic prices may be negative. A negative ask on a spread means the displayed
+source prices imply a credit for entering the package; it does not guarantee a
+risk-free profit.
+
+Synthetic asks round up and bids round down so the displayed quote does not
+overstate the available edge. Quantities are limited by the source leg that runs
+out first after accounting for weights.
+
+Underlying prices remain raw venue prices. Fee information, when available, is
+carried separately so an execution-aware consumer can estimate all-in cost for the
+specific price and quantity it plans to use.
+
+<Note>
+**Missing fee information means unknown, not fee-free.**
+</Note>
+
+## Freshness and executable status
+
+A package is only as current as its least healthy leg. A synthetic book may report:
+
+| Status                                  | Meaning                                                                                  |
+| --------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `MATERIALIZATION_STATUS_UNSPECIFIED`     | No status has been determined yet.                                                        |
+| `MATERIALIZATION_STATUS_EXECUTABLE`      | Every source is current and the displayed package levels can be evaluated for execution.  |
+| `MATERIALIZATION_STATUS_SOURCE_MISSING`  | A required source book has not arrived at all yet.                                        |
+| `MATERIALIZATION_STATUS_SOURCE_NOT_LIVE` | A source is bootstrapping, gapped, stale, or withdrawn.                                   |
+| `MATERIALIZATION_STATUS_NO_LIQUIDITY`    | Every source is live, but a required side has no available levels.                        |
+| `MATERIALIZATION_STATUS_ARITHMETIC_OVERFLOW` | A source value or weighted result left the representable range.                       |
+
+Each constituent also carries its own lineage health:
+`SOURCE_STATUS_BOOTSTRAPPING`, `SOURCE_STATUS_LIVE`, `SOURCE_STATUS_GAPPED`,
+`SOURCE_STATUS_STALE`, or `SOURCE_STATUS_WITHDRAWN`.
+
+> **One unhealthy leg takes down the whole package.** Anything other than `LIVE`
+> moves the package to `SOURCE_NOT_LIVE` — not just the levels that leg touches
+> — and the package is withdrawn. Continuing to display the last good
+> combination would present liquidity that may no longer exist.
+
+> **Even an executable quote is a point-in-time view.** Revalidate the
+> underlying prices, quantities, fees, and account constraints immediately
+> before placing orders.
+
+## Canonical definitions
+
+Equivalent formulas resolve to the same synthetic definition regardless of leg
+ordering. Duplicate outcome legs are combined and zero-weight results are removed.
+
+These formulas are equivalent:
+
+```text
+A - B
+-B + A
+0.5*A + 0.5*A - B
+```
+
+These are not equivalent because they define different units:
+
+```text
+A - B
+2*A - 2*B
+```
+
+Book shape and requested depth also matter: a best-price view and a deep,
+execution-aware view are distinct even when their formula matches.
+
+## Definition request format
+
+A provisioned integration submits a definition as JSON. This example constructs
+`A - B`, requests ten levels, and includes the source actions for each level:
+
+```json
+{
+  "legs": [
+    {
+      "venue": "polymarket",
+      "contract_id": "<market-id-a>",
+      "token_id": "<outcome-token-id-a>",
+      "weight": "1"
+    },
+    {
+      "venue": "kalshi",
+      "contract_id": "<market-ticker-b>",
+      "outcome_index": 0,
+      "weight": "-1"
+    }
+  ],
+  "output_mode": "decomposed_l2",
+  "depth": 10,
+  "classification": "relative_value"
+}
+```
+
+### Leg fields
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `venue` | string | Yes | — | Provider slug: `kalshi`, `polymarket`, `predictfun`, `opinion`, `limitless`, or `robinhood`. Anything else is `unknown_venue`. |
+| `contract_id` | string | Yes | — | The provider's market identifier |
+| `token_id` | string | Yes* | — | Outcome token identifier, for venues with separate outcome tokens |
+| `outcome_index` | integer | Yes* | — | Zero-based outcome index — the form to use for `kalshi` |
+| `weight` | string (decimal) | Yes | — | Signed weight; a positive weight buys the outcome, a negative weight sells it |
+| `fee` | object | No | — | Optional taker-fee model annotation — see [Optional fee annotation](#optional-fee-annotation) |
+
+*Identify the outcome with `token_id` **or** `outcome_index`.
+
+<Note>
+**`kalshi` is the one merged-book venue.** Its per-outcome token is derived as
+`{contract_id}::{index}`, so send the zero-based `outcome_index` and let the
+service build it. If you send a `token_id` for kalshi it must match that form,
+or the leg is rejected `token_contract_mismatch` — a token that does not
+belong to the contract it claims would subscribe to one book and read another.
+</Note>
+
+Use the identifiers returned by Kairos market metadata rather than
+reconstructing them from labels.
+
+Perpetual venues are recognised but not materialized in v1
+(`unsupported_quantity_unit`), and mixing them with prediction contracts is
+`mixed_quantity_units` — a rejection that will remain after perpetuals ship,
+because summing incompatible units needs a conversion nobody has specified.
+
+> **Weights must be decimal *strings*, not JSON numbers.** Strings preserve the
+> requested value exactly:
+>
+> ```json
+> { "weight": "0.125" }
+> ```
+
+### Optional fee annotation
+
+A leg may carry the venue's taker-fee **model** — never a fee-adjusted price,
+since raw prices must round-trip against what the venue shows:
+
+```json
+{ "venue": "kalshi", "contract_id": "...", "outcome_index": 0, "weight": "-1",
+  "fee": { "model": "curve_rate_ppm", "rate_ppm": 70000,
+           "is_estimate": false, "resolved_at_ms": 1756000000000 } }
+```
+
+| `model` | Formula | Rate field | Maximum |
+| --- | --- | --- | --- |
+| `none` | Venue charges no taker fee on this contract | — | — |
+| `curve_rate_ppm` | `(rate_ppm / 1e6) × p × (1 − p) × qty` | `rate_ppm` | 1,000,000 |
+| `min_side_bps` | `(bps / 1e4) × min(p, 1 − p) × qty` | `bps` | 10,000 |
+
+The rate field is required and must be a non-zero unsigned integer in range for
+its model; `none` must carry no rate. A malformed annotation is rejected rather
+than repaired — silently coercing it to fee-free would under-price that venue
+for every consumer. Duplicate legs of one instrument asserting **different**
+models are rejected as contradictory.
+
+The annotation is metadata: it participates in validation and the wire echo but
+**not** in the canonical id, so re-asserting a definition with fresher fee data
+updates the shared materialization instead of forking it. A resolved model beats
+an estimate; between two resolutions the strictly fresher one wins.
+
+### Enumerations
+
+The supported output modes are `bbo`, `aggregated_l2`, and `decomposed_l2`.
+The supported classifications are `arbitrary_basket`, `relative_value`,
+`exact_equivalence`, `complement`, `partition`, `implication`, `range`, and
+`guaranteed_payout`. Classification is reviewed metadata; it does not alter the
+formula's arithmetic or prove the relationship.
+
+The creation response contains the canonical `synthetic_id` to use on the
+stream. Equivalent definitions return the same ID. Follow the subscription
+lifecycle and authentication instructions supplied with your provisioned
+definition endpoint.
+
+## Current limits
+
+- A request may contain 1 to 15 outcome legs.
+- A canonical definition may use up to 3 venues and 5 legs from one venue.
+- Every weight must be nonzero, use at most nine decimal places, and have an
+  absolute value no greater than 1,000.
+- Requested depth must be from 1 to 50 price levels.
+- All legs must use compatible prediction-contract quantity units.
+- Duplicate legs are combined. A definition is rejected if every leg cancels
+  to zero.
+- Only weighted-additive formulas are supported; there is no constant term or
+  nested synthetic leg.
+
+Connection and subscription quotas are separate from formula limits. See
+[Stream limits](/websocket/synthetic-books#stream-limits).
+
+## What synthetic books do not model
+
+- Multiplicative parlays or conditional-probability products. Formulas are additive.
+- Recursive synthetics whose legs are themselves synthetic books.
+- A constant or intercept term.
+- Account balances, allowances, or position-specific constraints.
+- Atomic execution across independent venues.
+- Automatic proof that two market descriptions or resolution rules are equivalent.
+- A union of venue liquidity where each unit may come from any one venue. A
+  multi-leg package consumes every leg in its formula.
+- Mixed prediction-contract and perpetual-futures quantities.
+
+## Risk checklist
+
+Before acting on a synthetic quote, confirm:
+
+1. Every market's written resolution rules support the intended relationship.
+2. Outcome identifiers refer to the intended side of each market.
+3. The source books are live and the package has not expired or been withdrawn.
+4. Fees and any transfer, settlement, or conversion costs are included.
+5. Available quantity covers every leg after applying weights.
+6. The execution plan accounts for partial fills and legging risk.
+7. Your account can trade every venue and outcome in the package.
+
+Synthetic books make multi-market liquidity easier to reason about. They do not
+remove the operational and settlement risks of executing the underlying legs.

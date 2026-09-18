@@ -1,0 +1,672 @@
+---
+title: "Conditional Orders & Market Making"
+description: "Stop-loss, take-profit, stop-limit, trailing-stop, OCO/OTO brackets, TWAP, and market-making"
+---
+
+This page covers the dedicated endpoints for price- and time-triggered orders:
+single stops and targets, OCO and OTO brackets, TWAP schedules, and the
+two-sided market maker. These are the endpoints most integrations use; each one
+creates a strategy that the Krisis engine evaluates until it fires, expires, or
+is cancelled.
+
+All endpoints require `Authorization: Bearer <jwt>`.
+
+<Note>
+**Gotcha: every conditional order consumes a strategy slot.** A bracket
+creates two strategies and an OTO bracket creates three, so each counts that
+many times against your account's strategy-count
+[tier limit](/krisis/overview#tier-limits). Once the limit is hit, a create call
+returns `400 "Strategy limit reached for your tier"`.
+</Note>
+
+## Choosing an endpoint
+
+| You want | Endpoint |
+|---|---|
+| One stop-loss, take-profit, stop-limit, or trailing stop | [`POST /api/v1/conditional-orders`](#single-conditional-order) |
+| A stop-loss **and** a take-profit on a position you already hold, one cancelling the other | [`POST /api/v1/conditional-orders/bracket`](#bracket-oco) |
+| An entry plus **one** exit leg that waits for the entry to fill | [`POST /api/v1/conditional-orders/oto`](#oto) |
+| An entry plus **both** an SL and a TP, all waiting for the entry | [`POST /api/v1/conditional-orders/oto-bracket`](#oto-bracket) |
+| To work a large order over time in slices | [`POST /api/v1/conditional-orders/twap`](#twap) |
+| To rest a two-sided quote and re-quote on a timer | [`POST /api/v1/conditional-orders/market-maker`](#market-maker) |
+
+## Lifecycle
+
+A conditional order has no separate status field: `is_active` is the whole
+state, and how it got there is told by the other fields on the row.
+
+| State | How the row reads | Leaves it by | Terminal |
+|---|---|---|---|
+| **Dormant** | `is_active: true` with `trigger_order_id` set (waiting on an OTO entry), or `kind: "bracket_entry"` with its [wake price](#stop-entries) unreached | The entry filling, or the market reaching the wake price | No |
+| **Armed** | `is_active: true`, no `trigger_order_id` | Its trigger condition going true | No |
+| **Fired** | `is_active: false` after the engine submitted its order | — | Yes |
+| **Cancelled** | `is_active: false` after [DELETE](#cancel-a-conditional-order), or after an OCO sibling fired | — | Yes |
+| **Expired** | `is_active: false` once `expires_at` passes | — | Yes |
+
+<Warning>
+**Gotcha: deactivation never deletes the row.** A fired, cancelled, or expired
+order keeps showing in [List conditional orders](#list-conditional-orders), so
+filter on `is_active` rather than assuming the list is live work.
+</Warning>
+
+The market maker is the exception to the fire-once shape: it holds two resting
+quotes and stays active across fills, deactivating only on cancel, expiry, or a
+`stop_loss_pct` breach.
+
+## Shared fields
+
+These fields appear on most create requests.
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `market_id` | string | Yes | — | Market / contract identifier |
+| `quantity` | number | Yes | — | Contracts to trade; must be `> 0` |
+| `exchange_id` | string | No | `"kalshi"` | `"kalshi"`, `"polymarket"`, or `"predictfun"` |
+| `fund_id` | uuid | No | — | Spending fund to reserve against |
+| `execution_mode` | string | No | `"live"` | Only `"live"` — paper execution has been removed |
+| `expires_at` | string | No | — | ISO 8601; auto-deactivates the order after this time |
+| `token_id` | string | Polymarket | — | CLOB token id — **required for Polymarket** |
+| `outcome` | string | Polymarket | — | Outcome label (e.g. `"Yes"`) — **required for Polymarket** |
+| `max_slippage_cents` | integer | No | `2` | Walk-the-book cap for market fills, in cents |
+
+<Note>
+**Gotcha: Polymarket needs `token_id` and `outcome` on every conditional
+order.** Omit either and the request is rejected `400`.
+</Note>
+
+## Single conditional order
+
+```
+POST /api/v1/conditional-orders
+```
+
+Creates one stop-loss, take-profit, stop-limit, or trailing-stop. Returns
+`201 Created` with an [order object](#order-object).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `kind` | string | Yes | — | `"stop_loss"`, `"take_profit"`, `"stop_limit"`, or `"trailing_stop"` |
+| `trigger_price` | number | Yes | — | Price at which the order arms; must be `> 0` |
+| `side` | string | Yes | — | `"buy"` or `"sell"` |
+| `order_type` | string | No | `"market"` | `"market"` or `"limit"` |
+| `limit_price` | number | stop_limit | `trigger_price` | Resting limit price, in `(0, 1]`. Required for `stop_limit`; optional on a `stop_loss` / `take_profit` with `order_type: "limit"`, where omitting it rests the leg at `trigger_price` |
+| `trailing_offset` | number | trailing_stop | — | Offset the stop trails the peak/trough by; required for `trailing_stop`, `> 0` |
+
+Plus the [shared fields](#shared-fields).
+
+### What each `kind` does
+
+| `kind` | Behaviour |
+|---|---|
+| `stop_loss` | Fires when price crosses `trigger_price` adversely. `order_type: "market"` = stop-market; `"limit"` rests a limit |
+| `take_profit` | Fires when price reaches a favourable `trigger_price` |
+| `stop_limit` | Stop that, once triggered, rests a GTC limit at `limit_price` (the two-price model) |
+| `trailing_stop` | Stop whose trigger trails the best price seen by `trailing_offset` and never moves backward |
+
+`"twap"` and market-making are **not** valid here — use the [TWAP](#twap) and
+[market maker](#market-maker) endpoints.
+
+### Example
+
+```bash
+curl -X POST https://krisis.kairos.trade/api/v1/conditional-orders \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "market_id": "KXBTCD-25",
+    "exchange_id": "kalshi",
+    "kind": "stop_loss",
+    "trigger_price": 0.40,
+    "side": "sell",
+    "order_type": "market",
+    "quantity": 100
+  }'
+```
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| `kind` cannot be `"twap"` or market-making | `400` |
+| `side` must be `"buy"` / `"sell"`; `order_type` must be `"market"` / `"limit"` | `400` |
+| `stop_limit` requires `limit_price` | `400` |
+| `trailing_stop` requires `trailing_offset` | `400` |
+| Polymarket requires `token_id` + `outcome` | `400` |
+
+## Bracket (OCO)
+
+```
+POST /api/v1/conditional-orders/bracket
+```
+
+Creates a **one-cancels-other** pair — a stop-loss and a take-profit on an
+open position. Whichever fills first, the other is cancelled.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `side` | string | Yes | — | `"buy"` or `"sell"` |
+| `stop_loss_price` | number | Yes | — | Stop trigger; `> 0` |
+| `take_profit_price` | number | Yes | — | Target trigger; `> 0` |
+| `order_type` | string | No | — | Legacy — applies to both legs if the per-leg fields are omitted |
+| `stop_loss_order_type` | string | No | `"market"` | `"market"` or `"limit"` |
+| `stop_loss_limit_price` | number | No | `stop_loss_price` | Where an SL-`"limit"` rests once the stop triggers, in `(0, 1]` |
+| `take_profit_order_type` | string | No | `"market"` | `"market"` or `"limit"` |
+| `take_profit_limit_price` | number | No | `take_profit_price` | Where a TP-`"limit"` rests once the target triggers, in `(0, 1]` |
+
+Plus the [shared fields](#shared-fields).
+
+Supplying a limit price that differs from its trigger gives the standard
+two-price stop-limit — trigger at 40¢, rest at 38¢.
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| `stop_loss_price` and `take_profit_price` must both be `> 0` | `400` |
+| For `side: "sell"`, `stop_loss_price` must be **below** `take_profit_price` | `400` |
+| A supplied limit price must be in `(0, 1]` | `400` |
+| Polymarket requires `token_id` + `outcome` | `400` |
+
+### Response
+
+`201 Created` — `stop_loss` and `take_profit` are each an
+[order object](#order-object).
+
+```json
+{
+  "oco_group_id": "…",
+  "stop_loss":   { /* order object */ },
+  "take_profit": { /* order object */ }
+}
+```
+
+## OTO
+
+```
+POST /api/v1/conditional-orders/oto
+```
+
+Creates a **one-triggers-other** pair — an entry order plus a single
+follow-on (SL, TP, or trailing stop) that stays dormant until the entry
+fills. Distinct from [OTO bracket](#oto-bracket): this attaches exactly one
+exit leg instead of an SL+TP pair.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entry_side` | string | Yes | — | `"buy"` or `"sell"` |
+| `follow_on` | object | Yes | — | The dormant leg — see below |
+| `entry_order_type` | string | No | `"market"` | `"market"` or `"limit"` |
+| `entry_price` | number | if limit | — | Required when `entry_order_type` is `"limit"` |
+| `entry_trigger_price` | number | No | fires immediately | Wake price for the entry, in `(0, 1)` — see [Stop entries](#stop-entries) |
+
+`follow_on`:
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `kind` | string | Yes | — | `"stop_loss"`, `"take_profit"`, or `"trailing_stop"` |
+| `price` | number | SL / TP | — | Trigger price; required for SL/TP, in `(0, 1)` |
+| `trail_offset` | number | trailing | — | Required for `trailing_stop`; `> 0` |
+| `order_type` | string | No | `market` for SL, `limit` for TP, always `market` for trailing | `"market"` / `"limit"` |
+| `limit_price` | number | No | `price` | Where an SL/TP with `order_type: "limit"` rests once it triggers. Ignored for `trailing_stop` |
+
+Plus the [shared fields](#shared-fields) — `quantity` here covers both legs.
+
+<Note>
+**Gotcha: `max_slippage_cents` applies only to a market-exit follow-on**
+(`stop_loss` / `trailing_stop`), not a `take_profit`, which always rests a GTC
+limit.
+</Note>
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| `entry_side` must be `"buy"` / `"sell"` | `400` |
+| `entry_order_type` must be `"market"` / `"limit"`, and requires `entry_price` when `"limit"` | `400` |
+| `follow_on.price` in `(0, 1)` for `stop_loss` / `take_profit` | `400` |
+| `follow_on.trail_offset > 0` for `trailing_stop` | `400` |
+| `entry_trigger_price`, when supplied, must be in `(0, 1)` | `400` |
+| Polymarket requires `token_id` + `outcome` | `400` |
+
+### Response
+
+`201 Created`
+
+```json
+{
+  "entry":     { /* order object */ },
+  "follow_on": { /* order object */ }
+}
+```
+
+### Stop entries
+
+<Note>
+**Gotcha: by default an OTO entry fires on the very next tick.** It is
+compiled with the condition `true` — it does not wait for any market state.
+If you meant "enter when price reaches X", you must supply
+`entry_trigger_price`.
+</Note>
+
+Supplying `entry_trigger_price` compiles a book-side wake instead, so the entry
+stays dormant until the market reaches that price:
+
+| `entry_side` | Compiled entry condition |
+|---|---|
+| `"buy"` | `ask >= entry_trigger_price` |
+| `"sell"` | `bid <= entry_trigger_price` |
+
+This is a stop entry ("wait for price") — the whole OTO or OTO bracket stays
+armed and dormant until it wakes. The same field, with the same semantics, is
+accepted by [OTO bracket](#oto-bracket).
+
+While the wake is still pending, the dormant entry appears in
+[List conditional orders](#list-conditional-orders) with
+`kind: "bracket_entry"`. Fire-immediately entries are filtered out of that
+list entirely.
+
+## OTO bracket
+
+```
+POST /api/v1/conditional-orders/oto-bracket
+```
+
+An entry order plus **both** a stop-loss and a take-profit, all dormant until
+the entry fills. Whichever of SL/TP fills first, the other is cancelled —
+the same OCO relationship as [Bracket](#bracket-oco), gated behind the entry.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `entry_side` | string | Yes | — | `"buy"` or `"sell"` |
+| `entry_order_type` | string | No | `"market"` | `"market"` or `"limit"` |
+| `entry_price` | number | if limit | — | Required when `entry_order_type` is `"limit"` |
+| `entry_trigger_price` | number | No | fires immediately | Wake price for the entry, in `(0, 1)` — see [Stop entries](#stop-entries) |
+| `stop_loss_price` | number | fixed form | — | Stop trigger; `> 0` |
+| `take_profit_price` | number | fixed form | — | Target trigger; `> 0` |
+| `stop_loss_offset` | number | No | — | Fixed form only — see [Fill-anchored legs](#fill-anchored-legs) |
+| `take_profit_offset` | number | No | — | Fixed form only — see [Fill-anchored legs](#fill-anchored-legs) |
+| `stop_loss_atr_period` / `stop_loss_atr_mult` | number | ATR form | — | ATR-derived stop — see [ATR legs](#atr-legs) |
+| `stop_loss_atr_timeframe` | string | No | `"1m"` | Candle timeframe for the SL ATR |
+| `take_profit_atr_period` / `take_profit_atr_mult` | number | ATR form | — | ATR-derived target |
+| `take_profit_atr_timeframe` | string | No | `"1m"` | Candle timeframe for the TP ATR |
+| `stop_loss_order_type` | string | No | `"market"` | `"market"` (FAK) or `"limit"` (GTC at `stop_loss_limit_price`) |
+| `stop_loss_limit_price` | number | No | the trigger price | Where an SL-`"limit"` rests once the stop triggers |
+| `take_profit_order_type` | string | No | `"limit"` | `"limit"` (GTC) or `"market"` (FAK) |
+| `take_profit_limit_price` | number | No | the trigger price | Where a TP-`"limit"` rests once the target triggers |
+
+Plus the [shared fields](#shared-fields).
+
+<Note>
+**Gotcha: each leg is exactly one of two forms** — fixed-price (`*_price`) or
+ATR (`*_atr_period` + `*_atr_mult`). Sending both, or neither, for the same
+leg is rejected.
+</Note>
+
+#### ATR legs
+
+An ATR leg is anchored to the entry's actual fill price rather than a level
+picked before the entry filled. Supplying `stop_loss_atr_period` +
+`stop_loss_atr_mult` compiles a trigger of the form
+
+```
+price <= (entry_price - 2.0 * atr(14, "1m"))
+```
+
+where `entry_price` is injected from the entry fill. The take-profit form is
+the mirror image (`entry_price + mult * atr(...)`).
+
+`*_atr_timeframe` must be one of `1s`, `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
+and defaults to `"1m"`.
+
+<Note>
+**Gotcha: an ATR leg always fires as a market order.**
+`stop_loss_order_type` / `take_profit_order_type` are ignored on it.
+</Note>
+
+#### Fill-anchored legs
+
+On a fixed-price leg, `stop_loss_offset` / `take_profit_offset` (positive,
+in price units, strictly inside `(0, 1)`) re-anchor the leg to the actual
+entry fill: the stop fires at `entry_fill − stop_loss_offset` and the target
+at `entry_fill + take_profit_offset`. The accompanying `stop_loss_price` /
+`take_profit_price` then serves only as the provisional pre-fill level.
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| Each leg must be exactly one of the fixed-price form (`*_price`) or the ATR form (`*_atr_period` + `*_atr_mult`) | `400` |
+| `stop_loss_price` / `take_profit_price` must be `> 0` on the fixed form | `400` |
+| `*_offset` must be strictly inside `(0, 1)` | `400` |
+| `entry_trigger_price`, when supplied, must be in `(0, 1)` | `400` |
+| Polymarket requires `token_id` + `outcome` | `400` |
+
+### Response
+
+`201 Created`
+
+```json
+{
+  "oco_group_id": "…",
+  "entry":        { /* order object */ },
+  "stop_loss":    { /* order object */ },
+  "take_profit":  { /* order object */ }
+}
+```
+
+## TWAP
+
+```
+POST /api/v1/conditional-orders/twap
+```
+
+A **time-weighted average price** order: a large parent quantity sliced into
+child orders submitted at a fixed interval across a window.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `side` | string | Yes | — | `"buy"` or `"sell"` |
+| `total_quantity` | number | Yes | — | Parent quantity; `> 0`, whole number of contracts |
+| `duration_seconds` | integer | Yes | — | Window length; `30`–`21600` (30 s – 6 h) |
+| `slice_count` | integer | * | derived | Number of slices; `2`–`200` |
+| `slice_interval_seconds` | integer | * | derived | Seconds between slices; `>= 5` |
+| `style` | string | No | `"market"` | `"market"` or `"limit"` |
+| `limit_offset_cents` | integer | if limit | — | Signed cents from the same-side best; required when `style` is `"limit"` |
+| `abort_on_gap_pct` | number | No | — | Abort if price moves this % adversely from the start; `> 0` and `<= 50` |
+
+\* Supply **exactly one** of `slice_count` or `slice_interval_seconds` — the
+other is derived from `duration_seconds`.
+
+Plus the [shared fields](#shared-fields) (`fund_id`, `token_id`, `outcome`,
+`max_slippage_cents`) — `quantity` and `expires_at` do not apply.
+
+### What `style` does
+
+| `style` | Behaviour |
+|---|---|
+| `"market"` | Each slice is a fill-and-kill market order. Any unfilled remainder carries into the next slice |
+| `"limit"` | Each slice rests a limit at the same-side best `±` `limit_offset_cents`, re-priced each interval |
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| Exactly one of `slice_count` / `slice_interval_seconds` | `400` |
+| `duration_seconds` must divide evenly by whichever of `slice_count` / `slice_interval_seconds` is supplied (or derives the other), and the derived interval must be `>= 5` s | `400` |
+| `total_quantity` must divide evenly by the resolved `slice_count` | `400` |
+| `style: "limit"` requires `limit_offset_cents` | `400` |
+| Polymarket requires `token_id` + `outcome` | `400` |
+
+<Note>
+**Gotcha: the divisions must be exact.** A non-exact `duration_seconds`
+division is **rejected rather than silently truncating the schedule**, and a
+fractional per-slice quantity is **rejected rather than truncated at
+placement**. Size the window and quantity to divide cleanly.
+</Note>
+
+### Example
+
+```bash
+curl -X POST https://krisis.kairos.trade/api/v1/conditional-orders/twap \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "market_id": "KXBTCD-25",
+    "exchange_id": "kalshi",
+    "side": "buy",
+    "total_quantity": 1000,
+    "duration_seconds": 1800,
+    "slice_count": 10,
+    "style": "market"
+  }'
+```
+
+### Response
+
+`201 Created`
+
+| Field | Type | Description |
+|---|---|---|
+| `strategy_id` | uuid | The TWAP strategy id |
+| `started_at` | string | ISO 8601 schedule anchor |
+| `slice_count` | integer | Resolved slice count |
+| `slice_interval_seconds` | integer | Resolved interval |
+| `slice_quantity` | number | Quantity per slice |
+| `description` | string | Human-readable summary |
+
+## Market maker
+
+```
+POST /api/v1/conditional-orders/market-maker
+```
+
+Rests a two-sided quote — a bid at `mid − offset` and an ask at
+`mid + offset` — splitting `total_capital` 50/50 across the two sides, and
+auto-cancels/re-quotes on a refresh interval or on fill.
+
+<Note>
+**Gotcha: this one does not fire once and stop.** Unlike every other kind it
+keeps two resting orders simultaneously and does not auto-deactivate when one
+side fills. It stops only on cancel, expiry, or a `stop_loss_pct` breach.
+</Note>
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `market_id` | string | Yes | — | Market / contract identifier |
+| `total_capital` | number | Yes | — | Notional to deploy; split 50/50 bid/ask. Practical floor is `10` — each side gets half, and the smaller leg must still afford the 5-share minimum order at the 99¢ price ceiling |
+| `complement_outcome` | string | Yes | — | Label of the complement outcome (e.g. `"No"`) |
+| `exchange_id` | string | No | `"kalshi"` | `"kalshi"`, `"polymarket"`, or `"predictfun"` |
+| `variant` | string | No | `"pro"` | `"pro"` (static user-supplied mid) or `"simple"` (mid re-anchored to the live orderbook midpoint each refresh) |
+| `mode` | string | No | `"mid_tracking"` | `"mid_tracking"` or `"sticky"` (rides the best bid/ask while inside the band, never crossing `mid`) |
+| `mid_cents` | integer | pro | — | Fair-value anchor, cents; `1`–`99`. Required for `"pro"`, ignored for `"simple"` |
+| `offset_cents` | integer | * | — | Legacy static symmetric offset from `mid`, cents; `>= 1` |
+| `spread_buffer_cents` | integer | * | — | Signed buffer from the live half-spread, cents; `-3` to `3` |
+| `refresh_interval_seconds` | integer | No | `30` | Re-quote cadence; range `0`–`3600` |
+| `fund_id` | uuid | No | — | Spending fund to reserve against |
+| `token_id` | string | Polymarket | — | CLOB token id for the quoted (bid-side) outcome |
+| `outcome` | string | No | — | Label of the quoted outcome (e.g. `"Yes"`) |
+| `complement_token_id` | string | Polymarket | — | CLOB token id of the complement outcome, bought on the ask side |
+| `stop_loss_pct` | number | No | — | PnL stop as a percent of `total_capital`; `(0, 100]` |
+
+\* Supply **exactly one** of `offset_cents` (legacy static spread) or
+`spread_buffer_cents` (buffer relative to the live half-spread).
+
+On Polymarket, a binary market's two tokens sum to $1, so the ask side quotes
+by buying `complement_token_id` rather than short-selling.
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| Exactly one of `offset_cents` / `spread_buffer_cents` | `400` |
+| `"pro"` requires `mid_cents` in `[1, 99]` | `400` |
+| The resulting `bid`/`ask` must both stay inside `[1, 99]` when using `offset_cents` | `400` |
+| `spread_buffer_cents` must be in `[-3, 3]`; `offset_cents` must be `>= 1` | `400` |
+| `refresh_interval_seconds` in `[0, 3600]`; `stop_loss_pct` in `(0, 100]` | `400` |
+| Polymarket requires `token_id` + `outcome` + `complement_token_id` + `complement_outcome` | `400` |
+
+**If `stop_loss_pct` is breached** (net PnL on held inventory drops to
+`-(stop_loss_pct/100 × total_capital)`), the runner cancels both quotes,
+market-closes the position, and deactivates the strategy.
+
+### Response
+
+`201 Created`
+
+```json
+{
+  "strategy_id": "…",
+  "started_at": "2026-05-16T12:00:00Z",
+  "variant": "pro",
+  "mode": "mid_tracking",
+  "bid_price_cents": 49,
+  "ask_price_cents": 51,
+  "refresh_interval_seconds": 30,
+  "description": "MM: 49¢/51¢ band, 200 capital, 30s refresh"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `strategy_id` | uuid | The market-maker strategy id |
+| `started_at` | string | ISO 8601 anchor time |
+| `variant` | string | `"pro"` or `"simple"` |
+| `mode` | string | `"mid_tracking"` or `"sticky"` |
+| `bid_price_cents` | integer \| null | Initial resting bid; `null` for `"simple"` or for `"pro"` with `spread_buffer_cents` (band resolved live each tick) |
+| `ask_price_cents` | integer \| null | Initial resting ask; same nullability as `bid_price_cents` |
+| `refresh_interval_seconds` | integer | Resolved re-quote cadence |
+| `description` | string | Human-readable summary |
+
+## List conditional orders
+
+```
+GET /api/v1/conditional-orders
+```
+
+Returns every conditional order owned by the caller, active and inactive.
+
+<Warning>
+**Gotcha: fire-immediately OTO entries are omitted.** An entry compiled with
+the condition `true` never appears here, so absence from this list does **not**
+mean a strategy was hand-authored. An entry still waiting on its
+[`entry_trigger_price`](#stop-entries) does appear, as `kind: "bracket_entry"`.
+</Warning>
+
+### Response
+
+Array of summary objects.
+
+| Field | Type | Description |
+|---|---|---|
+| `strategy_id` | uuid | Strategy id |
+| `name` | string | Display name |
+| `kind` | string | `stop_loss` / `take_profit` / `stop_limit` / `trailing_stop` / `twap` / `market_making` / `bracket_entry` |
+| `market_id` | string | Market identifier |
+| `trigger_price` | number | Arming price |
+| `side` | string | `"buy"` or `"sell"` |
+| `order_type` | string | `"market"` or `"limit"` |
+| `quantity` | number | Contracts |
+| `is_active` | boolean | Whether the engine is still evaluating it |
+| `expires_at` | string \| null | ISO 8601 |
+| `oco_group_id` | uuid \| null | Bracket group |
+| `trigger_order_id` | uuid \| null | Entry this leg is waiting on (OTO) |
+| `resting_order_id` | uuid \| null | Venue order id of a resting `limit` SL/TP that's live on the book; `null` for market-type or not-yet-armed legs |
+| `created_at` | string | ISO 8601 |
+| `outcome` | string \| null | Polymarket outcome |
+| `token_id` | string \| null | Polymarket CLOB token id |
+| `trailing_offset` | number \| null | Trailing-stop offset |
+| `high_water_mark` | number \| null | Trailing-stop peak |
+| `low_water_mark` | number \| null | Trailing-stop trough |
+| `fund_id` | uuid \| null | Linked fund |
+| `twap_slice_count` | integer \| null | TWAP only — total slices |
+| `twap_slices_submitted` | integer \| null | TWAP only — slices submitted so far |
+| `twap_style` | string \| null | TWAP only — `"market"` / `"limit"` |
+| `twap_limit_offset_cents` | integer \| null | TWAP only — limit offset |
+| `mm_mode` | string \| null | Market-maker only — `"mid_tracking"` / `"sticky"` |
+| `mm_bid_price_cents` | integer \| null | Market-maker only — current resting bid, until the runner places a quote |
+| `mm_ask_price_cents` | integer \| null | Market-maker only — current resting ask |
+
+## Modify a conditional order
+
+```
+PATCH /api/v1/conditional-orders/{id}
+```
+
+Edits a single conditional order or one leg of a live OCO bracket in place —
+the engine picks up the new trigger on its next tick with no cancel/recreate.
+Not available for TWAP or market-maker strategies.
+
+Returns `200 OK` with the updated conditional-order object (see
+[Order object](#order-object)).
+
+### Request
+
+All fields optional; at least one is required.
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `trigger_price` | number | No | unchanged | New trigger price; `> 0`. For `trailing_stop` this sets the trailing offset instead |
+| `quantity` | number | No | unchanged | New quantity; `> 0` |
+| `order_type` | string | No | unchanged | `"market"` or `"limit"` |
+| `limit_price` | number | No | unchanged | New resting limit price (stop-limit only); `> 0` |
+| `trailing_offset` | number | No | unchanged | New trailing offset (trailing stops only); `> 0` |
+
+### Validation
+
+| Rule | Failure |
+|---|---|
+| At least one field must be present | `400` |
+| The order must currently be `is_active: true` — editing a dead row would silently no-op | `400` |
+| TWAP and market-maker strategies cannot be modified — they have no single trigger price to edit | `400` |
+| For a leg of a live OCO bracket, the new trigger must still satisfy the sell-bracket ordering (`stop_loss_price < take_profit_price`) against the still-active sibling | `400` |
+
+**If the edited leg is a resting limit take-profit** — one that's already
+live on the venue — Krisis cancels the resting order and lets the engine
+re-place it at the new price; other kinds have nothing resting yet, so the
+edit is purely a database update.
+
+## Cancel a conditional order
+
+```
+DELETE /api/v1/conditional-orders/{id}
+```
+
+Deactivates the order (`is_active = false`) rather than deleting the row, so
+it still shows in history. For a live order with a resting venue order, Krisis
+additionally sends a best-effort cancel to the exchange so the order cannot
+fill after cancellation.
+
+<Note>
+**Gotcha: cancelling one leg cancels the whole bracket by default.** If the
+order is part of an OCO bracket, **every leg in the group is deactivated**
+unless you pass `single_leg=true`.
+</Note>
+
+### Query parameters
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `single_leg` | boolean | No | `false` | `true` cancels **only** this leg. Its OCO sibling(s) stay armed as standalone strategies — Krisis clears their `oco_group_id` instead of deactivating them |
+
+### Response
+
+`204 No Content` — returned whether or not the engine had already fired or
+deactivated the order, so re-cancelling a live-but-already-dead row is safe.
+An id that does not exist (or is not yours) returns `404`.
+
+## Order object
+
+`POST /api/v1/conditional-orders` returns one of these directly; the
+`stop_loss` / `take_profit` / `entry` / `follow_on` fields of the bracket and
+OTO responses, and the response of [Modify](#modify-a-conditional-order), are
+each one of these:
+
+| Field | Type | Description |
+|---|---|---|
+| `strategy_id` | uuid | The underlying strategy id |
+| `kind` | string | Conditional kind — `stop_loss` / `take_profit` / `stop_limit` / `trailing_stop` |
+| `condition` | string | Human-readable summary of the trigger (e.g. `"Stop-loss: sell when price <= 0.4"`) |
+| `expression` | string | The generated DSL expression the engine evaluates |
+| `strategy` | object | The full strategy object — same shape as a row from [List strategies](/krisis/strategies#list-strategies), including its `legs` |
+
+```json
+{
+  "strategy_id": "80da0800-2739-4821-8e39-6f0fac4c7840",
+  "kind": "stop_loss",
+  "condition": "Stop-loss: sell when price <= 0.4",
+  "expression": "price <= 0.4",
+  "strategy": { "id": "80da0800-…", "name": "SL sell …", "legs": [ /* … */ ] }
+}
+```

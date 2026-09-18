@@ -1,0 +1,509 @@
+---
+title: "Matched Markets & Arbitrage"
+description: "Cross-venue market correlations, the matched-pair catalog, and the live arb feed"
+---
+
+Find the same underlying market listed on Polymarket, Kalshi, and Predict.fun, compare prices across venues, and stream cross-venue arbitrage opportunities — all powered by Kairos's correlation engine.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+All REST paths on this page are relative to that host. The arb feed is a WebSocket protocol on a different host — see [WebSocket arb feed](#websocket-arb-feed).
+
+## Authentication
+
+All REST endpoints on this page accept **either** a JWT (`Authorization: Bearer <token>`) **or** an API key (`X-Client-Id` / `X-Api-Key` / `X-Api-Secret` — see [API Keys](/rpc/api-keys)); an admin secret also works. None of them require an API-key scope. Session-JWT callers must additionally have passed the invite gate; API-key and admin callers bypass it.
+
+There are no anonymous endpoints on this page. The two `/sports` helpers listed under [Typical workflow](#typical-workflow) are public, but they live on the [Sports](/rest/sports) page.
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+## How matching works
+
+The arb-scanner continuously generates **embedding-verified correlations** between markets on different venues, each carrying a similarity score. Only pairs scoring **≥ 0.82** ever surface — `min_similarity` is clamped up server-side even if a caller asks for less. Correlations are symmetric and refreshed continuously; this dataset is the primary matching primitive everything below reads from.
+
+## Typical workflow
+
+1. **Page the full catalog** with [`GET /matched-markets`](#matched-markets-catalog), or use [`GET /matched-markets/enriched`](#enriched-matched-markets) when each side also needs identifiers, outcomes, and current reference pricing.
+2. **Look up counterparts for a market** with [`GET /search/simple`](#cross-venue-correlations) — every search response carries a `correlations` map of cross-venue counterparts.
+3. **Stream live opportunities** over the [market-data WebSocket's `arb` channel](#websocket-arb-feed) — a transport-bounded metadata snapshot plus live spread updates.
+4. **Sports discovery** helpers: [`GET /sports/trending-matched`](/rest/sports#trending-matched) and [`GET /sports/matching-markets`](/rest/sports#matching-markets) (both public), plus [`GET /sports/poly-kalshi-pairings`](#poly-kalshi-game-pairings) below for game-level pairing.
+5. **Execute both legs** through the [order endpoints](/rest/orders) or the [external execution lane](/external-execution/overview).
+
+## Matched markets catalog
+
+```
+GET /matched-markets
+```
+
+Page through the full catalog of verified cross-venue matched pairs — the primary way to consume the correlation dataset over REST. Draws from the verified pairs in the correlation dataset, joined against market metadata for display.
+
+**Auth:** API key, session JWT, or admin secret. **Rate limit:** 60/minute. **Cache-Control:** 10 seconds.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `50` | 1–1,000. Page size |
+| `offset` | integer | No | `0` | ≥ 0. Legacy row offset; do not combine with `cursor` |
+| `cursor` | string | No | — | Opaque, ≤ 16,384 chars. Keyset cursor; send an empty value on the first page, then pass `next_cursor` |
+| `provider` | string | No | — | Known provider name. Only pairs where either side is this provider |
+| `min_similarity` | float | No | `0.82` | 0.0–1.0; always clamped up to at least 0.82. Confidence floor |
+| `sort_by` | string | No | `similarity` | `similarity` \| `updated_at`. Sort column, descending. **Ignored in cursor mode**, which always pages by pair identity |
+| `include_total` | boolean | No | `false` | Include `total`. In offset mode this costs an extra `COUNT` query; in cursor mode it comes free from the same statement |
+
+```bash
+curl "https://data.kairos.trade/matched-markets?limit=50&provider=polymarket&cursor=&include_total=true" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "pairs": [
+    {
+      "a": {
+        "provider_id": 2,
+        "provider": "polymarket",
+        "market_id": "2793754",
+        "title": "Will Switzerland vs. Colombia end in a draw?",
+        "ticker": "",
+        "image": "https://...",
+        "icon": "https://...",
+        "expires_at": "2026-07-07T22:00:00Z",
+        "category": "Sports"
+      },
+      "b": {
+        "provider_id": 1,
+        "provider": "kalshi",
+        "market_id": "KXWCGAME-26JUL07SUICOL-TIE",
+        "title": "Switzerland vs Colombia: draw?",
+        "ticker": "KXWCGAME-26JUL07SUICOL-TIE",
+        "image": null,
+        "icon": null,
+        "expires_at": "2026-07-07T22:00:00Z",
+        "category": "Sports"
+      },
+      "similarity": 0.94,
+      "updated_at": "2026-07-08T19:20:11.000Z"
+    }
+  ],
+  "count": 1,
+  "limit": 50,
+  "offset": 0,
+  "has_more": true,
+  "next_cursor": "WyIxODM0OjIwMjYtMDgtMDUgMTI6MDA6MDAuMDAwOjk0NzEyOTM4IiwxLCJLWC4uLiIsMiwiMjc5Mzc1NCJd",
+  "catalog_version": "1834:2026-08-05 12:00:00.000:94712938",
+  "total": 1834
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `pairs[].a` / `pairs[].b` | object | The two matched sides: `provider_id`, `provider`, `market_id`, `title`/`ticker`/`image`/`icon`/`expires_at`/`category` (nullable when that side isn't mirrored into market metadata) |
+| `pairs[].similarity` | number | Confidence score, 0.82–1.0 |
+| `pairs[].updated_at` | string | Last confirmation time (ISO 8601) |
+| `count` | integer | Pairs on this page after live-status filtering — can be **less** than `limit` |
+| `has_more` | boolean | Whether the raw (pre-filter) page was full — the actual pagination stop signal |
+| `next_cursor` | string \| null | Opaque cursor for the next page; `null` on the last page. Cursor mode only — the key is absent in offset mode. |
+| `catalog_version` | string | Full-set fingerprint shared by every page in one cursor walk. Cursor mode only — the key is absent in offset mode. |
+| `total` | integer | Total verified pairs before live-status filtering; only present with `include_total=true` |
+| `limit` / `offset` | integer | Echo of the request; `offset` is always `0` in cursor mode |
+
+Pairs whose either side has expired are excluded before paging. Pairs whose either side has resolved/closed, or whose venue indexing is paused, are dropped after paging.
+
+#### Paging the catalog
+
+For a complete live catalogue, start with `cursor=` and follow `next_cursor` until `has_more` is false. The cursor walks immutable pair identity and carries `catalog_version`; one windowed ClickHouse statement derives each page and its full-set fingerprint from the same snapshot.
+
+> **Gotcha:** `count` can be less than `limit`, because live-status filtering happens after paging. `has_more` — not `count` — is the stop signal, and legacy offset callers must advance `offset` by `limit`, never by `count`.
+
+> **Gotcha:** a `409` means the next page belongs to a different generation. Discard every accumulated page and restart from `cursor=`; you cannot resume mid-walk.
+
+**Errors:** `400` for an unknown `provider`, an undecodable `cursor`, an invalid `sort_by`, or `cursor` combined with a non-zero `offset`; `409` when a cursor generation changes and must be restarted; `503` when the correlation store is unreachable (fail-fast — never a silently degraded page). Full table under [Errors](#errors).
+
+## Enriched matched markets
+
+```
+GET /matched-markets/enriched
+```
+
+Returns the verified catalog with indexed identifiers, outcomes, and current reference pricing attached to both sides. Use this endpoint when a client needs immediately tradeable identifiers without making separate `/markets/details` and `/markets/batch-prices` calls.
+
+**Auth:** API key, session JWT, or admin secret. **Rate limit:** 60/minute. **Cache-Control:** `no-store`.
+
+### Request
+
+The request parameters and cursor restart semantics match [`GET /matched-markets`](#matched-markets-catalog) — `offset`, `cursor`, `provider`, `min_similarity`, `sort_by`, and `include_total` all behave identically. One row differs:
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer | No | `50` | 1–150. Page size, capped at **150 pairs** to bound request cost |
+
+<Note>
+**Gotcha:** the 150 cap is not a clamp. `limit=151` returns a `422`, not a silently reduced page.
+</Note>
+
+```bash
+curl "https://data.kairos.trade/matched-markets/enriched?limit=50&cursor=" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "pairs": [
+    {
+      "a": {
+        "provider_id": 2,
+        "provider": "polymarket",
+        "market_id": "2793754",
+        "title": "Will Switzerland vs. Colombia end in a draw?",
+        "ticker": "",
+        "image": null,
+        "icon": null,
+        "expires_at": "2026-07-07T22:00:00Z",
+        "category": "Sports",
+        "details": {
+          "market_id": "2793754",
+          "provider_id": 2,
+          "event_id": "switzerland-colombia",
+          "name": "Will Switzerland vs. Colombia end in a draw?",
+          "category": "sports",
+          "status": "open",
+          "condition_id": "0x...",
+          "token_id": "123...",
+          "token_ids": ["123...", "456..."],
+          "outcomes": ["Yes", "No"]
+        },
+        "pricing": {
+          "price": 0.54,
+          "volume": "1.2M",
+          "liquidity": 50000.0
+        }
+      },
+      "b": { "...": "same enriched side shape" },
+      "similarity": 0.94,
+      "updated_at": "2026-07-08T19:20:11.000Z"
+    }
+  ],
+  "count": 1,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false,
+  "next_cursor": null,
+  "catalog_version": "1834:2026-08-05 12:00:00.000:94712938"
+}
+```
+
+Every key in the catalog response is also present here — including `next_cursor` and `catalog_version` in cursor mode — with `details` and `pricing` added to each side.
+
+`details` is `null` when no market resolves for that side. `pricing` is best-effort and is `null` for unsupported markets, missing quotes, a non-positive price, or an unavailable venue; those conditions never remove a verified pair.
+
+`pricing.price` is the venue's current reference price on a **0–1 decimal scale** (Kalshi cents are divided by 100 on the way in) and is not an executable bid or ask. `pricing.volume` is a pre-formatted display string (e.g. `"1.2M"`), not a number; `pricing.liquidity` is a number.
+
+A `503` means matched-market or enrichment data could not be loaded.
+
+## Cross-venue correlations
+
+```
+GET /search/simple
+```
+
+Every `/search/simple` response is enriched with a `correlations` map: for each result market, its cross-venue counterparts (matched above a similarity threshold, capped at 4 per result). This is the REST way to answer "is this market also listed on the other venue, and at what confidence?" alongside a normal search.
+
+**Auth:** API key, session JWT, or admin secret. **Rate limit:** 60/minute (the shared `search` limit group).
+
+### Request
+
+The full parameter set covers general search (`offset`, `tags`, `statuses`, `sort_by`, `sort_order`, `include_total`, `include_expired`, …) — see [Search](/rest/search) and the [API Reference](/api-reference) for all of it. Parameters relevant to matching:
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `q` | string | Yes | — | 1–200 chars. Search query |
+| `limit` | integer | No | `20` | 1–1000. Max results |
+| `provider` | string | No | — | Known provider name; legacy alias `provider_id`. Filter results by provider |
+| `group_results` | boolean | No | `true` | Group markets by event server-side. When true the body also carries `groups` and `singles`; `correlations` is attached either way |
+
+```bash
+curl "https://data.kairos.trade/search/simple?q=switzerland%20colombia&limit=20&group_results=true" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+Abridged — the full envelope is `{results, meta, groups?, singles?, correlations?}`; only the correlation-specific parts are shown.
+
+```json
+{
+  "results": [
+    { "market_id": "2793754", "provider_id": 1, "title": "Will Switzerland vs. Colombia end in a draw?" }
+  ],
+  "meta": { "query": "switzerland colombia", "returned": 1, "query_time_ms": 12.4 },
+  "correlations": {
+    "2793754": [
+      {
+        "provider_id": 8,
+        "market_id": "431377",
+        "similarity": 1.0,
+        "method": "embedding",
+        "title": "Switzerland vs Colombia: draw?",
+        "ticker": "KXWCGAME-26JUL07SUICOL-TIE",
+        "expires_at": "2026-07-07T22:00:00Z"
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `correlations` | object | Map of result `market_id` → up to 4 counterpart markets, sorted by similarity descending. Keyed on `market_id` alone, so it is also populated from `groups[].markets` and `singles`, not just `results`. |
+| `correlations.<id>[].provider_id` | integer | Counterpart's numeric provider ID |
+| `correlations.<id>[].market_id` | string | Counterpart's market ID on that provider |
+| `correlations.<id>[].similarity` | number | Confidence score, 0.82–1.0 |
+| `correlations.<id>[].method` | string | How the pair was matched (e.g. `embedding`) |
+| `correlations.<id>[].title` / `ticker` / `image` / `icon` / `expires_at` | string | Display fields, present only when a live market row was found for the counterpart |
+
+`correlations` is attached best-effort — it's simply absent if no counterparts were found (or if the lookup failed), and never blocks or degrades the main search result. Counterparts whose market has resolved/closed, or whose venue's indexing is paused, are dropped; a counterpart with no market row is kept but arrives without the display fields.
+
+## WebSocket arb feed
+
+Filtered matched-pair snapshots and live spread updates stream over the [market-data WebSocket](/websocket/market-data-websocket) (`wss://stream.kairos.trade`).
+
+This is a WebSocket protocol, not a `data.kairos.trade` REST route — it has no entry in the [API Reference](/api-reference), and **there is no curl example for it**: the transport is a binary protobuf stream, so it cannot be exercised with an HTTP request. API-key auth is supported on the upgrade, same headers as above.
+
+Match snapshots are bounded by the NATS payload ceiling and prioritise metadata referenced by live spreads; use [`GET /matched-markets`](#matched-markets-catalog) when a complete browse catalogue is required.
+
+### Subscribing
+
+Subscribe with the fixed contract id/provider `arb`, topic `arb`, and an `arb_subscription` filter — the server applies it before sending either batch, so clients never see the global arb set:
+
+```protobuf
+SubscribeRequest {
+  contract_id: "arb"
+  provider: "arb"
+  topics: ["arb"]
+  arb_subscription: {
+    subscription_id: "my-arbs"
+    filter: {
+      provider_pairs: [{ a_provider: PROVIDER_KALSHI, b_provider: PROVIDER_POLYMARKET }]
+      min_spread_bps: 100
+      min_similarity_scaled: 8000
+      min_arb_liquidity_scaled: 0
+      categories: []
+    }
+  }
+}
+```
+
+<Note>
+**Gotcha:** the two list filters have **opposite empty semantics**. An empty `provider_pairs` matches nothing — send all three combinations to get everything — while an empty `categories` means every category.
+</Note>
+
+`min_arb_liquidity_scaled` filters on `max_arb_liquidity_scaled`; zero disables liquidity filtering. **Unverified fail-open matches carry `similarity_scaled = 0`**, never a fabricated perfect-confidence score.
+
+### Subscription lifecycle
+
+Subscriptions support a full connection-scoped lifecycle:
+
+| Action | How |
+|---|---|
+| Create | `SubscribeRequest` with a new `subscription_id` |
+| Read / bootstrap | `FetchRequest.arb_subscription_id` — returns `SubscribedResponse` plus cached filtered batches |
+| Update | Resend `SubscribeRequest` with the same id and new filters |
+| Delete | `UnsubscribeRequest.arb_subscription_id` |
+
+### `0x0D` ArbMatchList
+
+Two binary message types follow, both using `[1-byte tag][protobuf]` framing, as with all market-data messages. `ArbMatchList` is the metadata snapshot.
+
+Envelope fields: `timestamp_us`, `count`, `matches[]`, `subscription_id`, `category_counts[]`.
+
+Each `ArbMatch` carries:
+
+| Field | Description |
+|---|---|
+| `a_provider` / `b_provider` | The two venues in the pair |
+| `a_market_id` / `b_market_id` | Market ID on each venue |
+| `a_name` / `a_label` (and the `b_` equivalents) | Display name and label for each side |
+| `a_price_yes` / `b_price_yes` | Yes-side price, scaled ×10,000 |
+| `a_expires_at_sec` / `b_expires_at_sec` | Expiry as a unix timestamp in **seconds** |
+| `spread_bps` | Cross-venue spread, in basis points |
+| `event_title` / `clean_title` | Event titles for display |
+| `similarity_scaled` | Confidence score, scaled ×10,000 |
+| `liquidity` | Liquidity on the pair |
+| `max_arb_liquidity_scaled` | Dollar notional, scaled ×10,000 |
+
+`count` and `category_counts[]` describe the catalogue *before* your subject filter is applied, so they will exceed what you actually receive.
+
+### `0x0E` ArbSpreadList
+
+`ArbSpreadList` is the authoritative active-opportunity snapshot.
+
+Envelope fields: `timestamp_us`, `count`, `subscription_id`, and `opportunities[]`.
+
+<Note>
+**Gotcha:** `ArbSpreadList` uses **`opportunities[]`, not `matches[]`** — and you must replace local state on every batch, including an empty one. Merging batches leaves dead opportunities on screen.
+</Note>
+
+An `ArbSpread` uses the same scaled price/similarity/liquidity conventions as `ArbMatch` but a trimmed field set:
+
+| Difference | Detail |
+|---|---|
+| Removed | `a_name`, `a_label`, `event_title` |
+| Added | `direction`, `title`, `category` |
+
+See the [Protobuf Reference](/websocket/protobuf-reference) for full schemas.
+
+## Poly-Kalshi game pairings
+
+```
+GET /sports/poly-kalshi-pairings
+```
+
+Server-side Polymarket ↔ Kalshi pairing index for currently-live games. The correlations feed keys on individual markets; this endpoint keys on games, useful for lining up whole live events across venues. Falls back to a last-known-good snapshot if the live Kalshi game cache is empty.
+
+**Auth:** API key, session JWT, or admin secret. **Rate limit:** 100/minute (this route carries no limit decorator, so it falls back to the service-wide default). **Cache-Control:** `public, max-age=10`.
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/poly-kalshi-pairings" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "pairings": [
+    {
+      "polyGameId": "10078222",
+      "polySport": "mlb",
+      "kalshiEventTicker": "KXMLBGAME-26JUN041410SFMIL",
+      "kalshiLeague": "MLB",
+      "kalshiMilestoneId": "MILESTONE-4521",
+      "kalshiMarkets": [
+        {
+          "ticker": "KXMLBGAME-26JUN041410SFMIL-SF",
+          "title": "Giants at Brewers",
+          "yes_sub_title": "Giants win",
+          "price": 46.5,
+          "volume": 12045.0,
+          "image": null,
+          "eventTicker": "KXMLBGAME-26JUN041410SFMIL"
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `pairings[].polyGameId` | string | Polymarket game identifier |
+| `pairings[].polySport` | string | Sport key on Polymarket (e.g. `mlb`, `nba`) |
+| `pairings[].kalshiEventTicker` | string | Kalshi event ticker for the same game |
+| `pairings[].kalshiLeague` | string | League label on Kalshi (e.g. `MLB`) |
+| `pairings[].kalshiMilestoneId` | string | Kalshi milestone identifier |
+| `pairings[].kalshiMarkets[]` | array | Flattened Kalshi markets for the event — `ticker`, `title`, `yes_sub_title`, `price`, `volume`, `image`, `eventTicker`. Covers the moneyline (home/away, plus draw for soccer) and every spread and total line. |
+
+> **Gotcha:** Kalshi prices in `kalshiMarkets` are rescaled to **0–100**, not the 0–1 scale used elsewhere in this API, to match a legacy response shape. They are rounded to 1 decimal, and a missing price is `0.0`, not `null`.
+
+> **Gotcha:** `volume` is always `0.0` on moneyline and draw entries — per-side volume isn't exposed at that level upstream. Only spread and total lines carry a real figure.
+
+An empty `pairings` array is normal (no live games, or no matches found); the endpoint has no "no data" error.
+
+## Combo-eligible markets
+
+```
+GET /sports/combo-markets
+```
+
+Catalog of combo-eligible markets — Polymarket markets (combos are Polymarket-only) whose YES/NO legs can be combined into multi-leg positions. Each entry carries the condition id and both position ids needed to build a leg.
+
+**Auth:** API key, session JWT, or admin secret. **Rate limit:** 200/minute (the shared `market_data` limit group). **Cache-Control:** `public, max-age=300`.
+
+### Request
+
+No parameters.
+
+```bash
+curl "https://data.kairos.trade/sports/combo-markets" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+### Response
+
+```json
+{
+  "markets": [
+    {
+      "id": "587234",
+      "conditionId": "0xabc123...",
+      "yesPositionId": "108972340000000000000000000000000000000000000000000000000000000001",
+      "noPositionId": "108972350000000000000000000000000000000000000000000000000000000001",
+      "slug": "nba-lal-bos-2026-01-15-bos",
+      "title": "Celtics -4.5",
+      "tags": ["nba", "spread"]
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `markets[].id` | string | Polymarket market ID |
+| `markets[].conditionId` | string | On-chain condition ID |
+| `markets[].yesPositionId` | string | Position ID of the YES leg |
+| `markets[].noPositionId` | string | Position ID of the NO leg |
+| `markets[].slug` | string | Market slug |
+| `markets[].title` | string | Market title |
+| `markets[].tags` | array | Category tags |
+
+Served straight from Kairos's own store — this endpoint never calls Polymarket, so an empty `markets` array means the catalog is empty, not that an upstream is down.
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`. Two shapes deviate: 422s use FastAPI's standard validation envelope, and 429s use `{ "error": "Rate limit exceeded: <limit>" }` alongside `X-RateLimit-*` and `Retry-After` headers. An unhandled server fault returns a generic `500 An internal error occurred. Please try again later.`
+
+The Code column holds the exact `detail` string the service returns; `—` means the response carries no fixed string.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 400 | `Unknown provider 'acme'` | Unknown `provider` on `/matched-markets` or `/matched-markets/enriched` | Use a known provider name and resend — deterministic; retrying unchanged returns the same error. |
+| 400 | `sort_by must be one of ['similarity', 'updated_at']` | `sort_by` outside the allowed set | Send `similarity` or `updated_at`. In cursor mode `sort_by` is ignored anyway. |
+| 400 | `cursor and non-zero offset cannot be combined` | `cursor` sent together with a non-zero `offset` | Pick one paging mode: drop `offset`, or drop `cursor`. |
+| 400 | `invalid matched-markets cursor` | `cursor` is not decodable, or decodes to the wrong structure | Restart the walk from `cursor=`; pass back only a `next_cursor` you received verbatim. |
+| 400 | `Search query cannot be empty` | `/search/simple`: empty `q`, invalid `provider`, or invalid `sort_by`/`sort_order` | Fix the parameter and resend. |
+| 401 | `Authentication required (JWT token / API key / admin secret)` | No credentials, or `X-Client-Id` sent without `X-Api-Key`/`X-Api-Secret` | Send a JWT, all three API-key headers together, or the admin secret. |
+| 403 | `Invite required` | Session-JWT caller has not passed the invite gate | Use an API key or the admin secret — both bypass the gate. |
+| 409 | `matched-markets catalogue changed between cursor pages` | The eligible correlation set changed mid-walk | Discard accumulated pages and restart from `cursor=`. Resuming from the last cursor is not valid. |
+| 422 | — | FastAPI parameter validation failure — `limit` outside 1–1,000 (1–150 on `/enriched`), negative `offset`, `min_similarity` outside 0.0–1.0, `cursor` over 16,384 chars, missing `q` | Fix the parameter and resend — the `/enriched` `limit` cap is a rejection, not a clamp. |
+| 429 | — | Rate limit exceeded | Back off and retry; `Retry-After` says how long. 429s themselves do not consume quota. |
+| 500 | `Search query failed` | `/search/simple` backend failure | Retry; report to support with the response body if it persists. |
+| 500 | `An internal error occurred. Please try again later.` | Unhandled fault on `/sports/poly-kalshi-pairings` or `/sports/combo-markets` — neither wraps its backing store, so a Redis or ClickHouse failure surfaces as the generic 500 rather than a 503 | Retry once the backing store recovers; do not read this as a data-availability signal. |
+| 503 | `Correlation store unavailable` | Correlation store unreachable — `/matched-markets` and `/matched-markets/enriched` fail fast rather than serve a degraded page | Retry later. The page you did not get is missing entirely, not partially filled. |
+| 503 | `Market enrichment unavailable` | Enrichment (details/pricing) could not be loaded — `/matched-markets/enriched` only | Retry, or fall back to `/matched-markets` for the unenriched pairs. |
+
+The correlation attachment on `/search/simple` is the one exception: it is fail-open, so a correlation-store failure drops the `correlations` key instead of erroring.

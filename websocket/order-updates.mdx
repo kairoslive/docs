@@ -1,0 +1,601 @@
+---
+title: "Order Updates"
+description: "Real-time order status updates, fills, positions, and balance changes via WebSocket"
+---
+
+Receive real-time order status updates, fill notifications, position changes, and balance updates over the order execution WebSocket. Connect to it whenever you need to know what happened to your orders without polling REST. The same socket also carries the [Order Execution](/websocket/order-execution) commands and the [Fee Quote (RFQ)](/websocket/fee-quote) stream — one connection, three surfaces.
+
+## Connecting
+
+```
+wss://execution.kairos.trade/ws
+```
+
+### Authentication
+
+Authenticate during the WebSocket upgrade using one of two methods. The presence of an `X-Client-Id` header switches the server into API-key mode; otherwise it expects a JWT.
+
+**API Key Authentication:**
+
+Include credentials as HTTP headers on the upgrade request:
+
+```
+X-Client-Id: kairos_ck_...
+X-Api-Key: <64 hex chars>
+X-Api-Secret: <64 hex chars>
+```
+
+If `X-Client-Id` is present but `X-Api-Key` or `X-Api-Secret` is missing or invalid, the upgrade is rejected with `401 Unauthorized`.
+
+**JWT Authentication:**
+
+Use the standard `Authorization` header if your client supports it (non-browser clients):
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+Since browsers cannot set custom headers on WebSocket upgrades, pass the JWT via the `Sec-WebSocket-Protocol` header instead:
+
+```
+Sec-WebSocket-Protocol: authorization, Bearer_<base64url(jwt_token)>
+```
+
+Encode the complete JWT as base64url without `=` padding. A `Bearer.<standard
+base64>` form is also accepted. The server echoes
+`Sec-WebSocket-Protocol: authorization` on the 101 response. JWTs that are
+expired or revoked (via `/auth/logout`) are rejected at upgrade time and
+revalidated while the connection remains open — see
+[Errors & Disconnection](#errors-disconnection).
+
+<Warning>
+**Credentials are never read from query parameters.** They leak into logs,
+browser history, and `Referer` headers, so that path was removed.
+</Warning>
+
+### Welcome Message
+
+On successful connection, the server sends:
+
+```json
+{
+  "type": "connected",
+  "connection_id": "a1b2c3d4-...",
+  "user_id": "your-user-id",
+  "polymarket_builder_code": "0x<public bytes32>"
+}
+```
+
+`polymarket_builder_code` is the public attribution value required by the
+one-shot `submit_signed_order` flow. Include the identical value in the request
+and in the signed EIP-712 `Order.builder` field.
+
+All messages on this WebSocket are **JSON text frames**. Events are filtered per-user; you only receive events for your own orders and positions.
+
+### A complete connect example
+
+```javascript
+import WebSocket from "ws";
+
+const ws = new WebSocket("wss://execution.kairos.trade/ws", {
+  headers: {
+    "X-Client-Id": process.env.KAIROS_CLIENT_ID,
+    "X-Api-Key": process.env.KAIROS_API_KEY,
+    "X-Api-Secret": process.env.KAIROS_API_SECRET,
+  },
+});
+
+ws.on("message", (data) => {
+  const event = JSON.parse(data.toString());
+  switch (event.type) {
+    case "connected":
+      console.log("connected as", event.user_id);
+      break;
+    case "status_changed":
+      console.log(event.order_id, event.old_status, "->", event.new_status);
+      break;
+    case "filled":
+      // fill_id is the dedupe key — the same fill can arrive more than once
+      console.log("fill", event.fill_id, event.filled_quantity, "@", event.price);
+      break;
+    default:
+      break; // Unknown types are safe to ignore
+  }
+});
+
+ws.on("close", (code) => {
+  // 1000 / 1001 / 1006 — reconnect with backoff, then reconcile over REST
+  console.log("closed", code);
+});
+```
+
+### API-key event filtering
+
+API-key connections receive an event only when the key has the required scope and, for provider-scoped events, [platform access](/guides/authentication#platform-access) to that event's originating provider.
+
+| Events | API-key requirement |
+|--------|---------------------|
+| `status_changed`, `partially_filled`, `filled`, `failed`, `fill_hint` | `trade:read` plus access to `exchange_id` |
+| `position_updated`, `position_redeemed`, `position_resolved` | `position:read` plus access to `exchange_id` |
+| Polygon `pusd` `balance_updated` | `position:read` plus Polymarket access |
+| Other `balance_updated` | `position:read` |
+| `setup_completed`, `ctf_action_completed` | `trade:execute` plus access to `exchange_id` |
+
+<Warning>
+**Gotcha: filtered-out events are silently omitted.** The server does not
+send an error frame when a scope or platform check fails, so a missing event
+class looks identical to an idle account. API-key connections also do not
+receive in-app `notification` events or legacy `status_changed` events
+without an `exchange_id`. JWT connections are unaffected by scope and
+platform-event filtering.
+</Warning>
+
+---
+
+## Server Events
+
+### status_changed
+
+Sent whenever an order transitions between statuses. Includes full order details so the frontend can update instantly without an HTTP fetch.
+
+```json
+{
+  "type": "status_changed",
+  "order_id": "550e8400-...",
+  "user_id": "your-user-id",
+  "status": "live",
+  "old_status": null,
+  "new_status": "live",
+  "filled_quantity": "0",
+  "avg_fill_price": null,
+  "error": null,
+  "exchange_order_id": "0xabc...",
+  "exchange_id": "polymarket",
+  "market_id": "570362",
+  "token_id": "12345",
+  "outcome": "Yes",
+  "kind": "limit",
+  "side": "buy",
+  "price": "0.45",
+  "size": "100",
+  "time_in_force": "GTC",
+  "holding_wallet": "0x..."
+}
+```
+
+`holding_wallet` is the wallet that will hold the order's shares. It matters when one market is held in two wallets (a Kairos wallet plus an imported predict.fun account, or a Polymarket EOA plus a Safe): those are two positions, and without this field an order shows under both.
+
+<Warning>
+**Gotcha: `holding_wallet` is absent until the executor resolves it.** An
+early `queued`/`pending` transition legitimately predates it, so treat "no
+holder" as "do not decide" and fall back to matching on market/token.
+</Warning>
+
+A failing transition may also carry `error_code`, `error_classification`, and a
+structured `error_details` object (the same contract as the REST
+`POST /orders` error response). All three are omitted when absent rather than
+sent as `null`.
+
+### partially_filled
+
+Sent when part of your order fills. The order status becomes `partial`.
+
+```json
+{
+  "type": "partially_filled",
+  "order_id": "550e8400-...",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "status": "partial",
+  "filled_quantity": "60",
+  "remaining_quantity": "40",
+  "avg_fill_price": "0.45"
+}
+```
+
+### filled
+
+Sent when an individual fill occurs on your order.
+
+Each fill has its own `fill_id`; partial fills from the same order share the
+same `order_id`.
+
+```json
+{
+  "type": "filled",
+  "order_id": "550e8400-...",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "fill_id": "fill_abc123",
+  "filled_quantity": "100",
+  "price": "0.45",
+  "fee": "0.25",
+  "exchange_fee": "0.81"
+}
+```
+
+`fee` is the Kairos platform fee for this fill. `exchange_fee` is the fee
+charged by the venue, normalized to USD. Both are non-negative decimal strings.
+`exchange_fee` is `null` when the venue does not report its fee on the live fill;
+the trade-history response is updated when reconciliation obtains it.
+
+### position_updated
+
+Sent after a fill to reflect your updated position, including unrealized PnL.
+
+```json
+{
+  "type": "position_updated",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "market_id": "570362",
+  "token_id": "12345",
+  "holding_wallet": "0x...",
+  "position_id": "uuid",
+  "outcome": "Yes",
+  "condition_id": null,
+  "chain_id": "137",
+  "net_size": "100",
+  "avg_entry_price": "0.45",
+  "cost_basis": "45.00",
+  "total_fees": "0.25",
+  "first_entry_at": 1710000000,
+  "last_trade_at": 1710000100,
+  "last_trade_at_ms": 1710000100123,
+  "last_trade_price": "0.46",
+  "order_ids": ["550e8400-..."],
+  "unrealized_pnl": "2.50",
+  "unrealized_pnl_percent": "5.55",
+  "current_price": "0.475",
+  "current_value": "47.50",
+  "realized_pnl": "0.00",
+  "redeemable": false,
+  "bot_id": null
+}
+```
+
+<Note>
+**Gotcha: position identity is `(exchange_id, market_id, token_id,
+holding_wallet)`.** The same market held in two wallets is two positions — a
+sell routes to one wallet — so keying on market/token alone merges the rows
+and double-counts shares. `holding_wallet` is `null` only for legacy rows
+with no holder recorded.
+</Note>
+
+`last_trade_at_ms` is the millisecond-precision twin of the second-truncated `last_trade_at`; same-second updates are unorderable without it.
+
+### balance_updated
+
+Sent when your wallet balance changes (after fills, deposits, etc.). Events with a `tx_hash` indicate on-chain balance changes; events without `tx_hash` are internal adjustments from trade execution.
+
+`token` is `"usdc"` or `"pusd"` on Polygon (`chain: "polygon"`), or `"usdc"` on Solana (`chain: "solana"`). `"pusd"` is the Polymarket V2 trading collateral — track pUSD balance events for up-to-date buying power.
+
+```json
+{
+  "type": "balance_updated",
+  "user_id": "your-user-id",
+  "chain": "polygon",
+  "token": "pusd",
+  "wallet_address": "0x...",
+  "new_balance": "1250.00",
+  "tx_hash": "0x..."
+}
+```
+
+### failed
+
+Sent when an order fails to execute.
+
+```json
+{
+  "type": "failed",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "order_id": "550e8400-...",
+  "error": "Insufficient balance",
+  "message": "Insufficient balance"
+}
+```
+
+### setup_completed
+
+Sent when an exchange setup (wallet preparation, token approvals) completes.
+
+```json
+{
+  "type": "setup_completed",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "wallet_address": "0x...",
+  "success": true
+}
+```
+
+### position_redeemed
+
+Sent when a resolved market position is redeemed on-chain.
+
+```json
+{
+  "type": "position_redeemed",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "condition_id": "0x...",
+  "token_id": "12345",
+  "amount": "100.00",
+  "tx_hash": "0x..."
+}
+```
+
+<Note>
+**Match on `token_id`.** `condition_id` is frequently empty on Polymarket
+position rows, so matching on it alone leaves a stale Redeem button.
+</Note>
+
+### position_resolved
+
+Sent the instant an on-chain resolution is applied to a position you still
+hold. This is the only signal for a resolution that does not involve a
+redemption — `position_updated` carries no resolved flag and
+`position_redeemed` fires only on an actual redeem.
+
+```json
+{
+  "type": "position_resolved",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "condition_id": "0x...",
+  "token_id": "12345",
+  "redeemable": true,
+  "net_size": "5.011",
+  "realized_pnl": "-1.25"
+}
+```
+
+`redeemable` reflects the post-resolution state (a winner is `true`). For a
+retired loser `net_size` is `"0"` and `realized_pnl` carries the booked loss.
+Both are decimal strings.
+
+### ctf_action_completed
+
+Sent when a conditional-token split or merge completes on-chain.
+
+```json
+{
+  "type": "ctf_action_completed",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "condition_id": "0x...",
+  "action": "split",
+  "amount": "25.00",
+  "tx_hash": "0x..."
+}
+```
+
+### fill_hint
+
+Optimistic, **non-authoritative** fill hint emitted from low-latency signal paths (e.g. mempool / preconfirmation watchers). Use it to nudge the UI early; do not treat it as a confirmed fill. A subsequent `filled` / `partially_filled` / `status_changed` event is the authoritative confirmation.
+
+```json
+{
+  "type": "fill_hint",
+  "user_id": "your-user-id",
+  "exchange_id": "polymarket",
+  "wallet_address": "0x...",
+  "tx_hash": "0x...",
+  "token_id": "12345",
+  "market_id": "570362",
+  "side": "buy",
+  "phase": "preconfirmed",
+  "confidence": "high",
+  "idempotency_key": "unique-key"
+}
+```
+
+Deduplicate on `idempotency_key`. If no confirming event arrives within a reasonable window, treat the hint as expired and roll back any optimistic UI state.
+
+### notification
+
+In-app notification pushed to the connected client.
+
+```json
+{
+  "type": "notification",
+  "user_id": "your-user-id",
+  "notification_type": "order_filled",
+  "title": "Order Filled",
+  "body": "Your buy order for 100 Yes contracts has been filled.",
+  "payload": { "order_id": "550e...", "fill_id": "fill_abc..." },
+  "idempotency_key": "unique-key"
+}
+```
+
+### Event Types Reference
+
+| Event Type | Description |
+|------------|-------------|
+| `connected` | Welcome message on successful connection |
+| `status_changed` | Order status transition (primary status notification) |
+| `partially_filled` | Partial fill with remaining quantity |
+| `filled` | Individual fill event with fill details |
+| `position_updated` | Updated position after a fill |
+| `balance_updated` | Wallet balance change |
+| `failed` | Order execution failure |
+| `setup_completed` | Exchange setup completed |
+| `position_redeemed` | Resolved position redeemed |
+| `position_resolved` | Market resolved on a position you still hold |
+| `ctf_action_completed` | Conditional-token split or merge completed |
+| `fill_hint` | Optimistic (non-authoritative) fill hint |
+| `notification` | In-app notification |
+| `pong` | Response to client ping |
+
+---
+
+## Keepalive
+
+Send a ping to keep the connection alive or measure latency:
+
+```json
+{"type": "ping"}
+```
+
+The server responds:
+
+```json
+{
+  "type": "pong",
+  "timestamp": "2026-02-06T12:00:00Z"
+}
+```
+
+The server also sends WebSocket-level `Ping` frames every 30 seconds to keep the connection alive through load balancers (the AWS load balancer idles a connection out at 60 seconds). Your WebSocket library should respond with `Pong` automatically; if it doesn't, the server will eventually drop the connection. The server likewise answers a client-sent protocol-level `Ping` with a `Pong`.
+
+The same 30-second tick is where the server re-checks JWT expiry and session
+revocation, so a revoked identity is cut within one interval.
+
+---
+
+## Delivery, ordering, and recovery
+
+The event stream is a low-latency **hint**, not a ledger. REST (`GET /orders`,
+`GET /positions`) is the source of truth whenever you need certainty.
+
+### Order Lifecycle Examples
+
+**Limit order that fills over time**
+
+```
+1. POST /orders or WS submit_order  -> order submitted
+2. WS: status_changed               -> queued -> live
+3. WS: partially_filled             -> 60/100 filled (status: "partial")
+4. WS: position_updated             -> net_size: 60
+5. WS: balance_updated              -> new USDC balance
+6. WS: filled                       -> 100/100 filled
+7. WS: status_changed               -> partial -> filled
+8. WS: position_updated             -> net_size: 100
+9. WS: balance_updated              -> final USDC balance
+```
+
+**Market order that fills immediately**
+
+```
+1. POST /orders or WS submit_order  -> order submitted
+2. WS: status_changed               -> queued -> filled
+3. WS: filled                       -> 100/100 filled
+4. WS: position_updated             -> net_size: 100
+5. WS: balance_updated              -> new USDC balance
+```
+
+Internal statuses (`queued`, `locked`, `executing`, `orphaned`) are reported as `pending` in REST API responses but may appear as distinct `status_changed` transitions on the WebSocket.
+
+### Multiple Connections
+
+If you have multiple connections open for the same user (e.g. across several tabs, processes, or devices), **every** connection receives **every** event for your user. Cross-instance relaying is de-duplicated by origin so one event is not fanned out twice.
+
+<Note>
+**Gotcha: events are not deduplicated per client.** There is no per-client
+delivery ledger, so the same event can reach you more than once. Dedupe on
+the identifiers the events carry — `fill_id`, `order_id`, and
+`idempotency_key` on `fill_hint` / `notification` — rather than assuming
+exactly-once delivery.
+</Note>
+
+### Dropped events under lag
+
+<Note>
+**Gotcha: a slow reader silently loses events.** Events are delivered from a
+bounded in-process broadcast channel. A connection that reads too slowly is
+**not** disconnected — it silently misses the events that aged out while it
+was behind, and delivery resumes with the newest ones. There is no gap marker
+on the wire, so reconcile over REST whenever correctness matters.
+</Note>
+
+---
+
+## Errors & Disconnection
+
+The order execution WebSocket can reject the upgrade, push a per-command error, or close the socket at any time. Clients MUST handle all three cases and reconnect with backoff.
+
+### Upgrade-time rejections (HTTP status before 101)
+
+| HTTP Status | When it happens | What to do |
+|-------------|-------|------------------------------|
+| `401 Unauthorized` | `Missing authorization`, `Invalid authorization header format`, `Invalid token`, `Token expired`, `Token has been revoked`, `Invalid API credentials`, `API credential has been revoked` | Refresh credentials and retry. Do NOT retry the same token. |
+| `403 Forbidden` | `IP not whitelisted` (API key with an IP allowlist) or `Insufficient scope` | Stop retrying — fix the caller or the key. |
+| `429 Too Many Requests` | `Too many authentication attempts`, or the per-user connection limit ([Connection Limits](#connection-limits)) | Close other tabs / connections and retry with backoff. |
+| `500 Internal Server Error` | `Authentication configuration error` / `Internal authentication error` | Retry with backoff; if persistent, this is a server-side fault. |
+
+The response body is JSON: `{"error":"<reason>", ...}`. The connection-limit
+`429` additionally carries `max_allowed` and `current_count`.
+
+### Per-command errors (`order_error` frame)
+
+Commands that fail (validation error, scope check, missing order, exchange error, etc.) return an `order_error` JSON frame on the same connection — see [Order Execution → submit_order error response](/websocket/order-execution#submit_order). The connection normally **stays open**; only the offending command is rejected. An expired/revoked JWT detected before a command is the exception: the server sends a `401` `order_error` and terminates the connection. Always correlate the response with your command via `request_id`.
+
+Programmatic clients should branch on `error_details.code` (when present) rather than the human-readable `error` string.
+
+### Malformed client messages
+
+Invalid JSON and a missing or unknown `type` are silently ignored. If a
+recognized command has an invalid envelope — most commonly a missing or
+non-string `request_id` — you receive:
+
+```json
+{
+  "type": "order_error",
+  "request_id": "<echoed-if-parseable, else \"unknown\">",
+  "error": "Invalid command format: missing required fields (type, request_id)",
+  "status": 400
+}
+```
+
+This silent-ignore behavior for unknown types is intentional for forward
+compatibility.
+
+### Server-initiated close codes
+
+| Close code | When it happens | What to do |
+|------------|-------|------------------------------|
+| `1000` (normal) | Server shutdown / graceful close | Reconnect after a short delay. |
+| `1001` (going away) | Server restarting | Reconnect with backoff. |
+| `1006` (abnormal) | Underlying TCP/TLS dropped | Reconnect with exponential backoff (1s, 2s, 4s, …, cap 30s) and jitter. |
+
+<Note>
+**Gotcha: there is no custom auth close code on this socket.** The periodic
+heartbeat detects an expired/revoked JWT within 30 seconds and sends
+`Close(None)`. A pre-command check instead sends a `401` `order_error`, then
+terminates the connection without explicitly sending a close frame. In both
+cases, refresh the JWT before reconnecting.
+</Note>
+
+### Recommended reconnect / resync flow
+
+1. On any close, wait at least 500 ms before reconnecting; on repeated failures use exponential backoff up to 30 s with jitter.
+2. If reconnect returns `401`, refresh your JWT (or API key) before the next attempt.
+3. After reconnecting, call `GET /orders?status=live` (and `GET /positions`) to reconcile any events that fired while you were disconnected — the WebSocket does not replay missed events.
+4. Continue matching incoming events to in-flight commands by `request_id` and `client_order_id`; idempotency on the server means re-submitting with the same `client_order_id` is safe.
+
+---
+
+## Limits
+
+### Connection Limits
+
+| Limit | Value |
+|-------|-------|
+| Max connections per user | 10 (an API key carrying a `ws.maxConnections` override uses that value instead) |
+| Max inbound frame / message size | 64 KiB |
+
+Connections are counted per **user**, so two API keys owned by the same account
+share one budget. Exceeding the limit returns `429 Too Many Requests` on upgrade
+with a body of `{"error":"Maximum WebSocket connections exceeded","max_allowed":N,"current_count":N}`.
+
+---
+
+## Best Practices
+
+- Always listen on the WebSocket for order status. Do not poll `GET /orders` in a tight loop.
+- The `status_changed` event is the primary status notification. `filled` and `partially_filled` provide fill-specific details.
+- **Handle reconnections gracefully.** On reconnect, call `GET /orders?status=live` to sync state for any events missed during the disconnection.
+- Listen for `notification` events to display user-facing alerts (e.g., fill confirmations, errors).
+- Use `client_order_id` on submissions and match it to WebSocket events for reliable tracking.

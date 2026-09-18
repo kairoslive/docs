@@ -1,0 +1,280 @@
+---
+title: "CTF Operations"
+description: "Split, merge, and redeem conditional-token positions on-chain, across exchanges"
+---
+
+Move between **collateral** and a market's **outcome tokens** directly on-chain, without going through the order book. Outcome tokens are issued by the **CTF** — the on-chain conditional-token contracts behind each market — and these three endpoints operate on them directly: **split** mints a complete outcome-token set from collateral, **merge** burns one back into collateral before resolution, and **redeem** converts winning tokens into collateral after the market resolves. Each is an on-chain transaction, and a successful response carries a `tx_hash`.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://execution.kairos.trade
+```
+
+## Authentication
+
+Same API-key headers as [Orders](/rest/orders). These are fund-moving operations and require the `trade:execute` scope.
+
+```
+X-Client-Id: kairos_ck_...
+X-Api-Key: <64 hex chars>
+X-Api-Secret: <64 hex chars>
+```
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+**Identity is resolved server-side from the authenticated caller, not the request body.** `user_id`, `turnkey_org_id`, and `wallet_address` are all optional: omit them and the signer wallet is looked up from the authenticated user; if you send them anyway they must match the authenticated identity (a mismatch is rejected `403` with `error_details.code = AUTH_IDENTITY_MISMATCH`, naming the offending field), and they can never widen scope to another user's wallet.
+
+API keys carry no Turnkey organization, so a `turnkey_org_id` sent with API-key auth is simply ignored — the organization is read from your account, and the field is never grounds for rejection on that auth method. A `turnkey_org_id` only has to match for session-JWT callers, whose token carries one. Omitting the field is always the simplest call.
+
+All three endpoints sit behind a mutation gate that runs before user auth, so an API-key triple that fails to authenticate here is a **`403`**, not a `401`. They also require the caller's installed Turnkey trading policies to be current — see `AUTH_POLICY_OUTDATED` in [Errors](#errors).
+
+## Exchange support
+
+Availability is also readable per venue: `GET /exchanges/{exchange_id}/capabilities` returns `supports_redemption`, which is `true` only for `polymarket` and `predictfun`.
+
+| Exchange (`exchange_id`) | Split | Merge | Redeem | Collateral |
+|---|---|---|---|---|
+| `polymarket` | yes | yes | yes | USDC.e / pUSD |
+| `predictfun` | yes | yes | yes | USDC / wrapped-collateral (yield variants) |
+| `kalshi` | — | — | — | Off-chain settlement — no on-chain CTF, and no redeem endpoint |
+| `opinion` | — | — | — | — |
+
+All three actions require an **on-chain** CTF, so only `polymarket` and `predictfun` are wired. Kalshi settles off-exchange and needs no redemption call.
+
+<Warning>
+**Gotcha:** any other `exchange_id` — including `kalshi` and `opinion` — has no handler registered and returns **`404`** (`VALIDATION_MARKET_NOT_FOUND`) on split, merge, and redeem alike. It is not a `400`, so do not treat an unsupported venue as a malformed request.
+</Warning>
+
+## Concepts
+
+- **Complete set** — one YES + one NO of the same market is always worth exactly **1 unit of collateral**, regardless of resolution. Split mints a complete set from collateral; merge burns one back. Both legs settle **1:1**, so the implied per-token cost basis is **0.5**.
+- **NegRisk** — multi-outcome markets whose `conditionId` was issued by Polymarket's / predict.fun's NegRisk contracts. They route through the venue-specific adapter automatically — see [NegRisk markets](#negrisk-markets).
+- **Holding wallet** — deposit-wallet users hold tokens on their on-chain proxy/Safe; EOA users hold them directly. The endpoint resolves the correct holder for you.
+
+## Split
+
+```
+POST /exchanges/{exchange_id}/ctf/split
+Scope: trade:execute
+```
+
+Converts `amount` of collateral into `amount` YES **and** `amount` NO tokens. This does **not** open a market position — it mints equal tokens on every outcome.
+
+Auth: API key or session JWT, scope `trade:execute`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` (path) | string | Yes | — | `polymarket` or `predictfun`; any other value returns `404` |
+| `condition_id` | string | Yes | — | `0x…`. CTF `conditionId` of the market |
+| `amount` | number | Yes | — | > 0; non-positive is rejected `400`. Units of collateral to split (= tokens minted on each side) |
+| `market_id` | string | No | — | Only enriches the synthetic trade-log legs with YES/NO token ids. When omitted the market is resolved from `condition_id`; if it cannot be resolved either way the on-chain action still succeeds and only the history enrichment is skipped |
+| `user_id` | string | No | — | Ignored unless it conflicts with the authenticated caller |
+| `turnkey_org_id` | string | No | — | Ignored unless it conflicts with the authenticated caller |
+| `wallet_address` | string | No | — | Overrides the server-resolved wallet only if owned by the caller; omit to let it resolve automatically |
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/ctf/split \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "condition_id": "0x1234abcd…",
+    "market_id": "570362",
+    "amount": 100
+  }'
+```
+
+### Response
+
+```json
+{
+  "tx_hash": "0xabc…",
+  "amount": 100,
+  "condition_id": "0x1234…",
+  "action": "split",
+  "success": true
+}
+```
+
+`action` is always the lowercase `"split"` / `"merge"`.
+
+<Note>
+**Gotcha:** `tx_hash` is nullable. Branch on `success` rather than assuming a hash is present.
+</Note>
+
+## Merge
+
+```
+POST /exchanges/{exchange_id}/ctf/merge
+Scope: trade:execute
+```
+
+Burns `amount` YES **and** `amount` NO tokens and returns `amount` collateral. Requires holding **at least `amount` of every outcome token** — this is how you recover capital from matched inventory without waiting for resolution.
+
+Auth: API key or session JWT, scope `trade:execute`.
+
+### Request
+
+Identical to [Split](#split): `condition_id`, `market_id`, `amount`, plus the optional identity-override fields.
+
+**Example — free up capital from 290 YES + 290 NO:**
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/ctf/merge \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "condition_id": "0x1234abcd…",
+    "market_id": "570362",
+    "amount": 290
+  }'
+```
+
+Burns 290 YES + 290 NO and returns ~290 collateral to the wallet.
+
+### Response
+
+```json
+{
+  "tx_hash": "0xdef…",
+  "amount": 290,
+  "condition_id": "0x1234…",
+  "action": "merge",
+  "success": true
+}
+```
+
+## Redeem
+
+```
+POST /exchanges/{exchange_id}/redeem
+Scope: trade:execute
+```
+
+After a market **resolves**, converts the winning outcome tokens into collateral. Unlike merge, this only needs the **winning** side and only works once the market has resolved on-chain — losing shares are worthless and not redeemable.
+
+Auth: API key or session JWT, scope `trade:execute`.
+
+<Note>
+Polymarket auto-redeems winners by default when enabled — see [Copy Trading](/trading/copy-trading). Use this endpoint to redeem on demand.
+</Note>
+
+This redeems a single market's outcome tokens. Multi-leg parlay positions are a different instrument with their own redemption call — see [`POST /combo/redeem`](/rest/combo#redeem-a-combo).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `exchange_id` (path) | string | Yes | — | `polymarket` or `predictfun`; any other value returns `404` |
+| `condition_id` | string | Yes | — | CTF `conditionId` of the resolved market. This is what Polymarket redeems against |
+| `market_id` | string | predict.fun: yes | — | Locates the position when `position_id` is omitted. **Required on `predictfun`, which redeems by numeric market id** — a `0x…` or non-decimal value is rejected `400` |
+| `position_id` | string | No | — | Must be a UUID (`400`) and must be your own, on this exchange, and not already redeemed — it is an authorization boundary, checked before any signing. Position row to mark redeemed after success |
+| `token_id` | string | No | — | Locates the position if `position_id` is omitted |
+| `user_id`, `turnkey_org_id`, `wallet_address` | string | No | — | Same identity-override rules as [Split](#split) |
+
+The position is only marked redeemed when either `position_id`, or both `market_id` and `token_id`, are supplied.
+
+```bash
+curl -X POST https://execution.kairos.trade/exchanges/polymarket/redeem \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "condition_id": "0x1234abcd…",
+    "market_id": "570362",
+    "token_id": "12345678901234567890"
+  }'
+```
+
+### Response
+
+```json
+{
+  "tx_hash": "0xabc…",
+  "amount_redeemed": 100,
+  "success": true
+}
+```
+
+<Note>
+**Gotcha:** `db_update_failed: true` appears only when the **on-chain redeem succeeded** but the position-state DB write failed after retries. The funds are safe — only the bookkeeping needs a retry, which the caller should perform itself.
+</Note>
+
+## NegRisk markets
+
+Multi-outcome (NegRisk) markets are detected from the `conditionId` and routed through the appropriate adapter automatically — no flag needed:
+
+- **Polymarket** — CLOB-v2 NegRisk split, merge, and redeem use `NegRiskCtfCollateralAdapter` at `0xadA2005600Dec949baf300f4C6120000bDB6eAab`. It exposes the standard five-argument CTF split/merge ABI, accepts **pUSD** at the caller boundary, and returns pUSD directly. Kairos never sends new actions to the deprecated CLOB-v1 adapter.
+- **predict.fun** — has four contract sets across **yield × NegRisk**. The endpoint picks the conditional-token contract and collateral per `(is_yield_bearing, is_neg_risk)`: non-yield non-NegRisk uses the shared CTF + USDC; yield variants use the yield-bearing CT; NegRisk variants route through the NegRiskAdapter with wrapped collateral. All resolved internally from market metadata.
+
+The caller only ever provides `condition_id` + `market_id`; routing is automatic.
+
+## Gas & signing
+
+- Transactions are signed by Kairos's custodial signer, under the caller's resolved account.
+- **Deposit-wallet** users execute **gaslessly** through the relayer (tokens held on the proxy/Safe). For **EOA** holders the action is gas-sponsored where eligible; otherwise the wallet pays gas.
+- All three actions are **idempotent at the chain level** by nature — re-issuing a merge/redeem for already-consumed tokens simply has nothing left to burn/redeem.
+
+## How actions appear in your history
+
+Split and merge are recorded into your orders/trades/positions exactly like fills, so balances stay consistent:
+
+- **Split** → two synthetic **BUY** legs at price **0.5** (N collateral → N YES + N NO).
+- **Merge** → two synthetic **SELL** legs at price **0.5** (N YES + N NO → N collateral).
+
+A merge correctly **reduces** your YES and NO positions and credits the collateral, and shows up in [Trading Data](/rest/trading-data) and PnL like any other execution.
+
+## Errors
+
+Most CTF / redeem failures return the same Order Execution envelope as [Orders — Errors](/rest/orders#errors):
+
+```json
+{
+  "error": "This market hasn't settled on-chain yet",
+  "code": "ValidationMarketNotSettledOnChain",
+  "error_details": {
+    "code": "VALIDATION_MARKET_NOT_SETTLED_ON_CHAIN",
+    "message": "This market hasn't settled on-chain yet",
+    "details": "Market 0x… not yet finalised on-chain (payoutNumerators all zero); try again after the UMA dispute window closes",
+    "actions": [{ "action": "retry", "label": "Try Again", "primary": true }]
+  }
+}
+```
+
+Match on `error_details.code` (SCREAMING_SNAKE_CASE). Top-level `code` is a legacy PascalCase debug string. `error_details.details` and `error_details.metadata` are **omitted when absent**, never `null`.
+
+Several rejections on these paths are raised as a bare status and then wrapped, so they arrive with a generic code and the literal message `"Request failed with status <n>"`. **Treat the status as authoritative on this page** and use `error_details.code` for the cases below where a specific code is named.
+
+The Code column holds the `error_details.code` value.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `VALIDATION_INVALID_ORDER` | Non-positive `amount`, non-UUID `position_id`, `market_id`/`token_id` that disagree with the located position, a non-numeric `market_id` on a predict.fun redeem, or no active wallet on file for the caller | Fix the field and resend — retrying it unchanged returns the same error |
+| `400` | `FUNDS_INSUFFICIENT_USDC` / `FUNDS_INSUFFICIENT_BALANCE` | Kairos itself determined the collateral (split) or outcome-token (merge) balance is short. **Not a `402`** — this service never returns `402` | Add collateral, or reduce `amount` to what you actually hold |
+| `403` | `AUTH_IDENTITY_MISMATCH` | `user_id`, `turnkey_org_id` (JWT callers) or `wallet_address` names something other than the authenticated account | The message says which field; omitting it is the fix |
+| `403` | `AUTH_INSUFFICIENT_SCOPE` | API key missing `trade:execute`, or API-key access to that venue is disabled | Grant `trade:execute` or re-enable that venue for the key, then resend |
+| `403` | `AUTH_POLICY_OUTDATED` | Installed Turnkey trading policies are behind the version this path requires | Update the policies — `actions` includes `update_policies` — then resend |
+| `403` | `AUTH_CREDENTIALS_INVALID` | The `position_id` is not yours or belongs to another exchange, or the API-key triple failed the mutation gate | Not retryable as sent. Use one of your own positions on this exchange, or fix the API-key triple |
+| `404` | `VALIDATION_MARKET_NOT_FOUND` | No CTF/redemption handler for that `exchange_id` — this is what split/merge/redeem on `kalshi` or `opinion` returns | Use `polymarket` or `predictfun`; check `supports_redemption` from `GET /exchanges/{exchange_id}/capabilities` first |
+| `409` | `VALIDATION_MARKET_NOT_SETTLED_ON_CHAIN` | Venue shows resolved, but on-chain payouts are still all zero (common while a dispute window is open) | Transient — wait and retry; do **not** treat as a permanent failure |
+| `409` | `INTERNAL_ERROR` | The position is already marked redeemed (redeem only) | Nothing left to do — the redeem already happened |
+| `409` | `INTERNAL_ERROR` | **Split/merge only:** a wedged sponsored request or a position/ledger disagreement | Determinate — every retry hits the same record, so escalate instead of retrying |
+| `500` | `INTERNAL_ERROR`, `DATABASE_ERROR`, `SIGNATURE_ERROR` | Unexpected fault, or a sponsored **redeem** that needs manual review (`message` is `"This payout needs manual review"` with `contact_support`) | Do not blindly retry wedged sponsored requests; contact support with the response body |
+| `502` | `EXCHANGE_ERROR`, `NETWORK_ERROR`, `ALLOWANCE_CTF_NOT_SET`, `ALLOWANCE_USDC_NOT_SET`, `FUNDS_INSUFFICIENT_BALANCE` | On-chain submission failed (no `tx_hash`). A chain/venue-reported missing approval or short balance is classified here too, from the failure text | Usually safe to retry — but read `error_details.code` first: an allowance or balance code needs the approval set or the size reduced, not a retry |
+| `503` | `INTERNAL_ERROR` | The action is disabled by a circuit breaker (split, merge and redeem are gated independently, per exchange), gas sponsorship / allowance preparation failed, or the API-key provider-access lookup was unavailable | Retry later; nothing was submitted on-chain |
+| `504` | `NETWORK_TIMEOUT` | Upstream timeout | Retry — all three actions are idempotent at the chain level, so a re-issue for already-consumed tokens has nothing left to burn/redeem |
+
+<Note>
+**Gotcha:** a `502` here is not always a transport fault. Missing-approval and short-balance conditions reported by the chain or venue are classified as `502` from the failure text, so read `error_details.code` before retrying.
+</Note>
+
+**Client tip:** surface `error_details.message` when present. A bare transport failure has no useful reason; an over-long internal detail should not be shown verbatim in a toast.

@@ -1,0 +1,277 @@
+---
+title: "Streaming and recovery"
+description: "The live v2 book wire contract, sequencing, and client recovery"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, and the WebSocket half by
+`PERPETUALS_V2_ENABLED`, which is derived from the same rollout flag. Both
+are on in production and staging today; a gateway with the flag off carries
+no `perps_book` topic at all. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+The complete wire contract for consuming live perpetual books: how to
+subscribe, how to decode the binary frame, and the exact ordering rule that
+keeps your local book correct across reconnects.
+
+<Note>
+**Beta:** Perpetual order books use one canonical contract,
+`kairos.v2.BookSnapshot`. Perps are not dual-published on v1 and v2.
+</Note>
+
+Prediction-market channels continue to use their existing v1 messages. The
+control request used to subscribe is also still the existing v1
+`SubscribeRequest`; the perpetual data frame it selects is v2.
+
+## Subscribe
+
+Connect with the public market-data subprotocol:
+
+```text
+wss://stream.kairos.trade
+Sec-WebSocket-Protocol: kairos.marketdata.public.v1
+```
+
+Staging exposes the same contract at `wss://staging-stream.kairos.trade`.
+
+Send the normal binary subscribe control frame:
+
+```text
+[0x10] [kairos.v1.SubscribeRequest protobuf]
+```
+
+Example logical request:
+
+```text
+contract_id: "hl-mainnet-btc-usdt"
+provider: "hyperliquid_perps"
+topics: ["perps_book"]
+```
+
+| Field | Value |
+|---|---|
+| `contract_id` | The **canonical** Kairos instrument id from `GET /perpetuals/instruments` — not the venue-native id the REST snapshot takes |
+| `provider` | `hyperliquid_perps`, `polymarket_perps`, or `kalshi_margin` |
+| `topics` | Must contain `perps_book` explicitly |
+
+> **`perps_book` is never implied.** It is not included when `topics` is empty.
+> Request it by name.
+
+> **The WebSocket takes the canonical id; the REST snapshot takes the
+> venue-native one.** `hl-mainnet-btc-usdt` here, `BTC` there. Sending the
+> wrong one to the WebSocket does not produce an error — see below.
+
+> **The provider slug differs from the REST path segment.** `hyperliquid_perps`
+> on the WebSocket, `hyperliquid` on REST. See
+> [Venue normalization](/perpetuals/venue-normalization#one-venue-four-namespaces).
+
+On success the gateway replays the cached frame **before** sending the
+`Subscribed` acknowledgment (`0x14`), so a data frame arriving ahead of the ack
+is expected, not a protocol violation.
+
+## Subscribe errors
+
+A rejected control request comes back as a binary control frame:
+
+```text
+[0x17] [kairos.v1.ErrorResponse protobuf]
+```
+
+`ErrorResponse` carries a `message` and an `action` (`subscribe` or
+`unsubscribe`).
+
+| `message` | When it happens | What to do |
+|---|---|---|
+| `Unknown subscription topic: <value>` | A `topics` entry the gateway does not recognize | Send `perps_book` |
+| `perps_book requires provider hyperliquid_perps, polymarket_perps, or kalshi_margin` | `perps_book` requested with any other provider, including the prediction-market `hyperliquid` | Use the perps slug. `hyperliquid` means HIP-4 outcome markets |
+| `Provider identifier is invalid` | `provider` is not a safe transport token | Send one of the three literal slugs |
+| `contract_id is not a valid market identifier` | `contract_id` is not a safe transport token | Send the canonical instrument id from `GET /perpetuals/instruments` |
+
+> **⚠ There is no "unknown instrument" error**
+>
+> The gateway validates the provider against the perpetual set and the id as a
+> transport token. It does **not** check the id against the catalog. A
+> misspelled instrument is acknowledged like any other subscription and then
+> simply never delivers a frame.
+>
+> Identity is enforced one layer down, on the data path — the NATS subject, the
+> provider enum, and `InstrumentRef.instrument_id` must all agree, and a
+> mismatch is dropped **silently** rather than reported to you.
+>
+> If a subscription goes quiet, verify the instrument id before suspecting the
+> network.
+
+## Data frame
+
+Each perpetual book is a binary WebSocket frame:
+
+```text
+[0x40] [0x02] [kairos.v2.BookSnapshot protobuf]
+```
+
+| Byte | Meaning |
+|---|---|
+| `0x40` | Perpetual book snapshot message tag |
+| `0x02` | Perpetual wire version 2 |
+| remaining bytes | Serialized `kairos.v2.BookSnapshot` |
+
+<Warning>
+**Reject a frame if either prefix byte is unknown, and do not pass the
+version byte to protobuf decoding.** Both bytes are envelope, not payload.
+</Warning>
+
+The source schema is `kairos/v2/market_data.proto` in the `kairos-proto`
+repository, vendored at `proto/` in the monorepo. Generate bindings from that
+file; do not reproduce the message by hand.
+
+## Snapshot semantics
+
+Every frame is a complete replacement for the declared `book_view_id`.
+`feed_mode` is `BOOK_FEED_MODE_SNAPSHOT_ONLY`, including Kalshi: Kairos applies
+venue updates internally and emits the resulting full book.
+
+Important fields:
+
+| Field | Consumer use |
+|---|---|
+| `instrument` | Stable provider, instrument, venue ID, assets, environment, integration, and quantity unit |
+| `event_time_ns` | Optional venue event time |
+| `received_time_ns` | Kairos receive time; always present |
+| `source_epoch` | Monotonic owner-and-connection lineage fence |
+| `sequence` | Kairos sequence, monotonic per instrument inside one epoch |
+| `source_sequence` | Optional venue cursor; never substitute it for `sequence` |
+| `bids`, `asks` | Exact, ordered levels |
+| `source` | Producer, connection, ingest region, and delivery context |
+| `feed_mode` | Always `BOOK_FEED_MODE_SNAPSHOT_ONLY` |
+| `transport_sequence_domain` | Scope of `source_sequence`; `<provider>:connection` |
+| `book_view_id` | Identity of the published book view; `full-depth-<max_depth>` |
+| `max_depth` | Maximum levels per side declared by this book view |
+| `aggregation` | `price` |
+| `checksum` | Defined but never populated for perpetuals |
+
+`source` is fully populated and fully checked: `source_cell_id`,
+`latency_domain_id`, `ingest_region`, `producer_id`
+(`orderbook_streamer:<provider>`), and `connection_id` must all be non-empty,
+`source_mode` must be `SOURCE_MODE_DIRECT`, and a live frame must carry
+`DELIVERY_PHASE_REALTIME`. A frame that fails any of these is dropped before
+fan-out.
+
+`InstrumentRef.provider` uses the perpetual-specific enum. For example, a
+request uses the slug `hyperliquid_perps`, the internal subject venue is
+`hyperliquid`, and the protobuf provider is `PROVIDER_HYPERLIQUID_PERPS`.
+These are deliberate namespaces, not aliases to guess at runtime.
+
+## Exact decimals
+
+Each price and quantity is:
+
+```text
+value = coefficient × 10^(-scale)
+```
+
+For example, `coefficient: "600001", scale: 1` means `60000.1`. Canonical
+encoding has no leading zeroes, removes fractional trailing zeroes, and encodes
+zero only as `("0", 0)`. Book prices and quantities are positive.
+
+<Warning>
+**Use a decimal or integer-plus-scale type, and never route 64-bit
+timestamps or sequences through a JavaScript `number`.** See
+[Exact values and time](/perpetuals/exact-values-and-time#exact-decimals).
+</Warning>
+
+## Ordering algorithm
+
+Keep state per `(provider, instrument_id)`:
+
+```text
+if incoming.source_epoch < current.source_epoch:
+    drop
+if incoming.source_epoch == current.source_epoch:
+    if incoming.sequence <= current.sequence:
+        drop
+    replace the book
+if incoming.source_epoch > current.source_epoch:
+    discard the old lineage
+    replace the book
+```
+
+The gateway applies the same fence before fan-out. **Clients should still apply
+it**, because reconnects can cross gateway replicas and buffered application
+work can complete out of order.
+
+An upstream reconnect changes `source.connection_id` and advances
+`source_epoch`; `sequence` then restarts at 1 inside that new lineage. A
+streamer ownership transfer advances the owner portion of the epoch, so a
+process restart cannot resume beneath a gateway's cached cursor.
+
+`source_epoch` is composed, not a counter:
+
+```text
+source_epoch = owner_epoch × 1,000,000 + session_ordinal
+```
+
+`owner_epoch` is the cross-process ownership fence; `session_ordinal` counts
+upstream socket generations beneath one owner, starting at 1. That reserved
+range is why a reconnect can restart `sequence` at 1 without ever looking stale
+to a long-lived gateway.
+
+<Warning>
+**Treat `source_epoch` as opaque and compare it only for ordering.** Do not
+decompose it, and do not assume a `sequence` reset means data loss — check
+the epoch first.
+</Warning>
+
+## Initial state and reconnect
+
+At startup the gateway creates an ordered JetStream consumer with
+latest-per-subject delivery over the `PERPETUAL_BOOK_CHECKPOINTS` stream. Each
+recovered snapshot is validated as a live frame, *then* rewritten to
+`DELIVERY_PHASE_RECOVERY_REPLAY` and re-serialized, and placed in the same
+epoch/sequence-fenced cache as live data. When a client subscribes, it receives
+that frame immediately if one is cached, then continues with live replacements.
+
+<Note>
+**`source.delivery_phase` is the only field that distinguishes a replayed
+frame from a realtime one.** `DELIVERY_PHASE_RECOVERY_REPLAY` versus
+`DELIVERY_PHASE_REALTIME`.
+</Note>
+
+On reconnect:
+
+1. Resubscribe with the same provider, canonical instrument ID, and
+   `perps_book` topic.
+2. Accept a cached snapshot only through the epoch/sequence algorithm above.
+3. Replace the local book atomically.
+4. Continue with strictly newer snapshots.
+
+### NATS subjects
+
+The internal compacted recovery subject is:
+
+```text
+md.v2.perpetual.checkpoint.book.<venue>.<instrument>
+```
+
+The live subject is:
+
+```text
+md.v2.perpetual.book.snapshot.<venue>.<instrument>
+```
+
+Subject tokens use canonical uppercase percent encoding for characters outside
+`[A-Za-z0-9_-]`. Application clients normally do not construct NATS subjects;
+they subscribe through the WebSocket provider/instrument fields.
+
+## Backpressure
+
+Snapshots replace state, so a client may coalesce queued snapshots only by
+keeping the greatest `(source_epoch, sequence)` for the same instrument.
+
+<Warning>
+**Never compare or coalesce sequences across instruments.** Bound your queues
+and reconnect when processing lag violates your freshness requirement.
+</Warning>
+
+Next: [Venue normalization](/perpetuals/venue-normalization).

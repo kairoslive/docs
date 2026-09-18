@@ -1,0 +1,280 @@
+---
+title: "Candles"
+description: "OHLCV history from 1-second to 1-day resolution, JSON or binary"
+---
+
+OHLCV candles for any contract, from 1-second to 1-day resolution. Use
+`GET /v1/candles` for one series, `POST /v1/candles/batch` for up to 200 at
+once, and the [binary format](#binary-format) when JSON parsing is your
+bottleneck.
+
+## Get candles
+
+```
+GET /v1/candles
+```
+
+Returns one OHLCV series for one outcome of one contract.
+
+**Auth:** none required — works on the anonymous
+[free tier](/market-data/authentication). `light` bucket, cost
+`1 + 1 per 5,000 requested bars`.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | yes | — | `kalshi`, `polymarket`, `predictfun`, `hyperliquid` |
+| `contract_id` | string | yes | — | Market/contract id, max 128 characters. Polymarket also accepts the `0x…` [condition id](/learn/glossary) |
+| `timeframe_seconds` | integer | yes | — | One of `1`, `60`, `300`, `900`, `3600`, `14400`, `86400` |
+| `start` | string | yes | — | ISO 8601 (`2026-07-15T00:00:00Z`), a bare datetime, or a bare date — the latter two are read as UTC |
+| `end` | string | yes | — | Same formats as `start`. Must be after `start` |
+| `outcome` | integer | no | `0` | Outcome index. `0` is the first outcome (e.g. YES), `1` the second (NO) |
+| `fmt` | string | no | JSON | `binary` returns the columnar frame instead of JSON. Same effect as the `Accept` header — see [Binary format](#binary-format) |
+
+### Example
+
+```bash
+curl -G https://md.kairos.trade/v1/candles \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=1897067" \
+  --data-urlencode "timeframe_seconds=300" \
+  --data-urlencode "start=2026-07-14T00:00:00Z" \
+  --data-urlencode "end=2026-07-15T00:00:00Z"
+```
+
+Add your credentials to raise the budget:
+
+```bash
+curl -G https://md.kairos.trade/v1/candles \
+  -H "X-Client-Id: $CLIENT_ID" \
+  -H "X-Api-Key: $API_KEY" \
+  -H "X-Api-Secret: $API_SECRET" \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=1897067" \
+  --data-urlencode "timeframe_seconds=300" \
+  --data-urlencode "start=2026-07-14T00:00:00Z" \
+  --data-urlencode "end=2026-07-15T00:00:00Z"
+```
+
+### Response
+
+```json
+{
+  "candles": [
+    {
+      "contract_id": "1897067",
+      "timeframe_seconds": 300,
+      "bucket_start": "2026-07-14T00:30:00+00:00",
+      "open": 52, "high": 52.5, "low": 51, "close": 51.25,
+      "volume": 531,
+      "token_id": "77891685052…"
+    }
+  ]
+}
+```
+
+Prices are on the **0–100 scale** (probability × 100). `volume` is in
+contracts.
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `304` | — | `If-None-Match` matched a cacheable response | Reuse your cached body. Batch responses never `304` |
+| `400` | `invalid_request` | Missing or unknown `provider`; missing or over-long `contract_id`; a `timeframe_seconds` outside the seven valid values; unparseable `start`/`end`; `end` not after `start`; a negative `outcome` | Fix the named parameter. Retrying unchanged will fail again |
+| `401` / `403` / `429` | — | Credential or budget problem | See [Authentication](/market-data/authentication#errors) |
+| `500` | `internal` | `candle fetch failed` | Retry with backoff |
+| `503` | `rate_limiter_unavailable` | The rate limiter is down; the API fails closed | Retry with backoff |
+
+### Behavior
+
+- **Half-open windows, bucket-aligned.** `start` floors to a bucket boundary;
+  `end` mid-bucket extends to include the current bucket, and is then clamped
+  to at most one bucket past now. A request ending "now" includes the live,
+  still-forming bar. A window that aligns to nothing is widened to exactly one
+  bucket rather than rejected.
+- **Sparse series.** Buckets with no trades are omitted. Gaps in the array
+  reflect periods with no trading. An empty `candles` array is a valid `200` —
+  the window is authoritatively empty, not an error.
+- **Range caps per timeframe.** `start` is clamped, never rejected:
+
+  | Timeframe | Maximum lookback |
+  |---|---|
+  | 1s | 1 day |
+  | 1m | 30 days |
+  | 5m | 90 days |
+  | 15m | 180 days |
+  | 1h, 4h | 365 days |
+  | 1d | 730 days |
+
+  1-second data older than 24 hours is not retained — a 1s window entirely
+  older than that returns `{"candles": []}` without querying anything.
+- **Rollups.** Only 1s and 1m bars are stored; 5m, 15m, 1h, 4h and 1d are
+  aggregated from the 1m base on the fly. If that comes back empty, 1m, 1h, 4h
+  and 1d retry against the 1s base (which is what gives brand-new contracts a
+  series); 5m and 15m have no such retry.
+- **Multi-outcome markets.** Pass `outcome` to select the token; each outcome
+  has independent OHLC.
+- **Caching.** A window still in progress is `no-store`; a recent window is
+  cached briefly; a fully historical one is cached for a day. The latter two
+  carry a strong ETag and honor `If-None-Match` with a `304`.
+
+<Note>
+**Send `kalshi`, not the `kalshi_offchain` alias.** The alias takes a legacy
+path that derives outcome 1 as `100 − price` instead of reading its own
+series. On a multi-outcome Kalshi market that is the wrong number.
+</Note>
+
+## Batch
+
+```
+POST /v1/candles/batch
+```
+
+Fetches up to **200 series per call** in one round trip, each with its own
+provider, contract, timeframe, and window.
+
+**Auth:** none required. `light` bucket, cost `1` up front plus `1 per 5,000
+bars` summed over every item.
+
+### Request
+
+Body: JSON, at most 4 MiB.
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `requests` | array | yes | — | 1–200 items, each shaped like the `GET /v1/candles` query parameters |
+| `items` | array | no | — | Legacy alias for `requests`. Used only when `requests` is absent or empty |
+
+### Example
+
+```bash
+curl -X POST https://md.kairos.trade/v1/candles/batch \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      { "provider": "polymarket", "contract_id": "1897067",
+        "timeframe_seconds": 3600,
+        "start": "2026-07-14T00:00:00Z", "end": "2026-07-15T00:00:00Z" },
+      { "provider": "predictfun", "contract_id": "10909",
+        "timeframe_seconds": 60,
+        "start": "2026-07-14T22:00:00Z", "end": "2026-07-15T00:00:00Z" }
+    ]
+  }'
+```
+
+### Response
+
+Results come back index-aligned with per-item errors — one bad request doesn't
+fail the batch:
+
+```json
+{
+  "results": [
+    { "index": 0, "candles": [ … ] },
+    { "index": 1, "candles": [], "error": "unknown provider \"…\"" }
+  ]
+}
+```
+
+### Errors
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | Unreadable or invalid body, an empty `requests`/`items`, or more than 200 items | Fix the body. Per-item validation failures do *not* land here |
+| `401` / `403` / `429` | — | Credential or budget problem | See [Authentication](/market-data/authentication#errors) |
+| `500` | `internal` | `all batch items failed` — *every* item errored | Inspect the items you sent; the whole-call failure means none of them were serviceable |
+| `503` | `rate_limiter_unavailable` | The rate limiter is down; the API fails closed | Retry with backoff |
+
+> **A single item's failure never fails the call.** It comes back inside a
+> `200` as `{"index": n, "candles": [], "error": "…"}`. Check every item's
+> `error` field; do not infer success from the HTTP status alone.
+
+> **Batch overage is charged late.** Because the true cost is only known once
+> the body is parsed, the excess lands against your *next* request, not this
+> one. See [rate limits](/market-data/authentication#rate-limits).
+
+Batch responses are always `Cache-Control: no-store` and never carry an ETag.
+
+## Binary format
+
+For chart-heavy or high-volume consumers, request the columnar binary
+encoding — roughly **8× smaller** than JSON before compression:
+
+```bash
+curl -G https://md.kairos.trade/v1/candles \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=1897067" \
+  --data-urlencode "timeframe_seconds=300" \
+  --data-urlencode "start=2026-07-14T00:00:00Z" \
+  --data-urlencode "end=2026-07-15T00:00:00Z" \
+  --data-urlencode "fmt=binary" \
+  --output candles.bin
+```
+
+The `Accept` header is equivalent:
+
+```bash
+curl -G https://md.kairos.trade/v1/candles \
+  -H "Accept: application/x-kairos-candles" \
+  --data-urlencode "provider=polymarket" \
+  --data-urlencode "contract_id=1897067" \
+  --data-urlencode "timeframe_seconds=300" \
+  --data-urlencode "start=2026-07-14T00:00:00Z" \
+  --data-urlencode "end=2026-07-15T00:00:00Z" \
+  --output candles.bin
+```
+
+### Layout
+
+Little-endian throughout:
+
+```
+u8  magic = 0xCA     u8  version = 1     u16 num_results
+per result:
+  u32 index          u32 count      — high bit of count = this series errored
+  u32[count] t       — bucket start, unix seconds
+  u16[count] o,h,l,c — price × 100 (0–100 scale × 100)
+  i64[count] volume  — volume × 100
+```
+
+A single-series `GET` always has `num_results = 1`. A batch frame has one
+section per request index, in input order.
+
+<Note>
+**The high bit of `count` is an error flag, not part of the count.** On a
+batch, a failed item sets `0x80000000` on its `count`. Mask it off
+(`count & ~0x80000000`) before using the value, and treat a set bit as
+"this series errored" — not as "this series has no data". A decoder that
+skips this step will try to read roughly two billion candles. The error
+*message* is only available from the JSON response.
+</Note>
+
+### Reference decoder (Python)
+
+```python
+import struct
+
+ERROR_BIT = 0x80000000
+
+def decode(buf):
+    magic, ver, n = struct.unpack_from('<BBH', buf, 0); off = 4
+    assert magic == 0xCA and ver == 1
+    results = []
+    for _ in range(n):
+        idx, raw = struct.unpack_from('<II', buf, off); off += 8
+        cnt, failed = raw & ~ERROR_BIT, bool(raw & ERROR_BIT)
+        t = struct.unpack_from(f'<{cnt}I', buf, off); off += 4 * cnt
+        o = struct.unpack_from(f'<{cnt}H', buf, off); off += 2 * cnt
+        h = struct.unpack_from(f'<{cnt}H', buf, off); off += 2 * cnt
+        l = struct.unpack_from(f'<{cnt}H', buf, off); off += 2 * cnt
+        c = struct.unpack_from(f'<{cnt}H', buf, off); off += 2 * cnt
+        v = struct.unpack_from(f'<{cnt}q', buf, off); off += 8 * cnt
+        results.append(dict(index=idx, failed=failed, candles=[
+            dict(t=t[i], open=o[i]/100, high=h[i]/100,
+                 low=l[i]/100, close=c[i]/100, volume=v[i]//100)
+            for i in range(cnt)
+        ]))
+    return results
+```

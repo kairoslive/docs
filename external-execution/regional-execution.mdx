@@ -1,0 +1,189 @@
+---
+title: "Regional Execution Nodes"
+description: "Where to connect for the lowest latency: regional execution nodes in Ireland and Tokyo, what's served regionally vs centrally, and reading live positions"
+---
+
+This page tells you where to connect and what each endpoint is served by, so you don't accidentally route your hot path through the wrong region. Read it when you are choosing hostnames and deciding which calls go where; the request flow itself is in [Signing & Order Lifecycle](/external-execution/signing).
+
+Kairos runs **regional execution nodes** colocated with each venue, alongside the central primary deployment; executing on the node nearest your venue keeps your hot-path traffic in-region and removes the cross-region round-trip you'd otherwise pay twice (orderbook read in, order submit out).
+
+<Warning>
+**Gotcha: wiring your bot to the central region for everything is the single most common integration mistake.** If you execute on Polymarket from London or Predict.fun from Tokyo, most of your hot-path traffic should never leave the region.
+</Warning>
+
+Anything below marked *confirm with Kairos* depends on your specific node assignment and account flags — verify it with your onboarding contact.
+
+## The mental model
+
+A regional node runs the whole fast-lane order pipeline colocated with a specific venue, with **no cross-region runtime dependency** — it keeps trading even if the primary and every other node is unreachable. The central **primary** serves everything the nodes don't: candles, the public trade tape, history, analytics, portfolio/PnL, market metadata, discovery, and search.
+
+Two nodes are live in production:
+
+| Region | Venue | Colocated with |
+|---|---|---|
+| Ireland (`eu-west-1`) | Polymarket | Polymarket's relayer / Polygon RPC |
+| Tokyo (`ap-northeast-1`) | Predict.fun | Predict.fun and a region-local BSC RPC (Predict.fun settles on BSC) |
+
+## Where to connect
+
+This is where you submit orders and read authoritative live position state — the node's HTTPS / WebSocket server.
+
+| Thing | Value |
+|---|---|
+| Executor host (Polymarket) | `eu-west-1-polymarket.executor.kairos.trade` |
+| Executor host (Predict.fun) | `ap-northeast-1-predictfun.executor.kairos.trade` |
+| TLS port | `443` |
+| REST submit | `POST /orders` (custodial) and `POST /v2/orders/intent` + `POST /v2/orders/submit` (external-signing) |
+| WebSocket execution | `wss://<your-node>/ws` |
+| Live position read | `GET /positions/exposure` (see below) |
+| Health | `GET /health` (unauthenticated liveness probe) |
+
+`GET /health/deep` exists but is an internal operator probe gated by a service token — it is not reachable with a partner credential. Use `GET /health` for reachability.
+
+**Authentication** (both REST and WebSocket) is unchanged from the rest of the API: a Kairos JWT (`Authorization: Bearer <kairos-jwt>` for REST; on the WebSocket the JWT rides `Sec-WebSocket-Protocol` as `authorization, Bearer.<token>`), or a scoped API key issued at onboarding. Which credential you use is set at onboarding — *confirm with Kairos*.
+
+> **Gotcha: a bearer token is not enough on the shared order routes.** `POST /orders` and the three cancel routes carry an extra gate that a bare `Authorization: Bearer` header does not satisfy. Sending the full API-key triple (`X-Client-Id` + `X-Api-Key` + `X-Api-Secret`) satisfies it automatically. The `/v2/*` external-signing routes and `GET /positions/exposure` have no such gate.
+
+> **Gotcha: there is no region-discovery API and no latency-based DNS.** Each node's hostname is a plain record pointing at that region's load balancer, and your assignment is a fixed onboarding decision. Pin the hostname in your config.
+
+### Market data
+
+Live orderbook depth for your venue is produced in-region. For partners consuming market data from outside the node's network, Kairos offers a public WebSocket distribution endpoint:
+
+```
+wss://<your-node>.stream.executor.kairos.trade:8443/ws
+```
+
+It authenticates with a bearer API key, enforces a per-IP connection cap, and **rejects root-wildcard subscriptions** — subscribe per-contract, not to the whole firehose. Whether this endpoint is enabled for your node, and whether your data tier is this per-node stream or the shared public data tier at `stream.kairos.trade`, is *confirm with Kairos*. The shared public tier is read-only market data; it carries **no order flow**.
+
+## What is (and isn't) served regionally
+
+A node serves live orderbook market data and execution only. Everything historical, derived, or portfolio-related stays on the primary:
+
+| Stream / capability | Regional node | Central primary |
+|---|---|---|
+| Live orderbook depth | Yes | — |
+| Order submit / cancel | Yes | — |
+| Live position exposure (`GET /positions/exposure`) | Yes — authoritative live | Durable copy (async, see caveat below) |
+| Fill / order-status events (`filled`, `partially_filled`, `status_changed`) | Yes (`/ws`) | — |
+| Public trade tape | — | Yes |
+| Candles / OHLC | — | Yes |
+| Historical data / analytics | — | Yes |
+| Portfolio / PnL / balances / history | — | Yes |
+| Market metadata / discovery / search | — | Yes |
+
+**Rule of thumb:** if it's live orderbook or execution, use the node. If it's candles, history, PnL, or the trade tape, use the primary — anything not in the node's "regional" column requires a call to the central region, so fetch it out of band and keep the hot path on the node.
+
+## Live position exposure
+
+```
+GET /positions/exposure
+```
+
+Returns your current positions as tracked by the node you're connected to — the recommended source of truth for "what do I currently hold" while actively trading. See the [critical caveat](#reading-live-positions-a-critical-caveat) below before also reading the central positions endpoint.
+
+**Auth:** `Authorization: Bearer <kairos-jwt>` or a scoped API key, with the `position:read` scope. No query parameters.
+
+### Example
+
+```bash
+curl https://eu-west-1-polymarket.executor.kairos.trade/positions/exposure \
+  -H "Authorization: Bearer $KAIROS_JWT"
+```
+
+### Response
+
+```json
+{
+  "positions": [
+    {
+      "token_id": "71360012345678901234567890123456789012345678901234567890123456",
+      "market_id": "0xcondition…",
+      "outcome": "Yes",
+      "holding_wallet": "0xYourEOA",
+      "net_size": "100",
+      "available_to_sell": "60",
+      "reserved": "40",
+      "avg_entry_price_bps": 5200,
+      "realized_pnl": "12.50",
+      "last_trade_at": "2026-07-22T09:14:00Z"
+    }
+  ],
+  "closed_token_ids": ["71360098…"],
+  "resolved": [
+    {
+      "token_id": "71360055…",
+      "market_id": "0xcondition2…",
+      "outcome": "No",
+      "holding_wallet": "0xYourEOA",
+      "net_size": "0",
+      "redeemable": true
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `positions` | array | Currently open positions (`net_size != 0`) |
+| `positions[].net_size` | string | Current signed size, decimal string; positive is long |
+| `positions[].available_to_sell` | string | `net_size` minus outstanding sell reservations — what a new sell can reserve right now |
+| `positions[].reserved` | string | Size committed to in-flight sells: `net_size − available_to_sell` |
+| `positions[].avg_entry_price_bps` | integer | Average entry price in basis points (price × 10,000) |
+| `positions[].realized_pnl` | string | Realized PnL to date, decimal string |
+| `closed_token_ids` | array\<string\> | Tokens the node has just folded flat (within a short window); use presence here to zero a stale cached position for that token |
+| `resolved` | array | Held tokens whose market has resolved, kept separate so a resolved loser is never confused with an open position |
+| `resolved[].redeemable` | boolean | `true` for a won (claimable) outcome, `false` for a loss |
+
+<Note>
+**Gotcha: absence is not zero.** A token missing from every bucket means the node has no current opinion on it — leave any previously-cached value as-is. Only presence in `closed_token_ids` tells you to zero a cached position.
+</Note>
+
+### Reading live positions — a critical caveat
+
+**When you execute on a regional node, the central positions read is asynchronous and is not the live source of truth right after a fill.** Fills are recorded on the node first and synced centrally in the background. The central copy is the durable long-term record of what you hold, but it can be briefly stale right after a fill — more so cross-region than on the co-located primary.
+
+**Do not** poll the central positions endpoint from a remote region and treat it as live truth during active trading — you'll act on a sync-lagged view and pay a needless cross-region round-trip. Read `GET /positions/exposure` on the node for live state; reconcile against the central record for the durable copy once the sync has caught up.
+
+## Execute over WebSocket, not REST
+
+**Execute over the WebSocket (`/ws`), not REST.** This is not a stylistic preference — the REST path is materially slower at detecting your fill.
+
+- **WebSocket (recommended)** — fill detection is event-driven. A fill is recorded and pushed on the same socket as a `filled` / `partially_filled` / `status_changed` frame, typically **sub-second**. The socket stays warm, so you also skip per-order HTTPS/TLS setup. (There is no `order_update` or `fill` frame type — see [Signing & Order Lifecycle › Fills](/external-execution/signing#fills) for the exact shapes.)
+- **REST** — submission works and returns the venue's immediate status, but any fill not in the submit response (every queued/market order and all resting limit fills) is only caught on the next polling tick — a **multi-second** gap.
+
+For a latency-sensitive strategy, that delta dominates your order-to-known-fill time. **Keep one authenticated WebSocket connection open per node and both submit and listen on it** — treat REST `/orders` as a fallback / control-plane path (cancels, one-off ops), not your steady-state execution or fill-detection path.
+
+## Colocation
+
+The whole point of a regional node is venue proximity. You get the biggest win by colocating your infrastructure with the matching node.
+
+| If you trade… | Colocate in | Why |
+|---|---|---|
+| Polymarket | Ireland (`eu-west-1`) | Polymarket's relayer / Polygon RPC are native to the region; the node sits next to them. Trade from Ireland and your whole hot path stays in-region. |
+| Predict.fun | Tokyo (`ap-northeast-1`) | Predict.fun settles on BSC; the node sits next to the venue and a region-local BSC RPC. Being in-region collapses your submit and market-data round-trips. |
+
+Concretely: run your bot in the same region as your assigned node (in-region private-network access for colocated workloads is available on some accounts — *confirm with Kairos*); pin your execution socket to the region's node (a London desk trading Polymarket connects to `eu-west-1-polymarket.executor.kairos.trade`, not the central region); and consume market data in-region via the region's stream endpoint.
+
+## Why this is fast
+
+Building the order and verifying your signature is single-digit milliseconds of Kairos compute — most of the wall-clock is the unavoidable venue network hop, which is identical regardless of how the order was signed. Signing locally with your own key removes the ~50–100 ms round-trip a managed signature would add. The larger lever is fill detection: an event-driven WebSocket (sub-second) versus REST polling (multi-second). Colocating your infrastructure in the same region as your assigned node collapses the remaining submit and market-data round-trips to sub-region.
+
+## Slow paths to avoid
+
+| Avoid | Use instead |
+|---|---|
+| REST execution + polling for fills | WebSocket `/ws` submit + event-driven `filled` / `partially_filled` frames |
+| Central positions read from a remote region during active trading | `GET /positions/exposure` on the node (live, no cross-region hop) |
+| Calling the central region for candles/history/PnL on the hot path | Fetch those out of band; keep the hot path node-local |
+| Trading a venue from the wrong region | Route to the matching node and colocate |
+| Root-wildcard market-data subscribe | Per-contract subscribe |
+
+**In one line:** a London desk trading Polymarket should execute on the Ireland node over WebSocket and read positions from that node — not call the central region for orders, fills, or positions when a regional path exists.
+
+## See also
+
+- **[Overview](/external-execution/overview)** — access and the self-custody model.
+- **[Signing & Order Lifecycle](/external-execution/signing)** — the intent → sign → submit flow and the WebSocket one-round-trip path.
+- **[API Reference](/api-reference)** — full schema for `GET /positions/exposure` and the order endpoints.
+- **[WebSocket › Order Execution](/websocket/order-execution)** — the general execution WebSocket surface.

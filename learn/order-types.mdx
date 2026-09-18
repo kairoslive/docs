@@ -1,0 +1,109 @@
+---
+title: "Order Types"
+description: "Market orders, limit orders, resting orders, and maker vs taker"
+---
+
+Now that you can read a book, you need to tell the exchange what to do with it. This chapter covers the two orders you'll use for almost everything — market and limit — and the maker/taker distinction that decides what you pay in fees.
+
+## Two Ways to Trade
+
+When you want to buy or sell shares, you have two basic choices:
+
+1. **Market order** — "I want to trade right now, at whatever price is available"
+2. **Limit order** — "I want to trade at this specific price or better"
+
+## Market Orders
+
+A market order says: **"Just get it done."**
+
+You don't pick a resting price — the exchange matches you with the best available offers on the order book immediately.
+
+<Note>
+**On Kairos:** a market order still requires a `price`. Kairos treats it as the
+limit you authorise it to cross to, not as a "any price" sentinel, and rejects
+the order without one. Send the live same-outcome quote — ask for buys, bid for
+sells. See [Order Types](/guides/order-types) for the API details.
+</Note>
+
+**When to use it:**
+- You want to trade *right now*
+- You care more about speed than getting the perfect price
+- The order book has enough depth at reasonable prices
+
+**The catch:** If there isn't much depth, you might get a worse price than expected. This is called **slippage** (covered in a later chapter).
+
+**Example:** You market buy 100 shares. The book has 80 at $0.55 and 150 at $0.57:
+
+| Price | Shares | Cost |
+|-------|--------|------|
+| $0.55 | 80 | $44.00 |
+| $0.57 | 20 | $11.40 |
+| **Avg $0.554** | **100** | **$55.40** |
+
+## Limit Orders
+
+A limit order says: **"I'll only trade at this price or better."**
+
+You set your price. If the market can fill you at that price (or a better one), it does. If not, your order waits.
+
+**When to use it:**
+- You have a specific price in mind
+- You're not in a rush
+- You want to control your cost
+
+> **You:** Limit buy 100 at **$0.53**
+>
+> **Book:** Best ask is **$0.55** — no one selling at **$0.53**
+>
+> **Result:** Order rests on the book and waits.
+>
+> *...later, someone sells at **$0.53**...*
+>
+> **Result:** Filled!
+
+## Resting Orders
+
+When a limit order can't fill immediately, it **rests** on the order book. It becomes a bid (if buying) or an ask (if selling) that other traders can trade against.
+
+Your resting order stays on the book until:
+- Someone takes the other side (you get filled)
+- You cancel it
+- It expires (depending on time-in-force settings)
+
+Think of it like leaving a note at the auction: *"If anyone wants to sell at **$0.53**, I'm buying."*
+
+
+## Maker vs Taker
+
+These terms describe your role in a trade:
+
+| Role | What You Did | Example |
+|------|-------------|---------|
+| **Maker** | Added liquidity — your order rested on the book and someone else traded against it | Limit buy at **$0.53**, it rested, later got filled |
+| **Taker** | Removed liquidity — you traded against someone else's resting order | Market buy that ate into the existing asks |
+
+**Why it matters:** Many exchanges charge lower fees for makers (sometimes zero). Makers help the market by providing liquidity. Takers pay a bit more for the convenience of instant execution.
+
+<Note>
+**On Kairos:** the exact maker and taker rates depend on the venue and on your
+fee tier, and one venue inverts the usual direction. See
+[Fees](/trading/fees) before assuming maker is the cheap side.
+</Note>
+
+## Quick Comparison
+
+| | **Market Order** | **Limit Order** |
+|---|---|---|
+| **Speed** | Instant | May wait |
+| **Price control** | None | Full — you set the price |
+| **Guaranteed fill?** | No — only if the book has depth inside your price | No |
+| **Role** | Taker | Maker (if it rests) or Taker |
+| **Best for** | "I need this now" | "I want a good price" |
+
+## A Simple Rule of Thumb
+
+- **In a hurry?** Market order.
+- **Have a target price?** Limit order.
+- **Want lower fees?** Limit order (maker).
+
+**Next:** [Time-in-Force](/learn/time-in-force) — how long an order should stay alive, and what to do if it can't fill completely.

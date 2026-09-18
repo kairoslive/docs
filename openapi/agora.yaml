@@ -1,0 +1,1484 @@
+# Kairos Agora Auction House — OpenAPI 3.1 specification.
+# Canonical source of truth for the public API reference.
+#
+# Consumers:
+#   - services/web/scripts/build-openapi.ts -> /openapi/agora.{yaml,json} static assets
+#   - services/agora/internal/api/openapi_coverage_test.go -> CI check that every
+#     registered public route is documented here (and nothing phantom is)
+#
+# When you add or change an Agora route, update this file in the same PR —
+# the coverage test fails otherwise. Extensions the reference UI renders:
+# x-kairos-auth (public | api-key | session), x-kairos-rate-limit,
+# x-kairos-bucket, x-kairos-scope.
+openapi: 3.1.0
+info:
+  title: Agora Auction House API
+  version: 1.0.0-pilot
+  description: |
+    Private first-price sealed auctions for venue-backed prediction contracts.
+    Active auctions are never published through an unauthenticated or global
+    feed. All price and quantity values are integer atoms.
+
+    ## Authentication
+
+    Every `/v1` operation requires a first-party Kairos session JWT
+    (`Authorization: Bearer <jwt>`, RS256, `iss: kairos.trade`,
+    `aud: kairos-api`, `ver: 1`, an expiry claim, and a subject enrolled in the
+    Auction House). Any other credential shape — missing header, wrong
+    audience, revoked session, unenrolled subject — is rejected with `401`
+    before the handler runs. There is no API-key or anonymous tier. Browser
+    WebSocket clients pass the same JWT as the `Sec-WebSocket-Protocol`
+    subprotocol pair `authorization, Bearer.<base64url(jwt)>`.
+
+    Every session is granted the `auction:create` and `auction:quote`
+    capabilities; they only allow the request to reach the fail-closed
+    Go-owned economic policy store, which remains the real authorization
+    boundary.
+
+    ## Errors
+
+    Every error body is a flat JSON object: `{"error": "<code>"}`, plus a
+    `"message"` field on rejections raised by the auction engine. Codes are
+    stable; `message` is descriptive and must not be parsed. `422` rejections
+    carry the durable auction reason code (for example `INVALID_PRICE_TICK`,
+    `UNAUTHORIZED_SIZE`, `SERVICE_CAPACITY_EXCEEDED`) as the `error` value.
+
+    ## Request limits
+
+    Request bodies are capped at 1 MiB (`413 payload_too_large`). JSON is
+    parsed strictly: no `null` values, no duplicate object keys, no unknown
+    fields, no trailing data, and at most 64 levels of nesting. Owner-routing
+    headers (`X-Service-Token`, `X-Agora-Peer`, `X-Agora-Active-Only`,
+    `X-Agora-Owner-Read-Fallback`) are internal capabilities and are rejected
+    with `403` on the public listener.
+
+    ## Rate limiting
+
+    Only state-changing operations are metered, by a per-account and
+    per-auction token bucket owned by the authoritative shard, evaluated
+    before any risk reservation or journal write. Exceeding a bucket returns
+    `429 auction_mutation_rate_limited`. No `Retry-After` or `X-RateLimit-*`
+    headers are emitted; back off and retry with the same idempotency key.
+    Reads, both preflight calls, and the stream are not metered.
+servers:
+  - url: https://agora.kairos.trade
+  - url: https://staging-agora.kairos.trade
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      security: []
+      summary: Process health
+      description: Liveness of the local authority journal. Touches no dependency and is never rate-limited.
+      x-kairos-auth: public
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+              example: { status: ok }
+        "503":
+          description: The local authority journal has failed (`journal_failed`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+              example: { status: journal_failed }
+  /readyz:
+    get:
+      security: []
+      summary: Owner readiness
+      description: |
+        Reports whether this owner accepts new work. Fails closed while
+        draining, while the local authority journal is unavailable, and when
+        the shared Kairos control schema cannot be reached.
+      x-kairos-auth: public
+      responses:
+        "200":
+          description: Ready for new work
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+              example: { status: ready }
+        "503":
+          description: Draining, local authority journal unavailable, or shared Kairos control schema unavailable. `status` names the failing condition.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+  /v1/auctions:
+    post:
+      summary: Create and open a private auction
+      description: |
+        The resolved audience and identity policy freeze before this call
+        returns. Economic identity is derived exclusively from the
+        authenticated principal; a caller-supplied account identifier is
+        neither required nor trusted. Supply the idempotency key in the header
+        or request body. If both are present, they must match exactly.
+      x-kairos-auth: session
+      x-kairos-scope: auction:create
+      x-kairos-bucket: create
+      x-kairos-rate-limit: 2/s per account, burst 4
+      parameters:
+        [{ $ref: "#/components/parameters/OptionalIdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          {
+            application/json:
+              { schema: { $ref: "#/components/schemas/CreateAuction" } },
+          }
+      responses:
+        "201":
+          description: Durably opened
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/AuctionView" } },
+            }
+        "200":
+          description: Identical idempotent replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuctionView" }
+        "400":
+          description: |
+            `invalid_json` (unparseable, `null`, duplicate key, unknown field,
+            or over 64 levels deep), `multiple_json_values` (trailing data),
+            `idempotency_key_mismatch` (header and body keys differ), or
+            `idempotency_key_required` (no key at all, so the create cannot be
+            routed to its owner shard).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: idempotency_key_mismatch }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `forbidden` when the session lacks the `auction:create`
+            capability, or `internal_routing_headers_forbidden` when the
+            request carries an owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/Rejected" }
+        "429": { $ref: "#/components/responses/MutationRateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503":
+          description: |
+            New creates are paused: `projection_backlog` (asynchronous
+            projection backlog is unsafe), `clock_unhealthy`,
+            `journal_capacity_unhealthy`, or — when the owning shard for this
+            idempotency key cannot be reached — `auction_owner_unavailable`,
+            `owner_routing_unavailable`, or `owner_response_invalid`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    get:
+      summary: List only auctions visible to the authenticated principal
+      description: |
+        Merges the live owner shards with the shared completed projection into
+        one page ordered by open time descending, then auction ID descending.
+        Unknown or repeated query parameters are rejected rather than ignored.
+      x-kairos-auth: session
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 50 }
+        - name: cursor
+          in: query
+          description: Opaque continuation returned by the previous page.
+          schema: { type: string, maxLength: 512 }
+      responses:
+        "200":
+          description: Role-filtered private auction page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuctionPage" }
+        "400":
+          description: '`invalid_list_page` — unparseable query string, an unknown or repeated parameter, a `limit` outside 1..50, or a cursor that is over 512 characters, not base64url, over 256 decoded bytes, or missing its open time or auction ID.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: invalid_list_page }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/InternalRoutingHeaders" }
+        "503":
+          description: |
+            `completed_projection_unavailable` when the shared completed
+            projection cannot be read, or `auction_list_projection_invalid` /
+            `auction_list_item_exceeds_response_limit` when a retained owner
+            view cannot be encoded within the 2 MiB response bound.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/auctions/preflight:
+    post:
+      summary: Verify originator capacity without reserving it
+      description: |
+        Returns a point-in-time, read-only capacity verdict for the
+        authenticated originator across every requested route. The response
+        exposes bounded executable quantity, never raw collateral, position,
+        venue-account, credential, or control-group data. No auction, journal
+        event, or risk reservation is created. POST /v1/auctions always repeats
+        the same capacity calculation and reserves atomically, so a successful
+        preflight is evidence rather than a guarantee against concurrent use.
+        This call is not rate-limited and ignores the idempotency key.
+      x-kairos-auth: session
+      x-kairos-scope: auction:create
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateAuction" }
+      responses:
+        "200":
+          description: Current originator route-capacity evidence
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OriginatorPreflight" }
+        "400": { $ref: "#/components/responses/InvalidJSON" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `forbidden` when the session lacks the `auction:create`
+            capability, or `internal_routing_headers_forbidden` when the
+            request carries an owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/Rejected" }
+        "500":
+          description: |
+            `internal_error` — this owner cannot verify authority safely
+            (draining, unhealthy clock or journal capacity, saturated active
+            auction cache), or the admission authority returned evidence that
+            failed its own invariants. No 503 is emitted on this path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: internal_error, message: auction request could not be completed }
+  /v1/auctions/{auctionID}:
+    parameters: [{ $ref: "#/components/parameters/AuctionID" }]
+    get:
+      summary: Get a role-filtered private auction view
+      description: |
+        Reads the live owner first and falls back to the shared completed
+        projection. Existence of a private auction is opaque to unrelated
+        principals: they receive the same 404 as a caller asking for an ID
+        that was never issued.
+      x-kairos-auth: session
+      responses:
+        "200":
+          description: Originator or invited-MM view
+          headers:
+            X-Agora-Completed-As-Of:
+              description: Present only when the view was served from the shared completed projection; RFC 3339 nanosecond projection time.
+              schema: { type: string, format: date-time }
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/AuctionView" } },
+            }
+        "400": { $ref: "#/components/responses/InvalidAuctionID" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/InternalRoutingHeaders" }
+        "404":
+          {
+            description: Auction absent or not visible to the caller; private-auction existence is opaque,
+          }
+        "503":
+          description: |
+            `completed_projection_unavailable` when the shared projection
+            cannot be read, or `auction_owner_unavailable` /
+            `owner_routing_unavailable` / `owner_response_invalid` when the
+            owning shard for this auction cannot be reached.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/auctions/{auctionID}/events:
+    parameters: [{ $ref: "#/components/parameters/AuctionID" }]
+    get:
+      summary: Get the caller's complete role-filtered audit timeline
+      description: |
+        Reads the existing owner journal for a live auction or the existing
+        shared kairos_execution projection for completed history. Completeness
+        is verified before returning. Raw authority sequence numbers, event
+        IDs, owner/session identifiers, hidden execution identities, and every
+        competing-maker quote event are omitted so gaps cannot disclose private
+        participation.
+      x-kairos-auth: session
+      responses:
+        "200":
+          description: Complete ordered timeline visible to this principal
+          headers:
+            Cache-Control:
+              schema: { type: string, example: "private, no-store" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuctionAuditTimeline" }
+        "400": { $ref: "#/components/responses/InvalidAuctionID" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/InternalRoutingHeaders" }
+        "404":
+          description: Auction absent or not visible to the caller; private-auction existence is opaque
+        "500":
+          description: '`internal_error` — the projected history was readable but not contiguous through its authoritative snapshot, so no partial timeline is returned.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            The complete owner journal or shared audit projection cannot
+            currently be verified: `audit_history_unavailable` (owner journal
+            scan failed) or `audit_projection_unavailable` (no audit reader,
+            or the shared projection backlog is unsafe).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /v1/auctions/{auctionID}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/AuctionID"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      summary: Cancel an open auction
+      description: |
+        Originator-only. The request body is optional; omit it entirely to
+        cancel with reason code `UNSPECIFIED`. When a body is sent, an
+        `idempotency_key` inside it must match the header exactly.
+      x-kairos-auth: session
+      x-kairos-scope: auction:create
+      x-kairos-bucket: cancel
+      x-kairos-rate-limit: 5/s per auction (burst 10) and 20/s per account (burst 40)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CancelAuctionRequest" }
+      responses:
+        "200":
+          description: Durably cancelled or duplicate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuctionMutationResult" }
+        "400":
+          description: '`invalid_json`, `multiple_json_values`, `idempotency_key_mismatch`, or `invalid_auction_id`.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `forbidden` when a delivered invitee knows the auction but is not
+            its originator, or when the session lacks the `auction:create`
+            capability; `internal_routing_headers_forbidden` when the request
+            carries an owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { description: Auction absent or not visible to the caller }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422":
+          description: |
+            `auction_rejected` — the auction is no longer open (close already
+            won the owner sequence race), the `Idempotency-Key` header is
+            missing or over 200 bytes, the reason code is unknown, or
+            `operator_note` is malformed, over 240 bytes, or absent while
+            `reason_code` is `OTHER`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: auction_rejected, message: auction is not open }
+        "429": { $ref: "#/components/responses/MutationRateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/OwnerUnavailable" }
+  /v1/auctions/{auctionID}/quotes:
+    parameters: [{ $ref: "#/components/parameters/AuctionID" }]
+    post:
+      summary: Submit or revise one firm executable price and quantity
+      description: |
+        Invited makers only. Supply the idempotency key in the header or
+        request body. If both are present, they must match exactly. Revisions
+        are strictly sequential: the first quote must be revision 1 and each
+        later quote exactly one higher than the caller's current revision.
+      x-kairos-auth: session
+      x-kairos-scope: auction:quote
+      x-kairos-bucket: quote
+      x-kairos-rate-limit: 25/s per auction (burst 50) and 100/s per account (burst 200)
+      parameters:
+        [{ $ref: "#/components/parameters/OptionalIdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          {
+            application/json:
+              { schema: { $ref: "#/components/schemas/SubmitQuote" } },
+          }
+      responses:
+        "201":
+          description: Quote journaled and accepted
+          content:
+            {
+              application/json:
+                { schema: { $ref: "#/components/schemas/Quote" } },
+            }
+        "200":
+          description: Identical idempotent replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quote" }
+        "400":
+          description: '`invalid_json`, `multiple_json_values`, `idempotency_key_mismatch`, or `invalid_auction_id`.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `forbidden` when the session lacks the `auction:quote` capability,
+            or `internal_routing_headers_forbidden` when the request carries
+            an owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { description: Auction absent or not visible to the caller }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422":
+          description: |
+            Durably journaled bid rejection. `error` is the reason code:
+            `INVALID_PRICE_RANGE`, `INVALID_PRICE_TICK`,
+            `INVALID_QUANTITY_TICK`, `BID_INVALID`, `UNAUTHORIZED_SIZE` (over
+            the frozen approved size), `LATE_BID` (the auction closed), or a
+            reason returned by the reservation authority. A missing or
+            oversized idempotency key is also rejected here as
+            `auction_rejected`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: INVALID_PRICE_TICK, message: INVALID_PRICE_TICK }
+        "429": { $ref: "#/components/responses/MutationRateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/OwnerUnavailable" }
+    delete:
+      summary: Withdraw the caller's active quote
+      x-kairos-auth: session
+      x-kairos-scope: auction:quote
+      x-kairos-bucket: withdraw
+      x-kairos-rate-limit: 25/s per auction (burst 50) and 100/s per account (burst 200)
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses:
+        "200":
+          description: Quote durably withdrawn or duplicate
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuoteMutationResult" }
+        "400": { $ref: "#/components/responses/InvalidAuctionID" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `forbidden` when the session lacks the `auction:quote` capability,
+            or `internal_routing_headers_forbidden` when the request carries
+            an owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          {
+            description: Auction or caller's active quote absent; unrelated callers cannot distinguish them,
+          }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: '`auction_rejected` — the auction is no longer open, or the `Idempotency-Key` header is missing or over 200 bytes.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: auction_rejected, message: auction is not open }
+        "429": { $ref: "#/components/responses/MutationRateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "503": { $ref: "#/components/responses/OwnerUnavailable" }
+  /v1/auctions/{auctionID}/quotes/preflight:
+    parameters: [{ $ref: "#/components/parameters/AuctionID" }]
+    post:
+      summary: Verify the invited maker's price-specific quote capacity
+      description: |
+        Returns only the authenticated invitee's bounded capacity at the
+        proposed price across every frozen route. It exposes no raw portfolio,
+        other invitee, competing quote, venue-account, or control-group data
+        and creates no reservation or journal event. Quote submission repeats
+        the same calculation inside its serializable reservation transaction.
+        This call is not rate-limited and takes no idempotency key.
+      x-kairos-auth: session
+      x-kairos-scope: auction:quote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/QuotePreflightRequest" }
+      responses:
+        "200":
+          description: Current invitee quote-capacity evidence
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/QuotePreflight" }
+        "400":
+          description: '`invalid_json`, `multiple_json_values`, or `invalid_auction_id`.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `forbidden` when the session lacks the `auction:quote` capability,
+            or `internal_routing_headers_forbidden` when the request carries
+            an owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404": { description: Auction absent or caller was not delivered an invitation }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422":
+          description: |
+            `auction_rejected` when the auction is no longer open or the
+            auction reference is unbounded, otherwise the durable quote reason
+            code (`INVALID_PRICE_RANGE`, `INVALID_PRICE_TICK`,
+            `INVALID_QUANTITY_TICK`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: auction_rejected, message: auction is not open }
+        "500":
+          description: '`internal_error` — the admission authority returned capacity evidence that failed its own invariants. No 503 is emitted on this path.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/OwnerUnavailable" }
+  /v1/stream:
+    get:
+      summary: Private WebSocket event stream
+      description: |
+        Each principal receives only auctions it originated or was invited to,
+        with the same field filtering as GET. There is no active public stream.
+        Browser clients authenticate with subprotocols `authorization` and
+        `Bearer.<base64url(jwt)>`; polling is only a reconnect fallback.
+
+        The server sends a `SNAPSHOT` frame, then one `SYNC_COMPLETE` frame
+        once every owner shard has replied, then an `UPDATE` frame per visible
+        event. The session is re-verified every 15 seconds and the connection
+        is bounded by the token's expiry: a revoked, rotated, or expired
+        session is closed with code 1008 `session reauthentication required`.
+        Loss of a peer owner stream closes with 1011 `auction owner stream
+        unavailable`.
+      x-kairos-auth: session
+      responses:
+        "101": { description: Switching Protocols }
+        "400": { description: The request is not a valid WebSocket upgrade. The body is plain text, not the JSON error envelope. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `websocket_origin_forbidden` when `Origin` is absent, `null`, or
+            not an exact match for an allowed origin, or
+            `internal_routing_headers_forbidden` when the request carries an
+            owner-routing header.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: websocket_origin_forbidden }
+  /v1/invitations:
+    get:
+      summary: Read the authenticated participant's durable private invitation inbox
+      description: Returns only unexpired invitations published to the caller's account before the common close time.
+      x-kairos-auth: session
+      responses:
+        "200":
+          description: Unexpired private invitation envelopes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [invitations]
+                properties:
+                  invitations:
+                    type: array
+                    items: { $ref: "#/components/schemas/InvitationInboxItem" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/InternalRoutingHeaders" }
+        "503":
+          description: '`invitation_inbox_unavailable` — the inbox is not configured on this deployment or its durable read failed.'
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: invitation_inbox_unavailable }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    AuctionID:
+      name: auctionID
+      in: path
+      required: true
+      description: Canonical UUID whose first character is the owner shard (0, 1, or 2).
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 200 }
+    OptionalIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Required here or in the JSON body; both values must match when supplied together.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+  responses:
+    Unauthorized:
+      description: |
+        The bearer session is absent, malformed, expired, revoked, signed by
+        an unrecognized key, carries the wrong issuer, audience, or schema
+        version, or its subject is not enrolled in the Auction House.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: unauthorized, message: authentication required }
+    InternalRoutingHeaders:
+      description: '`internal_routing_headers_forbidden` — the request carried `X-Service-Token`, `X-Agora-Peer`, `X-Agora-Active-Only`, or `X-Agora-Owner-Read-Fallback`. These are internal owner-routing capabilities, not public API options.'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: internal_routing_headers_forbidden }
+    InvalidJSON:
+      description: |
+        `invalid_json` (unparseable, `null`, duplicate key, unknown field, or
+        over 64 levels deep) or `multiple_json_values` (trailing data after
+        the request object).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: invalid_json, message: request body is not valid JSON }
+    InvalidAuctionID:
+      description: '`invalid_auction_id` — the path identifier is not a canonical UUID carrying a valid owner shard.'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: invalid_auction_id }
+    PayloadTooLarge:
+      description: '`payload_too_large` — the request body exceeded 1 MiB.'
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: payload_too_large }
+    Conflict:
+      description: |
+        `IDEMPOTENCY_CONFLICT` when the idempotency key was already used with
+        a different request, or `REVISION_CONFLICT` when a quote revision is
+        not exactly one higher than the caller's current revision.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: IDEMPOTENCY_CONFLICT, message: IDEMPOTENCY_CONFLICT }
+    Rejected:
+      description: |
+        Admission, tick, reserve, audience, or state rejection. `error` is the
+        durable auction reason code — for example `INVALID_REQUEST`,
+        `TTL_OUT_OF_RANGE`, `BELOW_MIN_BLOCK_SIZE`, `NO_ELIGIBLE_MMS`,
+        `PARTICIPANT_INELIGIBLE`, `SERVICE_CAPACITY_EXCEEDED`,
+        `ATOMICITY_UNAVAILABLE` — or `auction_rejected` for an untyped
+        request-shape failure.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: TTL_OUT_OF_RANGE, message: TTL_OUT_OF_RANGE }
+    MutationRateLimited:
+      description: |
+        `auction_mutation_rate_limited` — the per-account or per-auction
+        mutation bucket is exhausted, or the durable event budget reserved for
+        auction lifecycle work has been reached. No `Retry-After` or
+        `X-RateLimit-*` header is emitted. Retrying with the same idempotency
+        key is safe.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: auction_mutation_rate_limited, message: auction mutation rate limit exceeded }
+    InternalError:
+      description: |
+        `internal_error` — the owner is draining, its journal is unavailable,
+        invitation publication for an idempotent replay is still pending, or
+        an untyped dependency failure occurred. `encode_create`,
+        `encode_quote`, and `encode_quote_preflight` indicate the request
+        could not be re-encoded for owner routing.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: internal_error, message: auction request could not be completed }
+    OwnerUnavailable:
+      description: |
+        The owning shard for this auction could not be reached or answered
+        unusably: `auction_owner_unavailable`, `owner_routing_unavailable`, or
+        `owner_response_invalid`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: auction_owner_unavailable }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      description: |
+        Flat error envelope used by every JSON error response. `message` is
+        present on rejections raised by the auction engine and absent on
+        transport-level rejections such as `invalid_list_page` or
+        `payload_too_large`. Match on `error`; never parse `message`.
+      properties:
+        error: { type: string, description: Stable machine-readable code, or the durable auction reason code on a 422/409 rejection. }
+        message: { type: string, description: Human-readable detail; not a stable contract. }
+    Status:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string }
+    InvitationInboxItem:
+      type: object
+      required: [auction_id, invitation, close_time, published_at]
+      properties:
+        auction_id: { type: string, format: uuid }
+        invitation: { $ref: "#/components/schemas/InvitationPayload" }
+        close_time: { type: string, format: date-time }
+        published_at: { type: string, format: date-time }
+    InvitationPayload:
+      type: object
+      required:
+        [
+          auction_id,
+          market_id,
+          outcome_id,
+          side,
+          fill_instruction,
+          min_fill_quantity_atoms,
+          max_fill_quantity_atoms,
+          execution_objective_quantity_atoms,
+          objective_mode,
+          close_time,
+          venue_scope,
+          customer_class,
+          allocation_policy,
+          price_tick_atoms,
+          quantity_tick_atoms,
+          minimum_leg_atoms,
+          maximum_mm_concentration_bps,
+          private_fee_profile,
+        ]
+      properties:
+        auction_id: { type: string, format: uuid }
+        market_id: { type: string }
+        outcome_id: { type: string }
+        side: { enum: [BUY, SELL] }
+        fill_instruction: { enum: [FOK, FLEXIBLE] }
+        min_fill_quantity_atoms: { type: integer, format: int64 }
+        target_fill_quantity_atoms: { type: integer, format: int64 }
+        max_fill_quantity_atoms: { type: integer, format: int64 }
+        execution_objective_quantity_atoms: { type: integer, format: int64 }
+        objective_mode: { enum: [STOP_AT_TARGET, SEEK_MAXIMUM] }
+        close_time: { type: string, format: date-time }
+        venue_scope: { type: array, items: { type: string } }
+        customer_class: { type: string }
+        allocation_policy:
+          { enum: [PRICE_FIRST, COMPLETION_FIRST] }
+        price_tick_atoms: { type: integer, format: int64 }
+        quantity_tick_atoms: { type: integer, format: int64 }
+        minimum_leg_atoms: { type: integer, format: int64 }
+        maximum_mm_concentration_bps: { type: integer, format: int64 }
+        private_fee_profile: { $ref: "#/components/schemas/FeeProfile" }
+        originator_identity:
+          type: string
+          description: Present only when the auction's identity policy is REVEAL_TO_INVITEES.
+    CreateAuction:
+      type: object
+      required:
+        [
+          market_id,
+          outcome_id,
+          side,
+          fill_instruction,
+          hard_reserve_price_atoms,
+          slippage_reference_policy,
+          max_cumulative_slippage_bps,
+          venue_scope,
+          audience_mode,
+          identity_disclosure_mode,
+          allocation_priority_policy,
+          max_total_execution_time_ms,
+        ]
+      properties:
+        idempotency_key:
+          { type: string, description: May be supplied instead of the header }
+        market_id: { type: string, maxLength: 128 }
+        outcome_id: { type: string, maxLength: 128 }
+        side: { enum: [BUY, SELL] }
+        fill_instruction: { enum: [FOK, FLEXIBLE] }
+        fixed_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+        flexible_fill: { $ref: "#/components/schemas/FlexibleFill" }
+        hard_reserve_price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        slippage_reference_price_atoms:
+          allOf: [{ $ref: "#/components/schemas/PriceAtoms" }]
+          description: Required only when slippage_reference_policy is APPROVED_EXPLICIT.
+        slippage_reference_policy:
+          { enum: [PUBLIC_EXECUTABLE_VWAP, APPROVED_EXPLICIT] }
+        max_cumulative_slippage_bps:
+          { type: integer, format: int64, minimum: 0, maximum: 10000 }
+        minimum_private_improvement_bps:
+          { type: integer, format: int64, minimum: 0, maximum: 10000 }
+        maximum_mm_concentration_bps:
+          {
+            type: integer,
+            format: int64,
+            minimum: 1,
+            maximum: 10000,
+            default: 10000,
+          }
+        minimum_mm_reliability_tier:
+          { enum: [UNRATED, C, B, A], default: UNRATED }
+        allocation_priority_policy:
+          enum: [PRICE_FIRST, COMPLETION_FIRST]
+          description: Frozen before invitations; price-first minimizes marginal economics while completion-first may prefer one firm able to complete the target.
+        auction_ttl_ms:
+          {
+            type: integer,
+            format: int64,
+            minimum: 2000,
+            maximum: 2592000000,
+            default: 5000,
+            description: "Custom sealed bidding window from 2 seconds through 30 days. Omit or send 0 to accept the 5-second default.",
+          }
+        venue_scope:
+          {
+            type: array,
+            minItems: 1,
+            maxItems: 8,
+            items: { type: string, maxLength: 64 },
+          }
+        audience_mode: { enum: [MANUAL, SAVED_GROUP, RECOMMENDED] }
+        allowed_participants:
+          { type: array, maxItems: 16, items: { type: string, maxLength: 128 } }
+        saved_group_id: { type: string, maxLength: 128 }
+        excluded_participants:
+          { type: array, maxItems: 16, items: { type: string, maxLength: 128 } }
+        max_recipients: { type: integer, minimum: 1, maximum: 16, default: 16 }
+        identity_disclosure_mode:
+          { enum: [CLASS_ONLY, REVEAL_TO_INVITEES, REVEAL_ON_AWARD] }
+        fallback_ladder:
+          type: array
+          maxItems: 4
+          items: { $ref: "#/components/schemas/FallbackRung" }
+        max_total_execution_time_ms:
+          { type: integer, format: int64, minimum: 1, maximum: 120000 }
+        client_metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: >-
+            Bounded non-authoritative display metadata, at most 32 entries and
+            4 KiB total. market_title and market_provider provide the catalog
+            label. Optional client_order_id is a 1–64 character desk
+            reconciliation reference using letters, numbers, or . _ : / -; it
+            is originator-only and should also derive the create idempotency
+            key.
+    FlexibleFill:
+      type: object
+      required:
+        [min_fill_quantity_atoms, target_fill_quantity_atoms, max_fill_quantity_atoms, objective_mode]
+      properties:
+        min_fill_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+        target_fill_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+        max_fill_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+        objective_mode: { enum: [STOP_AT_TARGET, SEEK_MAXIMUM] }
+      description: Minimum, target, and maximum are always explicit; SEEK_MAXIMUM may continue beyond the target but never beyond maximum.
+    OriginatorPreflight:
+      type: object
+      required:
+        [status, requested_quantity_atoms, maximum_executable_quantity_atoms, checked_at, valid_until, routes]
+      properties:
+        status: { enum: [EXECUTABLE, INSUFFICIENT_CAPACITY] }
+        requested_quantity_atoms:
+          { type: string, pattern: '^[1-9]\d*$', description: Requested maximum quantity encoded exactly. }
+        maximum_executable_quantity_atoms:
+          { type: string, pattern: '^(0|[1-9]\d*)$', description: Minimum currently executable quantity across all requested routes. }
+        checked_at: { type: string, format: date-time }
+        valid_until:
+          { type: string, format: date-time, description: Earliest risk, mapping, rule, or fee authority expiry across the route set. }
+        routes:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items: { $ref: "#/components/schemas/OriginatorRouteCapacity" }
+    OriginatorRouteCapacity:
+      type: object
+      required:
+        [venue, rails, resource_type, maximum_executable_quantity_atoms, risk_source_sequence, risk_valid_until, authority_valid_until]
+      properties:
+        venue: { type: string, maxLength: 64 }
+        rails:
+          type: array
+          minItems: 1
+          maxItems: 3
+          uniqueItems: true
+          items: { enum: [PRIVATE_BLOCK, VENUE_NATIVE_RFQ, CLOB] }
+        resource_type: { enum: [COLLATERAL, POSITION] }
+        maximum_executable_quantity_atoms: { type: string, pattern: '^(0|[1-9]\d*)$' }
+        risk_source_sequence:
+          { type: string, pattern: '^[1-9]\d*$', description: Opaque venue-account authority sequence. }
+        risk_valid_until: { type: string, format: date-time }
+        authority_valid_until:
+          { type: string, format: date-time, description: Earliest mapping, route-rule, fee, or execution-deadline expiry for this route. }
+    QuotePreflightRequest:
+      type: object
+      required: [price_atoms, max_executable_quantity_atoms]
+      additionalProperties: false
+      properties:
+        price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        max_executable_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+    QuotePreflight:
+      type: object
+      required:
+        [status, requested_quantity_atoms, maximum_executable_quantity_atoms, checked_at, valid_until, routes]
+      properties:
+        status: { enum: [EXECUTABLE, INSUFFICIENT_CAPACITY] }
+        requested_quantity_atoms: { type: string, pattern: '^[1-9]\d*$' }
+        maximum_executable_quantity_atoms:
+          { type: string, pattern: '^(0|[1-9]\d*)$', description: Minimum price-specific capacity across all frozen routes. }
+        checked_at: { type: string, format: date-time }
+        valid_until: { type: string, format: date-time }
+        routes:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/QuoteRouteCapacity" }
+    QuoteRouteCapacity:
+      type: object
+      required:
+        [venue, resource_type, maximum_executable_quantity_atoms, risk_source_sequence, risk_valid_until, authority_valid_until]
+      properties:
+        venue: { type: string, maxLength: 64 }
+        resource_type: { enum: [COLLATERAL, POSITION] }
+        maximum_executable_quantity_atoms: { type: string, pattern: '^(0|[1-9]\d*)$' }
+        risk_source_sequence: { type: string, pattern: '^[1-9]\d*$' }
+        risk_valid_until: { type: string, format: date-time }
+        authority_valid_until:
+          { type: string, format: date-time, description: Earliest frozen mapping, route-rule, fee, reservation, or execution-deadline expiry for this route. }
+    FallbackRung:
+      type: object
+      required: [action]
+      properties:
+        action: { enum: [EXECUTE, CANCEL_REMAINDER], default: EXECUTE }
+        rail: { enum: [VENUE_NATIVE_RFQ, CLOB] }
+        venue: { type: string }
+        limit_price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        minimum_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+        maximum_quantity_atoms: { type: integer, format: int64, minimum: 1 }
+        maximum_fraction_bps:
+          { type: integer, format: int64, minimum: 1, maximum: 10000, default: 10000 }
+        timeout_ms: { type: integer, format: int64, minimum: 1, default: 2000 }
+        maximum_quote_age_ms:
+          { type: integer, format: int64, minimum: 1, maximum: 5000, default: 500 }
+        allow_partial: { type: boolean }
+        on_unavailable: { enum: [CONTINUE, STOP], default: CONTINUE }
+        on_reject: { enum: [CONTINUE, STOP], default: CONTINUE }
+        fee_profile:
+          {
+            $ref: "#/components/schemas/FeeProfile",
+            description: Server-pinned; caller values are not authoritative.,
+          }
+        route_rule_profile:
+          {
+            $ref: "#/components/schemas/RouteRuleProfile",
+            description: Server-pinned executable venue and mapping contract; caller values are not authoritative.,
+          }
+    SubmitQuote:
+      type: object
+      required: [revision, price_atoms, max_executable_quantity_atoms]
+      additionalProperties: false
+      properties:
+        idempotency_key: { type: string, description: May be supplied instead of the header }
+        revision: { type: integer, format: int64, minimum: 1 }
+        price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        max_executable_quantity_atoms:
+          { type: integer, format: int64, minimum: 1 }
+    PriceAtoms:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 10000
+      description: One atom is 0.01 cent of probability-dollar price.
+    Quote:
+      type: object
+      required:
+        [quote_id, auction_id, revision, price_atoms, max_executable_quantity_atoms, receive_sequence, received_at, status]
+      properties:
+        quote_id: { type: string, format: uuid }
+        auction_id: { type: string, format: uuid }
+        revision:
+          type: string
+          pattern: '^(0|[1-9]\d*)$'
+          description: Opaque unsigned quote revision; compare as a decimal string.
+        price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        max_executable_quantity_atoms: { type: integer, format: int64 }
+        receive_sequence:
+          type: string
+          pattern: '^(0|[1-9]\d*)$'
+          description: Participant-scoped durable acknowledgement sequence encoded as an opaque decimal string; private FIFO coordinates are never exposed.
+        received_at: { type: string, format: date-time }
+        status:
+          {
+            enum: [ACTIVE, WITHDRAWN, SUPERSEDED, FROZEN, SELECTED, INELIGIBLE],
+          }
+    QuoteMutationResult:
+      type: object
+      required: [quote, duplicate]
+      properties:
+        quote: { $ref: "#/components/schemas/Quote" }
+        duplicate:
+          type: boolean
+          description: True when the identical durable withdrawal already existed.
+    AuctionMutationResult:
+      type: object
+      required: [auction, duplicate]
+      properties:
+        auction: { $ref: "#/components/schemas/AuctionView" }
+        duplicate:
+          type: boolean
+          description: True when the identical durable cancellation already existed.
+    CancelAuctionRequest:
+      type: object
+      additionalProperties: false
+      description: Optional. Omitting the body cancels with reason_code UNSPECIFIED.
+      properties:
+        idempotency_key:
+          type: string
+          description: Must equal the Idempotency-Key header when supplied.
+        reason_code:
+          enum: [UNSPECIFIED, CLIENT_REQUEST, RISK_REDUCTION, MARKET_VIEW_CHANGED, ROUTING_CHANGE, DUPLICATE_ORDER, OTHER]
+          default: UNSPECIFIED
+          description: Originator-private durable desk reason for cancelling the live auction.
+        operator_note:
+          type: string
+          maxLength: 240
+          description: Optional bounded originator-private audit note; required when reason_code is OTHER.
+    AuctionView:
+      type: object
+      required: [auction]
+      description: Fields are filtered by originator/invitee role and identity policy.
+      properties:
+        auction: { $ref: "#/components/schemas/Auction" }
+        originator_identity:
+          type: string
+          description: Policy-authorized public program selector; never a program, execution-account, venue-account, or credential identifier.
+        audience_participant_ids:
+          type: array
+          description: Originator-only policy-authorized public counterparty selectors; hidden execution identities never cross this boundary.
+          items: { type: string }
+        own_quote: { $ref: "#/components/schemas/Quote" }
+        allocations:
+          { type: array, items: { $ref: "#/components/schemas/Allocation" } }
+    AuctionAuditTimeline:
+      type: object
+      required: [auction_id, as_of, complete, events]
+      properties:
+        auction_id: { type: string, format: uuid }
+        as_of: { type: string, format: date-time }
+        complete:
+          type: boolean
+          enum: [true]
+          description: True only after the selected durable history is verified contiguous through its authoritative snapshot.
+        events:
+          type: array
+          maxItems: 4096
+          description: Ordered caller-visible events. Hidden events do not leave sequence gaps because raw authority coordinates are never exposed.
+          items: { $ref: "#/components/schemas/AuctionAuditEvent" }
+    AuctionAuditEvent:
+      type: object
+      required: [type, occurred_at]
+      properties:
+        type: { type: string }
+        occurred_at: { type: string, format: date-time }
+        state_before: { type: string }
+        state_after: { type: string }
+        reason: { type: string }
+        actor_scope: { enum: [SYSTEM, YOU, COUNTERPARTY] }
+        quote_revision:
+          { type: string, pattern: '^(0|[1-9]\d*)$', description: Caller-owned quote revision only. }
+        quote_price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        quote_quantity_atoms:
+          { type: integer, format: int64, minimum: 1, description: Caller-owned quote quantity only. }
+        cancellation_reason_code:
+          enum: [UNSPECIFIED, CLIENT_REQUEST, RISK_REDUCTION, MARKET_VIEW_CHANGED, ROUTING_CHANGE, DUPLICATE_ORDER, OTHER]
+          description: Originator-only durable cancellation instruction; never returned to invitees.
+        operator_note:
+          { type: string, maxLength: 240, description: Originator-only cancellation note. }
+    AuctionPage:
+      type: object
+      required: [auctions, completed_as_of, active_owners_complete]
+      properties:
+        auctions:
+          type: array
+          items: { $ref: "#/components/schemas/AuctionView" }
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next older page; absent at the end.
+        completed_as_of:
+          type: string
+          format: date-time
+          description: Projection time of the newest completed entry on this page; the zero time when the page contains no completed auction.
+        active_owners_complete:
+          type: boolean
+          description: False when one or more live owner shards could not answer this page.
+    Auction:
+      type: object
+      description: |
+        Role-filtered auction state. Reserve, slippage, fallback, and public
+        benchmark fields are present only for the originator.
+      properties:
+        auction_id: { type: string, format: uuid }
+        owner_epoch:
+          type: string
+          pattern: '^(0|[1-9]\d*)$'
+          description: Opaque unsigned owner-generation counter; compare as a decimal string.
+        customer_class: { type: string }
+        market_id: { type: string }
+        outcome_id: { type: string }
+        side: { enum: [BUY, SELL] }
+        fill_instruction: { enum: [FOK, FLEXIBLE] }
+        min_fill_quantity_atoms: { type: integer, format: int64 }
+        target_fill_quantity_atoms: { type: integer, format: int64 }
+        max_fill_quantity_atoms: { type: integer, format: int64 }
+        objective_mode: { enum: [STOP_AT_TARGET, SEEK_MAXIMUM] }
+        allocation_priority_policy: { enum: [PRICE_FIRST, COMPLETION_FIRST] }
+        execution_objective_quantity_atoms: { type: integer, format: int64 }
+        filled_quantity_atoms: { type: integer, format: int64 }
+        hard_reserve_price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        slippage_reference_price_atoms:
+          { $ref: "#/components/schemas/PriceAtoms" }
+        slippage_reference_policy:
+          { enum: [PUBLIC_EXECUTABLE_VWAP, APPROVED_EXPLICIT] }
+        max_cumulative_slippage_bps:
+          { type: integer, format: int64, minimum: 0, maximum: 10000 }
+        minimum_private_improvement_bps:
+          { type: integer, format: int64, minimum: 0, maximum: 10000 }
+        maximum_mm_concentration_bps:
+          { type: integer, format: int64, minimum: 1, maximum: 10000 }
+        minimum_mm_reliability_tier: { enum: [UNRATED, C, B, A] }
+        public_benchmark_price_atoms:
+          { $ref: "#/components/schemas/PriceAtoms" }
+        public_benchmark_quantity_atoms:
+          { type: integer, format: int64, minimum: 1 }
+        public_benchmark_observed_at: { type: string, format: date-time }
+        public_benchmark_source: { type: string }
+        benchmark_calculation_version: { type: string }
+        max_total_execution_time_ms:
+          { type: integer, format: int64, minimum: 1 }
+        venue_scope: { type: array, items: { type: string } }
+        audience_mode: { enum: [MANUAL, SAVED_GROUP, RECOMMENDED] }
+        max_recipients: { type: integer, minimum: 1, maximum: 16 }
+        identity_disclosure_mode:
+          { enum: [CLASS_ONLY, REVEAL_TO_INVITEES, REVEAL_ON_AWARD] }
+        fallback_ladder:
+          type: array
+          items: { $ref: "#/components/schemas/FallbackRung" }
+        rule_profile: { $ref: "#/components/schemas/RuleProfile" }
+        client_metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: Catalog labels are participant-visible. The optional client_order_id is returned only to the originator for OMS reconciliation.
+        invitation_delivery:
+          allOf: [{ $ref: "#/components/schemas/InvitationDelivery" }]
+          description: Originator-only durable delivery summary.
+        state:
+          enum:
+            [
+              PENDING_INVITATIONS,
+              OPEN,
+              CLOSING,
+              EXECUTING,
+              RECONCILING,
+              PROCESSING,
+              FILLED,
+              PARTIALLY_FILLED,
+              UNFILLED,
+              CANCELLED,
+              FAILED,
+              COMPLETED,
+            ]
+          description: PROCESSING is an invitee-only privacy projection used after close while another participant's execution or reconciliation state remains hidden.
+        final_reason:
+          enum:
+            [
+              OBJECTIVE_REACHED,
+              TARGET_NOT_REACHED,
+              MAXIMUM_NOT_REACHED,
+              INSUFFICIENT_SIZE,
+              MIN_FILL_NOT_REACHABLE,
+              NO_BIDS,
+              RESERVE_NOT_MET,
+              MIN_BLOCK_SIZE_NOT_MET,
+              REFERENCE_UNAVAILABLE,
+              NO_PRIVATE_IMPROVEMENT,
+              NO_ELIGIBLE_QUOTES,
+              USER_CANCELLED,
+              AUCTION_OWNER_LOST,
+              MINIMUM_TRANCHE_BROKEN,
+              BROKEN_FOK,
+              EXECUTION_UNKNOWN,
+              RECONCILIATION_REQUIRED,
+              LADDER_EXHAUSTED,
+              CANCEL_REMAINDER,
+              RUNG_UNAVAILABLE,
+              RUNG_QUOTE_STALE,
+              RUNG_MINIMUM_NOT_REACHED,
+              RUNG_SLIPPAGE_BREACH,
+              VENUE_REJECTED,
+              EXECUTION_REJECTED,
+              EXECUTION_TIMEOUT,
+              WINNER_EXPIRED,
+              ATOMICITY_UNAVAILABLE,
+              VENUE_UNAVAILABLE,
+              VENUE_NATIVE_RFQ_NO_RESPONSE,
+              VENUE_NATIVE_RFQ_RESERVE_BREACH,
+              VENUE_NATIVE_RFQ_SLIPPAGE_BREACH,
+              VENUE_NATIVE_RFQ_FAILED,
+              CLOB_NO_LIQUIDITY,
+              CLOB_RESERVE_BREACH,
+              CLOB_SLIPPAGE_BREACH,
+              CLOB_FALLBACK_FAILED,
+              MAPPING_INVALIDATED,
+              COLLATERAL_INVALIDATED,
+              PARTICIPANT_INELIGIBLE,
+              SELF_TRADE_PREVENTED,
+              UNAUTHORIZED_SIZE,
+              SIGNER_UNAVAILABLE,
+              MARKET_HALTED,
+              VENUE_SESSION_LOST,
+              MM_POPULATION_UNAVAILABLE,
+              AUCTION_EXPIRED,
+              TICK_PROFILE_STALE,
+              VENUE_RULE_CHANGED,
+              UNSUPPORTED_RAIL,
+              INVALID_FALLBACK_POLICY,
+              TOTAL_DEADLINE_EXCEEDED,
+              INTERNAL_ERROR,
+              BID_INVALID,
+              INVALID_PRICE_RANGE,
+              INVALID_PRICE_TICK,
+              INVALID_QUANTITY_TICK,
+              REVISION_CONFLICT,
+              LATE_BID,
+            ]
+        cancellation_reason_code:
+          enum: [UNSPECIFIED, CLIENT_REQUEST, RISK_REDUCTION, MARKET_VIEW_CHANGED, ROUTING_CHANGE, DUPLICATE_ORDER, OTHER]
+          description: Originator-only durable cancellation instruction.
+        cancellation_note:
+          { type: string, maxLength: 240, description: Originator-only bounded operator audit note. }
+        reason_history:
+          type: array
+          items: { $ref: "#/components/schemas/ReasonRecord" }
+        minimum_tranche_established: { type: boolean }
+        allocation_calculation_version: { type: string }
+        capacity_authority_status:
+          enum:
+            [
+              PENDING_VENUE_RECONCILIATION,
+              PENDING_PORTFOLIO_COVERAGE,
+              PORTFOLIO_COVERAGE_CONFIRMED,
+              AUTHORITY_EVIDENCE_UNAVAILABLE,
+            ]
+          description: Fail-closed venue and portfolio-capacity reconciliation state.
+        capacity_covered_by_source_sequence:
+          type: string
+          pattern: "^(0|[1-9][0-9]*)$"
+          description: Originator-only sealed portfolio source sequence that explicitly covered every confirmed execution token.
+        capacity_covered_at:
+          type: string
+          format: date-time
+          description: Originator-only time at which explicit sealed coverage retired the capacity fence.
+        capacity_portfolio_watermark:
+          type: string
+          maxLength: 256
+          description: Originator-only opaque portfolio revision certified by the covering snapshot.
+        open_time: { type: string, format: date-time }
+        close_time: { type: string, format: date-time }
+        finalized_at: { type: string, format: date-time }
+        sequence:
+          type: string
+          pattern: '^(0|[1-9]\d*)$'
+          description: Opaque auction authority sequence; compare as a decimal string.
+    InvitationDelivery:
+      type: object
+      required: [requested_count, delivered_count, by_transport, participants]
+      properties:
+        requested_count: { type: integer, minimum: 0, maximum: 16 }
+        delivered_count: { type: integer, minimum: 0, maximum: 16 }
+        by_transport:
+          type: object
+          additionalProperties: false
+          required: [BROWSER, FIX]
+          properties:
+            BROWSER: { type: integer, minimum: 0, maximum: 16 }
+            FIX: { type: integer, minimum: 0, maximum: 16 }
+        last_delivered_at: { type: string, format: date-time }
+        participants:
+          type: array
+          maxItems: 16
+          description: Originator-only delivery evidence keyed by public counterparty selector; hidden execution and delivery-session identities are never exposed.
+          items: { $ref: "#/components/schemas/InvitationParticipantDelivery" }
+    InvitationParticipantDelivery:
+      type: object
+      required: [participant_id, delivered]
+      properties:
+        participant_id:
+          type: string
+          maxLength: 128
+          description: Public counterparty selector frozen for this auction.
+        delivered: { type: boolean }
+        transport: { enum: [BROWSER, FIX] }
+        delivered_at: { type: string, format: date-time }
+    RuleProfile:
+      type: object
+      description: Immutable venue, tick, atomicity, freshness, and fee-assumption snapshot pinned at admission.
+      required:
+        [
+          version,
+          venue,
+          market_class,
+          private_rail,
+          price_tick_atoms,
+          quantity_tick_atoms,
+          minimum_block_atoms,
+          minimum_leg_atoms,
+          maximum_allocation_atoms,
+          atomic_private_execution,
+          public_benchmark_fee_scale_ppm,
+          public_benchmark_max_age_ms,
+          benchmark_calculation_version,
+          valid_until,
+        ]
+      properties:
+        version: { type: string }
+        venue: { type: string }
+        market_class: { type: string }
+        private_rail: { enum: [PRIVATE_BLOCK, VENUE_NATIVE_RFQ, CLOB] }
+        price_tick_atoms: { type: integer, format: int64, minimum: 1 }
+        quantity_tick_atoms: { type: integer, format: int64, minimum: 1 }
+        minimum_block_atoms: { type: integer, format: int64, minimum: 0 }
+        minimum_leg_atoms: { type: integer, format: int64, minimum: 0 }
+        maximum_allocation_atoms: { type: integer, format: int64, minimum: 1 }
+        atomic_private_execution: { type: boolean }
+        private_fee_profile: { $ref: "#/components/schemas/FeeProfile" }
+        public_benchmark_fee_scale_ppm:
+          { type: integer, format: int64, minimum: 0, maximum: 1000000 }
+        public_benchmark_max_age_ms:
+          { type: integer, format: int64, minimum: 1, maximum: 5000 }
+        benchmark_calculation_version: { type: string }
+        minimum_scorecard_sample_count: { type: integer, minimum: 1, default: 10 }
+        maximum_scorecard_age_ms: { type: integer, format: int64, minimum: 1 }
+        valid_until: { type: string, format: date-time }
+    FeeProfile:
+      type: object
+      required:
+        [
+          fee_profile_id,
+          fee_profile_version,
+          model,
+          rate_ppm,
+          fixed_fee_atoms,
+          minimum_fee_atoms,
+          prediction_fee_scale_ppm,
+          rounding_mode,
+          valid_until,
+        ]
+      properties:
+        fee_profile_id: { type: string }
+        fee_profile_version: { type: string }
+        model: { enum: [NONE, NOTIONAL_PPM, PREDICTION_MARKET], default: NONE }
+        rate_ppm: { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
+        fixed_fee_atoms: { type: integer, format: int64 }
+        minimum_fee_atoms: { type: integer, format: int64, minimum: 0 }
+        prediction_fee_scale_ppm:
+          { type: integer, format: int64, minimum: -1000000, maximum: 1000000 }
+        rounding_mode: { enum: [AGAINST_ORIGINATOR, NEAREST], default: AGAINST_ORIGINATOR }
+        valid_until: { type: string, format: date-time }
+    RouteRuleProfile:
+      type: object
+      required:
+        [
+          version,
+          venue,
+          rail,
+          mapping_version,
+          venue_market_id,
+          venue_outcome_id,
+          route_id,
+          price_tick_atoms,
+          quantity_tick_atoms,
+          minimum_order_atoms,
+          maximum_order_atoms,
+          atomic,
+          self_trade_prevention_mode,
+          control_group_version,
+          valid_from,
+          valid_until,
+          mapping_valid_from,
+          mapping_valid_until,
+        ]
+      properties:
+        version: { type: string }
+        venue: { type: string }
+        rail: { enum: [VENUE_NATIVE_RFQ, CLOB] }
+        mapping_version: { type: string }
+        venue_market_id: { type: string }
+        venue_outcome_id: { type: string }
+        route_id: { type: string }
+        price_tick_atoms: { type: integer, format: int64, minimum: 1 }
+        quantity_tick_atoms: { type: integer, format: int64, minimum: 1 }
+        minimum_order_atoms: { type: integer, format: int64, minimum: 1 }
+        maximum_order_atoms: { type: integer, format: int64, minimum: 1 }
+        atomic: { type: boolean }
+        self_trade_prevention_mode: { enum: [CONTROL_GROUP_REJECT] }
+        control_group_version: { type: string }
+        valid_from: { type: string, format: date-time }
+        valid_until: { type: string, format: date-time }
+        mapping_valid_from: { type: string, format: date-time }
+        mapping_valid_until: { type: string, format: date-time }
+    ReasonRecord:
+      type: object
+      required: [reason, stage, occurred_at, contributing]
+      properties:
+        reason: { type: string }
+        stage: { type: string }
+        rung_index: { type: integer, minimum: 0 }
+        occurred_at: { type: string, format: date-time }
+        contributing: { type: boolean }
+    Allocation:
+      type: object
+      required: [allocation_id, price_atoms, quantity_atoms, rail, venue, minimum_tranche, execution_status]
+      properties:
+        allocation_id: { type: string, format: uuid }
+        participant_id:
+          type: string
+          description: Policy-authorized public counterparty selector when visible to this principal; never a hidden execution or venue-account identifier.
+        price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        quantity_atoms: { type: integer, format: int64 }
+        rail: { enum: [PRIVATE_BLOCK, VENUE_NATIVE_RFQ, CLOB] }
+        venue: { type: string }
+        minimum_tranche: { type: boolean }
+        execution_status:
+          { enum: [PLANNED, SUBMITTED, CONFIRMED, REJECTED, UNKNOWN] }
+        venue_execution_id: { type: string }
+        confirmed_quantity_atoms: { type: integer, format: int64 }
+        confirmed_price_atoms: { $ref: "#/components/schemas/PriceAtoms" }
+        expected_fee_atoms: { type: string, pattern: "^(0|-?[1-9][0-9]*)$" }
+        expected_all_in_value_atoms: { type: string, pattern: "^(0|-?[1-9][0-9]*)$" }
+        confirmed_fee_atoms: { type: string, pattern: "^(0|-?[1-9][0-9]*)$" }
+        confirmed_all_in_value_atoms: { type: string, pattern: "^(0|-?[1-9][0-9]*)$" }
+        rung_index: { type: integer, minimum: 0 }
+        submitted_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time }
+        finalized_at: { type: string, format: date-time }

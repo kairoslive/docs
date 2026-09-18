@@ -1,0 +1,193 @@
+---
+title: "Venue normalization"
+description: "How Hyperliquid, Polymarket Perps, and Kalshi Margin map to one contract"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, enabled in production and staging today; a
+deployment with the flag off returns `404` for every perpetual route. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+Every place Hyperliquid, Polymarket Perps, and Kalshi Margin differ, collected
+in one set of tables: venue slugs per surface, quantity units, side spellings,
+notional rules, and what each venue does not publish.
+
+Kairos standardizes common economic facts and preserves native differences.
+The goal is one query surface without a "lowest common denominator" that loses
+the information required for trading, audit, or research.
+
+<Note>
+**Beta:** The public identity, asset-role, quantity-unit, and book
+normalization rules on this page are live. Venue capabilities can still
+change before general availability.
+</Note>
+
+## One venue, four namespaces
+
+A venue has a different spelling on each surface. These are deliberate
+namespaces, not aliases to guess at runtime.
+
+| Venue | WebSocket `provider` | REST `{venue}` path and `?venue=` | v2 NATS subject token | Protobuf `Provider` enum |
+|---|---|---|---|---|
+| Hyperliquid perps | `hyperliquid_perps` | `hyperliquid` | `hyperliquid` | `PROVIDER_HYPERLIQUID_PERPS` |
+| Polymarket Perps | `polymarket_perps` | `polymarket_perps` | `polymarket_perps` | `PROVIDER_POLYMARKET_PERPS` |
+| Kalshi Margin | `kalshi_margin` | `kalshi_margin` | `kalshi_margin` | `PROVIDER_KALSHI_MARGIN` |
+
+<Note>
+**Only Hyperliquid diverges — and it is the one you will get wrong.** It
+diverges because `hyperliquid` already means the HIP-4 outcome markets on the
+WebSocket.
+</Note>
+
+| Mistake | Result |
+|---|---|
+| `hyperliquid_perps` sent to the REST snapshot | `400 invalid_request` / `unsupported perpetual venue` |
+| `hyperliquid` sent with `perps_book` | A WebSocket error frame |
+
+## Common output
+
+All supported venues map to the same core concepts where semantics agree:
+
+- stable instrument and source identity
+- exact prices, quantities, rates, and timestamps
+- direct bid and ask books
+- public trades and trade candles
+- typed mark, index, oracle, mid, and related market state
+- funding observations with interval, phase, and sign convention
+- trading accounts, orders, fills, balances, positions, and ledger entries
+- risk schedules and liquidation events
+
+<Warning>
+**The first six are live; the last two are design targets.** The canonical
+schema has no account, order, fill, balance, position, or ledger message, and
+its one liquidation message, `kairos.v2.PublicLiquidation`, is defined but
+never published.
+</Warning>
+
+## Venue differences
+
+| Area                 | Hyperliquid                                                          | Polymarket Perps                                                 | Kalshi Margin                                                       |
+| -------------------- | -------------------------------------------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Target instrument namespace | Standard perps; HIP-3 dex namespaces remain design-only         | Perps instrument catalog                                         | Margin-market catalog                                               |
+| Native size          | Commonly base-denominated; instrument metadata remains authoritative | Contract quantity is preserved until multiplier rules are proven | Contract quantity with listing specifications                       |
+| Book delivery        | Venue book images with declared depth/grouping                       | Perps book and best-bid/offer channels                           | REST snapshots and WebSocket order-book updates                     |
+| Reference state      | Mark, oracle, mid, open interest, funding and asset contexts         | Tickers, statistics, funding and instrument configuration        | Market state, funding estimates, risk parameters and risk endpoints |
+| Margin               | Cross, isolated, and venue-specific isolated modes                   | Venue portfolio and instrument configuration                     | Margin accounts and subaccounts                                     |
+| Private data         | Clearinghouse state, orders and fills                                | Portfolio, orders, fills, balances and funding                   | Balances, positions, fills and private order updates                |
+
+This table is directional. A field is emitted only when the specific upstream
+contract and listing prove its meaning.
+
+### Hyperliquid: standard main-dex only
+
+<Note>
+**HIP-3 `dex:coin` identifiers are rejected, not approximated.** The REST
+snapshot supports Hyperliquid's standard main-dex perpetual universe only, in
+every environment. HIP-3 identity, metadata, collateral, and funding
+semantics remain design work, and the endpoint refuses those identifiers
+rather than applying standard-perp assumptions.
+</Note>
+
+For the supported standard main-dex universe, Hyperliquid prices are quoted in
+USDT except for the HYPE and PURR contracts, which are quoted in USDC. Margin
+collateral and settlement are USDC in both cases. The snapshot keeps those
+roles separate in the id itself:
+
+| Symbol | Canonical id | Quote | Collateral / settlement |
+|---|---|---|---|
+| `BTC` | `hl-mainnet-btc-usdt` | USDT | USDC |
+| `HYPE` | `hl-mainnet-hype-usdc` | USDC | USDC |
+| `PURR` | `hl-mainnet-purr-usdc` | USDC | USDC |
+
+## Native facts that remain visible
+
+Normalization does not discard:
+
+- venue instrument, account, order, fill, trade, and liquidation IDs
+- native quantity and unit
+- raw margin or order-mode code
+- source sequence and its scope
+- price grouping and requested book depth
+- venue funding interval and sign
+- venue-specific status or risk extensions
+
+Some of those native facts are re-spelled rather than passed through, and the
+mapping is fixed:
+
+| Fact | Hyperliquid | Polymarket Perps | Kalshi Margin |
+|---|---|---|---|
+| Trade aggressor side | `B` / `A` | `long` / `short` | `taker_side` `bid` / `ask` |
+| Native quantity unit | `base_asset` | `contracts` | `contracts` |
+| Candle volume unit | `base_asset` | `base_asset` | `contracts` |
+| `price_unit` | `quote_per_base_asset` | `quote_per_base_asset` | `quote_per_contract` |
+| `notional_formula` | `quantity_times_price` | `unavailable_contract_multiplier` | `quantity_times_price` |
+| `contract_multiplier` | absent | absent | the venue's `contract_size` |
+| Collateral / settlement | USDC / USDC | pUSD / pUSD | USD / USD |
+| `environment` | `mainnet` | `mainnet` | `production` |
+| Upstream book delivery | `l2Book` image, 20 levels a side | full book pushed every 100 ms | authenticated RSA-PSS WebSocket, per-`sid` sequenced updates applied to an internal book |
+
+<Note>
+**All three sides normalize to lowercase `buy` / `sell`, and a value outside
+the listed set is an error, not a default.** Note the two rows that are easy
+to miss: Polymarket Perps uses `contracts` for trades and books but
+`base_asset` for candle volume, and it is the only venue whose
+`notional_formula` is `unavailable_contract_multiplier` — meaning Kairos
+cannot prove a notional conversion for it and you must not invent one.
+</Note>
+
+## Never inferred
+
+Kairos does not:
+
+- apply prediction-market complement pricing to a perp book
+- assume every quantity is base-asset size
+- infer a contract multiplier from observed notional
+- label an unmarked trade as a liquidation
+- infer aggressor side from position direction
+- replace an absent mark with mid or last trade
+- assume every positive funding rate has the same payer
+- merge accounts across credentials, subaccounts, or environments
+
+## Decoder isolation
+
+Prediction-market and perps payloads may share a provider brand while using
+different APIs and semantics. They use separate venue decoders and then map
+into shared canonical shapes only after validation.
+
+### Hyperliquid is two products on one venue
+
+Hyperliquid carries both HIP-4 outcome markets (prediction markets) and
+perpetuals. They share a venue and nothing else:
+
+| | HIP-4 outcome markets | Perpetuals |
+|---|---|---|
+| Provider slug | `hyperliquid` | `hyperliquid_perps` |
+| Venue coin | `#<encoding>` (e.g. `#1210`) | Bare coin (`BTC`, `kPEPE`) |
+| Kairos id you subscribe with | Numeric HIP-4 outcome id (`101`) | Canonical instrument id (`hl-mainnet-btc-usdt`) |
+| Outcomes | Two — one independent book per side coin | None — one book |
+| Price meaning | Implied probability, 0–1 | Direct venue price |
+| Wire price scale | Fixed 10,000 | Per-snapshot `price_scale` |
+
+For an outcome market with numeric id `N`, the Yes-side coin is `#{10N}` and
+the No-side coin is `#{10N+1}`; those are the snapshot's index-0 and index-1
+`token_ids`. Every other coin on the venue is a perpetual — the `#` prefix is
+the single test that decides which pipeline a venue event belongs to, both for
+books and for on-chain fills.
+
+The two products use separate adapters, separate provider slugs, and separate
+fact tables. Do not route one through the other's decoder.
+
+## Upstream references
+
+The design is checked against the venues' current primary documentation:
+
+- [Hyperliquid perpetuals API](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals)
+- [Hyperliquid WebSocket subscriptions](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions)
+- [Polymarket developer documentation](https://docs.polymarket.com/llms.txt)
+- [Kalshi developer documentation](https://docs.kalshi.com/llms.txt)
+
+Upstream documentation remains authoritative for venue behavior.
+
+Next: [Availability and guarantees](/perpetuals/availability-and-guarantees).

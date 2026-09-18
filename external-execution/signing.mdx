@@ -1,0 +1,465 @@
+---
+title: "Signing & Order Lifecycle"
+description: "How to sign orders with your own EOA and place them through the external execution lane: intent, sign, submit, fills, and cancels"
+---
+
+This page is the end-to-end integration guide for placing an order with your own key on the external execution lane. Read it when you are writing the code that signs and submits orders; it covers the intent → sign → submit flow, the one-round-trip WebSocket path, order types, fills, and cancels.
+
+The full path of an externally-signed order is **build → sign → submit → track → fill**: Kairos hands you an [EIP-712](/learn/glossary) digest, you sign it locally with your own key, and you send the signature back — you never implement the venue's order encoding yourself.
+
+## Read this before you write any signing code
+
+Two mistakes account for almost every failed first integration on this lane. Both produce errors that look like a key problem and are not.
+
+### 1. The EIP-712 domain keys are snake_case on our wire — your library needs camelCase
+
+<Note>
+⚠️ **`unsigned_payload.domain` comes back as `{ name, version, chain_id, verifying_contract }`. viem and ethers require `chainId` and `verifyingContract`.** Pass our object straight through and your library silently ignores the two keys it does not recognise, hashes a domain separator over `{ name, version }` only, and produces a *different* digest. The submit then fails with `signature recovered 0x… does not match owner 0x…` and you will spend a day suspecting your private key.
+</Note>
+
+Rename the two keys before you sign:
+
+| Kairos sends | Your library wants |
+|---|---|
+| `chain_id` | `chainId` |
+| `verifying_contract` | `verifyingContract` |
+
+`name` and `version` map straight across. The full conversion is in [Option B](#sign-the-digest-locally) below. This applies **only** to the `signTypedData` path — if you raw-sign `eip712_digest_hex` you never touch the domain object and cannot hit this.
+
+### 2. `market_id` and `outcome` are required on every order — even though neither is signed
+
+<Note>
+⚠️ **Neither field enters the signed digest, and both are required anyway.** They tag the persisted order and position rows so fills attribute to the right market, which makes them easy to leave out of a request built from the EIP-712 struct alone — and every such request is a `400`.
+</Note>
+
+- Missing `market_id` → `400 market_id is required for external orders`
+- Missing `outcome` → `400 outcome is required for external orders (e.g. "Yes" / "No")`
+
+Both are required on `POST /v2/orders/intent` **and** on the WebSocket `submit_signed_order` payload. The node also resolves your `token_id` against `market_id` and rejects a mismatch with `400 token_id does not belong to the supplied market_id`.
+
+## The flow, start to finish
+
+Mode A (assisted, two round-trips) is the path most integrations take. End to end:
+
+1. **Authenticate** to your assigned [regional execution node](/external-execution/regional-execution) with a Kairos JWT or the API-key triple. See [Authentication](#authentication).
+2. *(Optional)* **Price the trade** with `GET /orders/fee-quote` or the WebSocket [Fee Quote (RFQ)](/websocket/fee-quote) stream.
+3. **`POST /v2/orders/intent`** with the order terms plus `market_id` and `outcome`. Kairos builds the canonical EIP-712 payload and returns a `payload_id`, an `eip712_digest_hex`, and the full `unsigned_payload`. No order is placed yet.
+4. **Sign locally.** Either raw-sign the 32-byte `eip712_digest_hex`, or camelCase the domain keys and `signTypedData` the `unsigned_payload`. Both produce the same signature.
+5. **`POST /v2/orders/submit`** with `payload_id` + `signature_hex`, within the intent's TTL (60 s by default). Kairos recomputes the digest, `ecrecover`s the signer, checks it against your registered wallets, and forwards to the venue.
+6. **Track.** The submit response carries `order_id` and the venue's immediate `status`. A resting order's later fills stream over your `/ws` connection — see [Fills](#fills).
+7. **Cancel or reprice** as needed. Cancels need no signature; a reprice is cancel + a fresh intent. See [Cancels](#cancels-no-signature-required).
+
+Mode B (self-built, one round-trip) collapses steps 3–5 into a single WebSocket frame — see [Submit over WebSocket](#submit-over-websocket-one-round-trip).
+
+### Intent states
+
+| State | How you get there | What you can do |
+|---|---|---|
+| **Issued** | `POST /v2/orders/intent` returned a `payload_id` | Sign the digest and submit, until `expires_at_us` |
+| **Consumed** | Any `POST /v2/orders/submit` naming that `payload_id` — *including one that then fails* | Nothing. Build a fresh intent |
+| **Expired** | `expires_at_us` passed without a submit | Nothing. Build a fresh intent |
+
+The intent is claimed and deleted at the very top of `/submit`, **before** any verification. A submit that fails signature verification still burns the `payload_id`; the recovery is a new intent, never a retry of the same one.
+
+## Authentication
+
+Base URL is your assigned [regional execution node](/external-execution/regional-execution). All requests require authentication, and this lane additionally requires that your account be [allow-listed](/external-execution/overview#access) (`403` otherwise).
+
+```
+Authorization: Bearer <kairos-jwt>
+```
+
+REST accepts the header above or a scoped API key issued at onboarding; on the WebSocket the JWT rides `Sec-WebSocket-Protocol` as `authorization, Bearer.<token>` instead.
+
+The `/v2/*` endpoints on this page take the JWT (or the API-key triple) on its own. The shared order endpoints — `POST /orders` and the three cancel routes — carry an extra gate that a bare `Authorization: Bearer` header does **not** satisfy: send the full API-key triple (`X-Client-Id` + `X-Api-Key` + `X-Api-Secret`) on those, which satisfies it automatically.
+
+## Signing modes
+
+**Mode A — assisted, two round-trips (simplest).** Kairos builds the canonical EIP-712 payload for you, so you never implement the venue's exact order encoding — you just sign a 32-byte digest. Call `POST /v2/orders/intent`, sign the returned digest locally, then call `POST /v2/orders/submit`.
+
+**Mode B — self-built, one round-trip (lowest latency, over WebSocket).** If you implement the venue's EIP-712 yourself, skip the intent step: build and sign the order locally, then send the whole thing in one WebSocket frame. Kairos verifies and forwards — zero server-side signing. See [Submit over WebSocket](#submit-over-websocket-one-round-trip).
+
+## Build the order intent
+
+```
+POST /v2/orders/intent
+```
+
+Builds the EIP-712 payload for an order and stashes it single-use under a `payload_id`. **No order is placed yet** — nothing reaches the venue until you submit a signature.
+
+**Auth:** Kairos JWT or scoped API key, plus external-signing allow-list. An API key needs the `trade:execute` scope, and the target provider must not be disabled for that key.
+
+**Pricing a trade first?** `GET /orders/fee-quote` (or the WebSocket [Fee Quote (RFQ)](/websocket/fee-quote) stream) returns an executable price and fee breakdown before you build an intent — it works identically for external-signing accounts.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | No | `polymarket` | Target venue: `polymarket` or `predictfun`. Omit for Polymarket — see [Predict.fun](#predictfun) for what changes |
+| `intent.token_id` | string | Yes | — | Outcome-token id on the target venue, as a uint256 decimal string. Max 256 chars |
+| `intent.side` | string | Yes | — | `buy` or `sell`, lower-case |
+| `intent.price` | string | Yes | — | Limit price as a decimal string in `[tick, 1]`. **You** are responsible for snapping to the market's tick — the node does not re-snap |
+| `intent.size` | string | Yes | — | Order size in shares, as a decimal string. Max 2 decimal places |
+| `intent.time_in_force` | string | Yes | — | `GTC`, `GTD`, `FOK`, `FAK`, or `IOC`, UPPER-case. Selects the order type — see [Order types](#order-types) |
+| `intent.expiration_unix_secs` | integer | GTD only | — | Unix seconds, must be in the future. Required iff `time_in_force=GTD`, otherwise omit. A GTD intent without it, or with one already in the past, is a `400`. On Polymarket it is **not** part of the signed `Order` struct — it rides on the outer payload |
+| `intent.post_only` | boolean | No | `false` | Maker-only. Requires a resting `time_in_force` (`GTC` or `GTD`); anything else is a `400`. Not part of the signed digest |
+| `intent.neg_risk` | boolean | Yes | — | Whether the market is a [neg-risk](/learn/glossary) market. Selects the EIP-712 verifying contract, so it must match the market |
+| `intent.owner_address` | string | Yes | — | The maker/owner EOA, `0x`-checksummed. On this lane it is also the signer |
+| `intent.signer_address` | string | No | `owner_address` | Must equal `owner_address`. Omit it — any other value is rejected with `400 signer_address must equal owner_address for signature_type 0 (EOA)` |
+| `intent.signature_type` | integer | Yes | — | `0` only. Anything else — including Poly1271 — is rejected up front with `400 only signature_type 0 (EOA) is supported on the external-signing lane`. Verification is therefore always raw `ecrecover`, never ERC-1271 |
+| `intent.salt` | string | No | node-stamped | uint256 decimal string. Omit and let the node stamp it; REQUIRED (together with `timestamp_ms`) on the one-round-trip WebSocket path |
+| `intent.timestamp_ms` | string | No | node-stamped | uint256 decimal string. Same rule as `salt` |
+| `market_id` | string | Yes | — | Condition id, max 256 chars. Not signed, but required — the node resolves your `token_id` against it and rejects a mismatch with `400` |
+| `outcome` | string | Yes | — | Outcome label, max 64 chars (e.g. `Yes`). Metadata only, not signed; a missing value is a `400` |
+
+### Example
+
+```bash
+curl -X POST https://eu-west-1-polymarket.executor.kairos.trade/v2/orders/intent \
+  -H "Authorization: Bearer $KAIROS_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "intent": {
+      "token_id": "71360012345678901234567890123456789012345678901234567890123456",
+      "side": "buy",
+      "price": "0.52",
+      "size": "100",
+      "time_in_force": "GTC",
+      "neg_risk": false,
+      "owner_address": "0xYourEOA",
+      "signature_type": 0
+    },
+    "market_id": "0xcondition0000000000000000000000000000000000000000000000000000",
+    "outcome": "Yes"
+  }'
+```
+
+### Response
+
+```json
+{
+  "payload_id": "8f1c…-uuid",
+  "eip712_digest_hex": "0x9a1c2b3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff0",
+  "expires_at_us": 1750000000000000,
+  "unsigned_payload": {
+    "domain": {
+      "name": "Polymarket CTF Exchange",
+      "version": "2",
+      "chain_id": 137,
+      "verifying_contract": "0xE111180000d2663C0091e4f400237545B87B996B"
+    },
+    "primary_type": "Order",
+    "types": { "...": "full EIP-712 type set" },
+    "message": { "...": "the order struct values" },
+    "eip712_digest_hex": "0x9a1c2b3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff0"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `payload_id` | string | Single-use handle for this stored intent; pass back to `POST /v2/orders/submit` |
+| `eip712_digest_hex` | string | The 32-byte digest to sign raw — a convenience copy of `unsigned_payload.eip712_digest_hex` |
+| `unsigned_payload` | object | Full EIP-712 typed-data payload; pass to `signTypedData` as an alternative to raw-signing the digest. **Its `domain` uses snake_case keys — see [the warning above](#read-this-before-you-write-any-signing-code)** |
+| `expires_at_us` | integer | Wall-clock expiry, unix microseconds (60 s out by default) |
+
+### Errors
+
+Every error on this lane is the minimal shape `{"error": "..."}` — there is no `code` field and no structured `error_details`.
+
+| Status | `error` | When it happens | What to do |
+|---|---|---|---|
+| `400` | `only signature_type 0 (EOA) is supported on the external-signing lane` | `signature_type` other than `0` | Send `0`; this lane is EOA-only |
+| `400` | `signer_address must equal owner_address for signature_type 0 (EOA)` | A distinct signer was declared | Omit `signer_address` |
+| `400` | `outcome is required for external orders (e.g. "Yes" / "No")` | `outcome` missing | Add the outcome label |
+| `400` | `market_id is required for external orders` | `market_id` missing or blank | Add the condition id |
+| `400` | `token_id does not belong to the supplied market_id` | Token/market mismatch | Re-resolve the token from market metadata |
+| `400` | `token_id does not match the supplied outcome` | Wrong outcome label for the token | Send the label of the token you are trading |
+| `400` | `outcome too long (max 64 chars)` / `market_id too long (max 256 chars)` / `token_id too long (max 256 chars)` | Length caps exceeded | Truncate to the documented cap |
+| `400` | `expiration_unix_secs is in the past for this GTD order` | Stale GTD expiry | Stamp a future expiry at request time, not at strategy start |
+| `400` | `invalid intent: …` | The venue payload builder rejected the terms: price outside `(0, 1]`, size not positive or over 2 decimal places, GTD without `expiration_unix_secs`, `post_only` on a non-resting TIF, unparseable `token_id`, amount overflow | Read the suffix — it names the specific field |
+| `400` | `neg_risk mismatch: market … is neg_risk=…, intent said …` | Predict.fun only: `neg_risk` disagrees with market metadata | Take `neg_risk` from market metadata, do not hard-code it |
+| `403` | `external-signing execution is not enabled for this account` | Account not allow-listed | Contact your account manager — see [Access](/external-execution/overview#access) |
+| `403` | `external-signing authorization check failed` | The allow-list read itself failed; the gate **fails closed** as a `403`, not a `500` | Retry with backoff; escalate if it persists |
+| `403` | `API key missing trade:execute scope` / `API-key access to <provider> is disabled` | Credential scope or provider gating | Have the key re-scoped at onboarding |
+| `429` | `Order rate limit exceeded` | Per-user (and per-credential) order window exhausted | Back off. **No `Retry-After` header is sent** — use your own backoff schedule |
+| `503` | `Execution disabled by circuit breaker: …` / `Order rejected by circuit breaker: …` | Kairos halted execution for this venue, or for this side/order type | Stop submitting and retry later; this is not a client error |
+| `503` | `predictfun execution is not available on this node` | Wrong regional node for the venue | Route Predict.fun to the Tokyo node — see [Regional Execution Nodes](/external-execution/regional-execution) |
+
+## Sign the digest locally
+
+> **Warning — sign the raw 32 bytes.** This is the #1 integration mistake after the domain-key one. Kairos gives you the final EIP-712 digest (already `keccak256("\x19\x01" ‖ domainSeparator ‖ hashStruct(order))`). You must produce a raw secp256k1 ECDSA signature over **those 32 bytes** — not a re-hash, not an EIP-191-prefixed message.
+>
+> - **Correct:** `secp256k1_sign(digest_bytes)` → 65-byte `r ‖ s ‖ v`.
+> - **Wrong:** `personal_sign(...)` / `eth_sign` with the `"\x19Ethereum Signed Message"` prefix — produces the wrong recovery. You'll get `signature recovered 0x… does not match owner`.
+> - **Wrong:** `signTypedData(...)` on the digest itself — that hashes it a second time.
+
+**Prefer `signTypedData`?** You don't have to sign the raw digest. The intent response also returns the full EIP-712 typed-data object as `unsigned_payload` (`{ domain, primary_type, types, message }`). Feed that to `signTypedData` and your library computes the identical digest — **after you camelCase `chain_id` → `chainId` and `verifying_contract` → `verifyingContract`**, as shown in Option B. Use whichever your stack supports; Kairos verifies the result the same way.
+
+**Signature format:** 65 bytes, `0x`-prefixed hex (`r` (32) ‖ `s` (32) ‖ `v` (1)). `v` is the recovery id — Kairos accepts `27`/`28` and normalizes `0`/`1` (add 27 if your library returns `0`/`1`). secp256k1 EOA only — the intent handler rejects `signature_type != 0` up front.
+
+**TypeScript — viem.** Option A raw-hash signs the digest; Option B signs the typed data. Both produce an identical signature:
+
+```ts
+import { sign, signTypedData } from 'viem/accounts'
+
+// Option A: raw-hash sign the digest. Nothing to rename — no domain object involved.
+const signature = await sign({ hash: intentRes.eip712_digest_hex, privateKey, to: 'hex' })
+
+// Option B: sign unsigned_payload. The domain keys MUST be camelCased first, or
+// viem hashes a domain over {name, version} only and the signature will not recover.
+const { domain: d, types, primary_type, message } = intentRes.unsigned_payload
+const domain = {
+  name: d.name,
+  version: d.version,
+  chainId: d.chain_id,                     // snake_case → camelCase
+  verifyingContract: d.verifying_contract, // snake_case → camelCase
+}
+const signature2 = await signTypedData({ privateKey, domain, types, primaryType: primary_type, message })
+
+await postSubmit({ payload_id: intentRes.payload_id, signature_hex: signature })
+```
+
+**Python — eth_keys** (raw-hash sign):
+
+```python
+from eth_keys import keys
+
+def sign_digest(digest_hex: str, priv_hex: str) -> str:
+    pk = keys.PrivateKey(bytes.fromhex(priv_hex.removeprefix("0x")))
+    sig = pk.sign_msg_hash(bytes.fromhex(digest_hex.removeprefix("0x")))  # RAW hash
+    v = bytes([sig.v + 27])                                              # {0,1} → {27,28}
+    return "0x" + (sig.r.to_bytes(32, "big") + sig.s.to_bytes(32, "big") + v).hex()
+```
+
+## Submit the signature
+
+```
+POST /v2/orders/submit
+```
+
+Submits your signature; the node recomputes the digest, `ecrecover`s the signer, confirms it against your registered wallets, and forwards to the venue.
+
+**Auth:** same as `/intent`. The allow-list and scope checks are re-run independently here, so an in-flight `payload_id` does not carry an earlier authorization forward.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `payload_id` | string (uuid) | Yes | — | The `payload_id` returned by `POST /v2/orders/intent`. Single-use, claimed atomically on the first `/submit` call |
+| `signature_hex` | string | Yes | — | `0x`-prefixed 65-byte signature (`r \|\| s \|\| v`) over `eip712_digest_hex` |
+
+### Example
+
+```bash
+curl -X POST https://eu-west-1-polymarket.executor.kairos.trade/v2/orders/submit \
+  -H "Authorization: Bearer $KAIROS_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payload_id": "8f1c0000-0000-4000-8000-000000000000",
+    "signature_hex": "0x<65-byte r||s||v>"
+  }'
+```
+
+### Response
+
+```json
+{ "order_id": "1f3c…-uuid", "exchange_order_id": "0xabc…", "status": "matched" }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `order_id` | string | Internal Kairos order id — usable for `GET /orders/{order_id}` and the cancel endpoints |
+| `exchange_order_id` | string \| null | Venue-assigned order handle. An empty venue id is treated as a failed submission (`400 venue returned an empty order id; order not tracked`), so on a `200` this is populated in practice |
+| `status` | string | The venue's immediate result string, passed through verbatim — Kairos neither normalizes nor validates it. Polymarket's observed values are `matched`, `live` and `delayed` (`unmatched` shows up on the fill-polling path). Treat it as an open string, not a closed enum |
+
+The order is now a first-class tracked row — fills, fees, positions, and cancel-by-id all work.
+
+### Errors
+
+| Status | `error` | When it happens | What to do |
+|---|---|---|---|
+| `400` | `payload_id not found or expired` | Wrong, old, or already-claimed `payload_id` | Build a fresh intent |
+| `400` | `payload_id expired` | Resolved, but past its `expires_at_us` | Build a fresh intent; sign within the 60 s TTL |
+| `400` | `payload_id does not belong to authenticated user` | Intent created by another account | Submit with the credential that created the intent |
+| `400` | `invalid signature hex` | Not decodable hex | Send `0x`-prefixed hex |
+| `400` | `invalid signature: signature must be 65 bytes (got N)` | Wrong signature length | Emit `r ‖ s ‖ v`, 65 bytes |
+| `400` | `signature recovered 0x… does not match owner 0x…` | Recovered signer ≠ declared owner. Usually the EIP-191 footgun, **or an un-camelCased EIP-712 domain** | Check the [domain-key warning](#read-this-before-you-write-any-signing-code) first, then that you raw-signed the digest |
+| `400` | `recovered signer is not a registered wallet for this user` | The signing wallet is not registered to your account | Register the address during onboarding |
+| `400` | `owner_address is not your registered predict.fun trading wallet` | Predict.fun only | Use the wallet the venue minted auth for |
+| `400` | `this predict.fun account is a Kernel smart account, …` | Predict.fun imported (ERC-1271) account | Use a plain EOA — see [Predict.fun](#predictfun) |
+| `403` | Same allow-list / scope set as `/intent` | Re-checked independently on submit | See the `/intent` error table above |
+| `502` | `CLOB error: …` | Venue rejected the order — balance, allowance, or tick. Message passed through verbatim | Read the venue message; usually funding or approvals |
+| `503` | `verification temporarily unavailable` | An EIP-1271 RPC timeout. Only reachable on a lane that accepted a non-EOA signature type, so not expected today | Build a fresh intent — the `payload_id` is already consumed, so this is not a retry of the same signature |
+
+<Note>
+**Gotcha: every submit consumes the intent.** The `payload_id` is claimed and deleted *before* verification runs, so a submit that fails signature verification burns it just as thoroughly as a successful one. There is no "retry the same signature". Recovery is always a new `POST /v2/orders/intent`.
+</Note>
+
+## Order types
+
+`time_in_force` selects the order type. Both `buy` and `sell` are supported for all of them.
+
+| `time_in_force` | Meaning | Typical use |
+|---|---|---|
+| `GTC` | Good-til-cancelled (resting limit) | Passive maker quotes |
+| `GTD` | Good-til-date (requires `expiration_unix_secs`) | Time-boxed quotes |
+| `FOK` | Fill-or-kill (all or nothing, immediate) | Aggressive taker |
+| `FAK` / `IOC` | Fill-and-kill / immediate-or-cancel (partial ok, rest cancelled) | Taker sweep |
+
+<Note>
+**Case matters.** Wire values for `time_in_force` are UPPER-case; `side` is lower-case (`buy`/`sell`).
+</Note>
+
+A market order is a marketable taker order with `FOK`/`FAK` — price is still required (it's the limit you're willing to cross to). See [Time in force](/learn/time-in-force) for the general model.
+
+## Submit over WebSocket (one round-trip)
+
+The lowest-latency path: keep one authenticated `/ws` socket open, build the EIP-712 order **and** sign it locally, then submit it in a single frame. Kairos verifies (`ecrecover` + the signer must be your registered wallet) and forwards — zero server-side signing, one round-trip.
+
+Two extra requirements apply here, both because there is no server-built intent to fall back on:
+
+- `salt` and `timestamp_ms` are **required** on the intent, so the node rebuilds the exact digest you signed.
+- `market_id` and `outcome` are **required** on the payload, same as REST.
+
+This path is **Polymarket-only** — there is no `provider` field on the frame.
+
+### submit_signed_order
+
+```json
+{
+  "type": "submit_signed_order",
+  "request_id": "client-generated-id",
+  "payload": {
+    "intent": {
+      "token_id": "71360012345678901234567890123456789012345678901234567890123456",
+      "side": "buy",
+      "price": "0.52",
+      "size": "100",
+      "time_in_force": "GTC",
+      "neg_risk": false,
+      "owner_address": "0xYourEOA",
+      "signature_type": 0,
+      "salt": "0x…",
+      "timestamp_ms": 1717029000000
+    },
+    "builder_code": "0x<64 hex digits also signed as Order.builder>",
+    "signature_hex": "0x<65-byte r||s||v>",
+    "market_id": "0xcondition0000000000000000000000000000000000000000000000000000",
+    "outcome": "Yes"
+  }
+}
+```
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `payload.intent` | object | Yes | — | Same shape as `POST /v2/orders/intent`'s `intent`, but `salt` and `timestamp_ms` are REQUIRED here |
+| `payload.builder_code` | bytes32 hex | Yes | — | Current public Kairos builder code. The identical value must be included in the signed EIP-712 `Order.builder`; read `polymarket_builder_code` from the socket's initial `connected` frame and refresh it after reconnect. |
+| `payload.signature_hex` | string | Yes | — | Signature you produced locally over the digest you computed for `intent` |
+| `payload.market_id` | string | Yes | — | Condition id. Metadata only, not signed — but the node resolves `intent.token_id` against it and rejects a missing or mismatched value with `400` |
+| `payload.outcome` | string | Yes | — | Outcome label. Metadata only, not signed — required |
+
+Success and error frames use the same shapes as the REST lane:
+
+```json
+{ "type": "order_response", "request_id": "…",
+  "result": { "order_id": "…", "exchange_order_id": "0x…", "status": "matched" } }
+```
+
+```json
+{ "type": "order_error", "request_id": "…", "status": 400, "error": "…" }
+```
+
+**Keep one authenticated WebSocket connection open per node and both submit and listen on it.** The socket stays warm (no per-order TLS setup) and fills arrive as events instead of on a poll tick. See [Regional Execution Nodes › Execute over WebSocket, not REST](/external-execution/regional-execution#execute-over-websocket-not-rest).
+
+## Fills
+
+`POST /v2/orders/submit` (and the WebSocket `order_response`) returns the venue's immediate result — for a marketable order that crossed, that's your fill confirmation; for a resting order it confirms the order is live.
+
+A resting maker order fills later. Those fills stream back over your `/ws` connection as flat, `type`-tagged events. The three you care about on this lane:
+
+```json
+{ "type": "status_changed", "order_id": "…", "user_id": "…", "status": "live",
+  "old_status": "queued", "new_status": "live", "exchange_order_id": "0x…",
+  "exchange_id": "polymarket", "market_id": "0x…", "token_id": "7136…",
+  "outcome": "Yes", "side": "buy", "kind": "limit", "price": "0.52", "size": "100",
+  "time_in_force": "GTC", "filled_quantity": "0", "avg_fill_price": null,
+  "holding_wallet": "0xYourEOA", "error": null }
+```
+
+```json
+{ "type": "partially_filled", "order_id": "…", "user_id": "…", "exchange_id": "polymarket",
+  "status": "partial", "filled_quantity": "40", "remaining_quantity": "60",
+  "avg_fill_price": "0.52" }
+```
+
+```json
+{ "type": "filled", "order_id": "…", "user_id": "…", "exchange_id": "polymarket",
+  "fill_id": "…", "filled_quantity": "100", "price": "0.52",
+  "fee": "0.00", "exchange_fee": "0.00" }
+```
+
+<Note>
+**Gotcha: there is no `order_update` or `fill` frame type,** and no `ts_us` field on any of these. Correlate on `order_id` and use your own receive timestamp.
+</Note>
+
+A terminal failure arrives as `{"type": "failed", …}`; position changes as `{"type": "position_updated", …}`. Fills become tracked trades, update your position, and run post-trade fee capture. A stale-order-recovery sweep is the backstop, so fills are never lost — just occasionally a beat slower on REST. **Listen on the WebSocket for the fastest fill detection.**
+
+## Cancels — no signature required
+
+Polymarket order cancellation is an **L2 API-key** operation (HMAC over the request) — it does not need your EOA signature. Cancels work on this lane exactly like the standard path:
+
+| Cancel | Endpoint | Body |
+|---|---|---|
+| One order | `POST /orders/{order_id}/cancel` | — |
+| Many orders | `POST /orders/cancel-batch` | `{ "order_ids": [...] }` |
+| Everything | `POST /orders/cancel-all` | — |
+
+Cancel-by-internal-`order_id` works because external orders are persisted with a real `order_id` (returned from `/submit`). You can also cancel by the venue's `exchange_order_id`, or use cancel-all. Full request/response schemas for all three are in the [API Reference](/api-reference) and [REST › Orders](/rest/orders).
+
+## Retries & repricing
+
+Because you hold the key, a retry or reprice is a fresh signature:
+
+1. Each intent is single-use (deleted on submit), so a retry needs a **new intent** — new `salt`/`timestamp` → new digest → new signature.
+2. Repricing a resting quote is the standard **cancel + new-signed-order** loop.
+3. Over the WebSocket a re-sign is a single message round-trip on an already-open socket — cheap enough to reprice at quote frequency.
+
+## Predict.fun
+
+Send `"provider": "predictfun"` on the intent. The request and response shapes are
+otherwise identical to Polymarket's, and you sign the returned digest exactly the
+same way — only the EIP-712 domain differs (BSC, chain 56, and one of four
+CTFExchange addresses).
+
+You do **not** supply any venue-specific values. Kairos resolves the market's
+`isYieldBearing` / `isNegRisk` pair, its `feeRateBps` and its price tick from
+authoritative market metadata and builds the domain and the signed struct from
+those. This is deliberate: `feeRateBps` is part of the signed order and the
+`(isYieldBearing, isNegRisk)` pair selects the verifying contract, so letting a
+client assert them would produce orders the venue rejects with opaque errors.
+`intent.neg_risk` is still required and is cross-checked against the market — a
+mismatch is a `400`, not a silently corrected value.
+
+Current limits on this venue:
+
+| Limit | What it means for you |
+|---|---|
+| **EOA only** | An account you imported from predict.fun is a ZeroDev Kernel smart contract wallet, validated via ERC-1271 rather than `ecrecover`. Those are rejected with a `400`; use a plain EOA funded with the venue's collateral on BSC |
+| **`owner_address` must be your registered predict.fun trading wallet** | Venue auth is a per-wallet token minted for that identity, so a different address is rejected rather than authenticated as someone else |
+| **Your size is never trimmed** | Unlike the custodial path, Kairos does not shave a sell to match its own view of your balance — you own your inventory. An oversell comes back as the venue's rejection |
+| **REST only** | The one-round-trip WebSocket path (Mode B) is Polymarket-only: it has no server-built intent, so you would have to reproduce the venue metadata above byte-for-byte to land on the same digest |
+| **On-chain ops stay custodial** | Approvals and redemptions remain custodial for this venue — `/v2/onchain/*` is Polygon-only |
+
+## Provider coverage
+
+**Polymarket** is the live reference venue for bring-your-own-signer orders (pure EOA, `signatureType = 0`, EIP-712 `Order` on the CTF Exchange V2; neg-risk markets use a different verifying contract, so a neg-risk signature can't be replayed on a standard market) — the signing and API examples above are written against it.
+
+**Coming soon:** additional venues (including Hyperliquid, which uses an agent-wallet action-signing model) are in development and not yet reachable end-to-end on this lane; this page documents Polymarket only.
+
+## See also
+
+- **[Overview](/external-execution/overview)** — access, account model, and what you bring vs. what Kairos does.
+- **[Regional Execution Nodes](/external-execution/regional-execution)** — where to connect, WebSocket-over-REST, and reading live positions.
+- **[API Reference](/api-reference)** — full schemas for `/v2/orders/intent`, `/v2/orders/submit`, and the cancel/fee-quote endpoints referenced above.
+- **[WebSocket › Order Execution](/websocket/order-execution)** and **[REST › Orders](/rest/orders)** — the general execution surface.

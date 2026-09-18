@@ -1,0 +1,154 @@
+---
+title: "Exact values and time"
+description: "Decimal, unit, timestamp, and revision rules"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, enabled in production and staging today; a
+deployment with the flag off returns `404` for every perpetual route. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+How numbers and clocks are encoded on the two live perpetual surfaces, and the
+two decoding mistakes that silently corrupt data: parsing a decimal as a float,
+and parsing a nanosecond timestamp as a JavaScript `Number`.
+
+Perps magnify small errors through leverage, funding, liquidation thresholds,
+and long-running positions. Financial values must survive transport, storage,
+and replay without changing meaning.
+
+<Note>
+**Beta:** `ExactDecimal`, nanosecond timestamps, and source/sequence fields
+are live in the v2 perpetual book stream. Private-state fields described on
+this page remain design contracts.
+</Note>
+
+## Exact decimals
+
+The two live surfaces spell an exact value differently. Both are exact.
+
+| Surface | Encoding | Example | Value |
+|---|---|---|---|
+| v2 protobuf stream | `kairos.v2.ExactDecimal` — a signed base-10 integer string plus a fractional-digit count | `{"coefficient": "1234567", "scale": 4}` | `123.4567` |
+| REST snapshot | Canonical decimal string | `"123.4567"` | `123.4567` |
+
+<Note>
+**No JSON number ever carries a financial value on either surface.** Prices,
+quantities, volumes, rates, and multipliers are strings or
+coefficient/scale pairs. Parse them into a decimal type. A `float` round-trip
+is a correctness bug, not a rounding preference.
+</Note>
+
+Canonical encoding removes redundant trailing fractional zeros. Zero has one
+canonical representation — `("0", 0)` on the protobuf, `"0"` on REST. Services
+parse into an exact decimal type and reject non-canonical or out-of-range
+values rather than rounding silently. The public gateway independently
+re-validates canonical form on every level it forwards.
+
+Exact decimals are used for:
+
+- prices and price bands
+- native and normalized quantities
+- balances, margin, PnL, and fees
+- funding rates and payments
+- notionals, multipliers, and risk limits
+
+User interfaces may convert exact values for display. They must not use a
+display float as the authoritative value for an order or risk calculation.
+
+<Note>
+**Twelve fractional digits is the streamer's floor.** Its internal perpetual
+book holds prices and sizes as integers scaled by `1e-12` and refuses a venue
+value it cannot represent at that scale. The wire type itself is scale-free,
+but a venue price with more than twelve fractional digits is dropped rather
+than rounded — you will see a missing book, not a wrong one.
+</Note>
+
+## Missing is not zero
+
+Optional values retain presence. For example:
+
+| State | Meaning |
+|---|---|
+| `0` funding | An observed zero rate |
+| absent funding | The source did not provide it |
+| unavailable balance | The venue could not return an authoritative value |
+| stale balance | A prior value exists but is outside its freshness rule |
+
+<Warning>
+**Never substitute numeric zero for missing, unavailable, or stale.** These
+are four distinct states and collapsing them produces confident wrong
+answers.
+</Warning>
+
+## Every quantity has a unit
+
+Quantity fields include a unit. Native quantity is always preserved; normalized
+base quantity and quote notional are separate optional fields. This prevents a
+contract count from being aggregated with a base-asset amount.
+
+## Clocks
+
+Messages distinguish four clocks:
+
+| Clock | Meaning |
+| --- | --- |
+| `event_time` | When the venue says the economic event occurred |
+| `source_time` | Time attached by the upstream transport, when available |
+| `received_time` | When the Kairos edge connection received the event |
+| `ingested_time` | When the normalized event entered Kairos |
+
+The clocks are never substituted for one another. Unknown venue time stays
+unknown. **Ordering by receive time is not equivalent to venue event order.**
+
+`source_time` and `ingested_time` are model concepts, not fields on either live
+surface. The published schema carries `source_time_ns` only on the trade- and
+quote-candle messages, which the beta does not emit.
+
+### Nanoseconds, everywhere, and the 2^53 trap
+
+Every timestamp on both live surfaces is **nanoseconds since the Unix epoch,
+UTC**, and every field name says so.
+
+| Surface | Timestamp fields |
+|---|---|
+| v2 book | `event_time_ns` (optional; absent when the venue publishes no event clock), `received_time_ns` (always present and nonzero) |
+| REST snapshot | `fetched_at_ns`, `book.event_time_ns`, `book.received_time_ns`, `market_state.event_time_ns`, `prices[].observed_time_ns`, `trades[].event_time_ns`, `candles[].interval_start_ns` / `interval_end_ns`, `funding[].effective_time_ns` / `calculated_time_ns` |
+
+> **⚠ Nanosecond timestamps do not fit in a JavaScript `Number`**
+>
+> A nanosecond epoch timestamp is already far past `2^53`. The REST snapshot
+> emits these as **JSON numbers**, so `JSON.parse` in a browser or Node
+> silently truncates them — you get a plausible-looking timestamp that is
+> wrong in its low-order digits and no longer round-trips.
+>
+> Parse them as `BigInt` or as text. Protobuf JSON may instead render 64-bit
+> integers as strings; do not coerce those through a `Number` either. The same
+> rule applies to `sequence` and `source_epoch`.
+
+## Identity, duplicates, and revisions
+
+Event identity is separate from event time. A venue event ID is preferred.
+Where a venue has no stable ID, Kairos uses a documented source-scoped identity
+that includes enough native fields to make replay deterministic.
+
+Some observations can be corrected:
+
+- candles can be revised before or after finalization
+- predicted funding can be replaced
+- account snapshots can supersede earlier projections
+
+Revision numbers are monotonic within their stated identity and scope. A newer
+transport cursor alone does not prove that an economic observation is newer.
+
+<Note>
+**No live surface carries a revision today.** The revision triple —
+`source_revision`, `revision_domain`, `revision_epoch` — is defined on the
+trade-candle, quote-candle, and funding messages in the canonical schema, and
+none of those messages is published in the beta. The book snapshot has no
+revision field at all: its ordering fence is `(source_epoch, sequence)`, and
+every frame is a complete replacement rather than a correction.
+</Note>
+
+Next: [Order books](/perpetuals/order-books).

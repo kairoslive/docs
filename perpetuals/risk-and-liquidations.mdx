@@ -1,0 +1,112 @@
+---
+title: "Risk and liquidations"
+description: "Risk tiers, restrictions, and public versus private liquidation facts"
+---
+
+> **⚠ Nothing on this page is callable**
+>
+> **Design preview.** The risk data described here is not a live trading or
+> liquidation-protection service. The canonical v2 schema defines **no** risk
+> schedule or account-risk message. Its one liquidation message,
+> `kairos.v2.PublicLiquidation`, is defined but is not published on any subject
+> today.
+>
+> The public perpetual market-data surface is live in production behind
+> `PERPETUALS_PUBLIC_API_ENABLED`, but enabling that flag did **not** make this
+> page callable in any environment. See
+> [Overview](/perpetuals/overview).
+
+This page describes how Kairos intends to model perpetual risk: versioned
+margin schedules, the provenance of every risk value, and the difference
+between a public liquidation print and a private account consequence.
+
+Perp risk cannot be reduced to a leverage number. Venues apply margin schedules,
+position tiers, price bands, concentration rules, and account restrictions that
+can change over time.
+
+## Versioned risk schedules
+
+A risk schedule has a provider, environment, instrument or risk group,
+effective period, source, and version. It can contain:
+
+- maximum leverage
+- initial and maintenance margin rates
+- notional or position-size tiers
+- maintenance deductions
+- order size and price limits
+- concentration or open-interest limits
+- reduce-only and withdrawal restrictions
+
+<Note>
+**The schedule used for a calculation must be reproducible.** Applying
+today's tier to a historical position is not a valid historical risk
+calculation.
+</Note>
+
+## Observed versus calculated
+
+Every risk value identifies its provenance:
+
+| Provenance | Meaning |
+|---|---|
+| venue-reported | Reported directly by the venue |
+| venue-rule calculation | Calculated from documented venue rules and versioned inputs |
+| Kairos estimate | Derived by Kairos |
+
+<Warning>
+**An estimate is never silently substituted for a venue-reported value.**
+Calculations fail outright when a required price, tier, collateral rule, or
+multiplier is absent — you get no number rather than a guessed one.
+</Warning>
+
+## Account risk state
+
+Private account risk can include equity, initial and maintenance requirements,
+available margin, liquidation status, and account restrictions. The observation
+is scoped to one trading account and carries its own freshness state.
+
+Cross-margin risk must be evaluated at the account or venue risk-group scope.
+An isolated position can be evaluated only with its assigned collateral and
+the venue's isolated-margin rules.
+
+## Liquidations
+
+Public liquidation events describe market activity. Private liquidation events
+describe an account consequence. They use related shapes but are separate data
+classes.
+
+A liquidation event can include:
+
+- instrument and exact execution values
+- liquidated position side, distinct from aggressor side
+- liquidation method
+- account scope for authorized private data
+- venue event, order, fill, or liquidation identifiers
+- multi-leg or bundle identifiers
+- bankruptcy, backstop, or insurance-fund attribution when supplied
+
+<Note>
+**One public print is not one fully closed position.** A single liquidation
+process can produce multiple trades, instruments, or ledger entries. The
+schema handles the multi-leg case by reusing `liquidation_id` and adding a
+`leg_index` or a stable `liquidation_leg_id` — so grouping by
+`liquidation_id` alone will over-count legs as separate events.
+</Note>
+
+## ADL and backstop events
+
+Auto-deleveraging, backstop fills, and insurance-fund actions are not ordinary
+liquidations. Kairos preserves the venue's method and does not map every forced
+execution to the same label. The schema's `LiquidationMethod` names them
+explicitly — `MARKET`, `BACKSTOP`, `ADL`, `OTHER` — with `UNSPECIFIED`
+reserved for a venue that says nothing. `OTHER` is a venue method Kairos chose
+not to collapse; it is not a synonym for `MARKET`.
+
+## Safety rules
+
+- Do not trade from stale or incomplete risk state.
+- Do not use a public liquidation feed to infer private account state.
+- Do not compare leverage across venues without the applicable margin rules.
+- Do not use an estimate as a liquidation guarantee.
+
+Next: [Streaming and recovery](/perpetuals/streaming-and-recovery).

@@ -1,0 +1,198 @@
+---
+title: "Trades and candles"
+description: "Reusable trade and candle shapes with perps-specific semantics"
+---
+
+<Note>
+**Live in production, still flag-gated.** Perpetuals are gated by
+`PERPETUALS_PUBLIC_API_ENABLED`, enabled in production and staging today; a
+deployment with the flag off returns `404` for every perpetual route. Read
+[Overview](/perpetuals/overview) before writing code.
+</Note>
+
+What the `trades` and `candles` arrays of the
+[REST snapshot](/perpetuals/overview#live-snapshot) contain, how each
+venue's native trade side and volume unit are normalized, and which fields the
+beta does not publish.
+
+Trades and candles are the most reusable prediction-market models, but their
+units and price sources must be made explicit for perps.
+
+<Note>
+**Beta:** The REST snapshot exposes the public trade and candle subset
+described below. Revisioned streaming and source-confirmed candle
+finalization are outside the current beta.
+</Note>
+
+## Public trades
+
+### What the REST snapshot gives you
+
+Each trade in the snapshot is exactly six fields:
+
+| Field | Notes |
+|---|---|
+| `trade_id` | Venue trade identity |
+| `price` | Exact decimal string |
+| `quantity` | Exact decimal string |
+| `quantity_unit` | `base_asset` or `contracts` — see the table below |
+| `side` | **Always the aggressor side**, always lowercase `buy` or `sell` |
+| `event_time_ns` | Nanosecond venue event time |
+
+There is no liquidation field, no proven base quantity or quote notional, and
+no separate source or ingest clock. Those live on the `kairos.v2.PublicTrade`
+message, which the beta does not publish.
+
+<Note>
+**A snapshot carrying any other `side` value fails validation and the request
+returns `502`.** The normalization is enforced, not best-effort.
+</Note>
+
+### Side normalization
+
+Every venue's native trade side is re-spelled to lowercase `buy` / `sell`:
+
+| Venue | Native value | Normalized |
+|---|---|---|
+| Hyperliquid | `B` / `A` | `buy` / `sell` |
+| Polymarket Perps | `long` / `short` | `buy` / `sell` |
+| Kalshi Margin | `taker_side` of `bid` / `ask` | `buy` / `sell` |
+
+An unrecognized value is an error, never a default.
+
+> **Side casing differs by product.** Perpetual trade sides are lowercase
+> (`buy` / `sell`). Prediction-market trade sides are uppercase. Do not compare
+> them without normalizing.
+
+> **Aggressor side is not position side.** A sell-aggressor trade does not
+> prove that the seller opened a short. Unknown side stays unknown.
+
+### The full canonical trade model
+
+A normalized public trade — the shape the canonical schema defines, beyond the
+snapshot subset above — contains:
+
+- instrument and source context
+- stable event identity and native event identity, when supplied
+- exact trade price
+- exact native quantity and native quantity unit
+- optional proven base quantity and quote notional
+- aggressor side when the venue supplies or deterministically proves it
+- liquidation attribution as a tri-state value
+- venue event, source, receive, and ingest times when available
+
+<Warning>
+**Liquidation attribution is `true`, `false`, or unknown.** Absence must not
+be collapsed to `false`.
+</Warning>
+
+## Conversions
+
+For a base-denominated linear contract, quote notional may be price multiplied
+by base quantity. For a contract-denominated venue, conversion also needs the
+listing's multiplier and contract rules. If those inputs are unavailable,
+Kairos publishes native quantity only.
+
+## Trade candles
+
+Trade candles aggregate executed trades and include:
+
+- interval and bucket start
+- exact open, high, low, and close
+- native volume with its unit
+- optional proven base volume and quote volume
+- trade count
+- revision and finality
+
+Buckets with no trades are sparse unless a specific endpoint declares a
+fill-forward policy. A zero-volume synthetic candle must never look like a
+venue trade.
+
+### What the preview actually serves
+
+<Note>
+**One interval only: `1m`, over roughly the last hour.** The validator
+rejects any other `interval` label and any candle whose end is not exactly
+sixty seconds after its start. A snapshot that somehow carried a five-minute
+bucket fails with `502` rather than being served.
+</Note>
+
+Every interval is half-open: `[interval_start_ns, interval_end_ns)`.
+
+<Note>
+**No candle is ever labelled `final`.** The preview's public REST sources
+provide no immutable finalization signal, so `finality` is either `open` or
+`closed_unconfirmed`. `finality` is derived from the bucket end against the
+snapshot's own `fetched_at_ns`, and the two are cross-checked — a candle
+marked `open` whose interval has already closed is a validation failure.
+</Note>
+
+Kalshi no-trade buckets with null OHLC values are omitted rather than filled
+from the previous close. A bucket with *partially* null OHLC, or null OHLC with
+non-zero volume, is a hard error rather than a skip.
+
+### Per-venue candle differences
+
+| Venue | Candle volume unit | Trade/book quantity unit | `trade_count` |
+|---|---|---|---|
+| Hyperliquid | `base_asset` | `base_asset` | Present |
+| Polymarket Perps | `base_asset` | `contracts` | Present |
+| Kalshi Margin | `contracts` | `contracts` | **Absent** — the venue's candlestick response does not carry one |
+
+<Warning>
+**Polymarket Perps splits its units: trades and books are `contracts`, kline
+volume is `base_asset`.** Volume units are carried per candle for exactly
+this reason. Use each record's declared unit; never inherit the trade unit.
+</Warning>
+
+## Quote candles
+
+Mark, index, oracle, mid, and other reference prices are not trades. Their
+candles use a quote-candle contract with a required `price_type` and source.
+Quote volume is absent rather than fabricated.
+
+Keeping trade and quote candles distinct prevents an index move from being
+reported as execution, and prevents a mark-price candle from entering a
+trade-volume calculation.
+
+## Finality and corrections
+
+A live candle can be provisional. Updates carry a monotonic revision within the
+instrument, price type, interval, and bucket. Finalization is explicit.
+
+Late source events or venue corrections can revise a finalized candle only
+under a declared correction policy. Upsert by candle identity and revision;
+do not append every update as a new bucket.
+
+## Hyperliquid perpetual trades today
+
+Hyperliquid perpetual trades are not scraped from a REST trade endpoint — they
+are the **on-chain HyperCore fills**, delivered to Kairos by webhook and
+decoded into perpetual trade facts.
+
+One stream carries both products, so the coin decides the pipeline: a coin
+starting with `#` is a HIP-4 outcome market, and every other coin is a
+perpetual. That single test is the only place the split is made, for books and
+for fills alike.
+
+Each fill records the venue's own values — instrument, trade id, price,
+quantity and its unit, event time — plus the aggressor side normalized to
+lowercase `buy` / `sell`. Identity is the venue's own key, so a redelivered
+block collapses onto the same row instead of double-counting volume. Quantity
+unit is always `base_asset`.
+
+> **Liquidation attribution is `unknown` for every HyperCore fill.** HyperCore
+> does not flag liquidations on the wire, and the `dir` label is not evidence.
+
+> **These fills are not the snapshot's `trades` array.** They land in the
+> perpetual fact tables. The REST snapshot's `trades` come straight from the
+> venue's `recentTrades` endpoint on each request.
+
+## Reuse boundary
+
+The logical OHLC and public-trade shapes can be shared across asset classes.
+Prediction-specific probability scales, outcome-token identity, and complement
+pricing do not carry into perps. Perps-specific unit and price-source fields
+are required, not optional interpretation left to the client.
+
+Next: [Funding and market state](/perpetuals/funding-and-market-state).

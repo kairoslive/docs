@@ -1,0 +1,124 @@
+---
+title: "Overview"
+description: "The Krisis conditional-order engine REST API — authentication, conventions, and errors"
+---
+
+This page covers everything that applies to every Krisis endpoint:
+the base URL, authentication, wire conventions, the error shape, the tier
+limits that cap what you can create, and rate limiting. Read it once before
+using any other page in this chapter.
+
+Krisis is the Kairos conditional-order engine. It evaluates user-defined
+strategies against live market data and fires orders at the venue when their
+conditions are met — stop-losses, take-profits, trailing stops, OCO/OTO
+brackets, and TWAP schedules.
+
+## Base URL
+
+```
+https://krisis.kairos.trade
+```
+
+Every endpoint path in this chapter is relative to this base.
+
+## Authentication
+
+```
+Authorization: Bearer <jwt>
+```
+
+Every endpoint under `/api/v1` requires a JWT bearer token, **except** the
+public `dsl/validate`, `dsl/evaluate`, and market-data endpoints noted in
+their pages.
+
+The token is the **same JWT issued by your Kairos session** — pass it as-is.
+Krisis does not issue tokens itself; there is no login endpoint.
+
+The token's `sub` claim is the user UUID. Every request is scoped to that
+user — you can only read and mutate your own strategies, funds, orders, and
+positions.
+
+## Conventions
+
+| Convention | Rule |
+|---|---|
+| Content type | Request bodies are JSON; send `Content-Type: application/json` |
+| Identifiers | UUIDs unless noted |
+| Timestamps | ISO 8601 strings in UTC (e.g. `2026-05-16T12:00:00Z`) |
+| Prices | Decimals in the `0.01`–`1.00` range (prediction-market contract prices), unless a field says otherwise |
+| Exchanges | `exchange_id` is `"kalshi"`, `"polymarket"`, or `"predictfun"`, defaulting to `"kalshi"` |
+
+> **Gotcha: Polymarket needs two extra fields.** Polymarket orders additionally
+> require `token_id` and `outcome`. A Polymarket request without both is
+> rejected `400`.
+
+> **Gotcha: `"kalshi_offchain"` is a deprecated alias.** It still comes back on
+> strategies armed before the on-chain Kalshi removal, so your parser must
+> tolerate it on reads. Send `"kalshi"` for anything new.
+
+## Error responses
+
+Errors return a JSON body with a single `error` field:
+
+```json
+{ "error": "limit_price is required for stop-limit orders" }
+```
+
+| Status | When it happens | What to do |
+|---|---|---|
+| `400` | Invalid input — failed validation (bad price, missing field, tier limit reached) | Read the `error` string; it names the field or limit |
+| `401` | Missing or invalid JWT | Refresh your Kairos session token |
+| `404` | Resource not found, or not owned by you | Confirm the id; ownership failures are not distinguished from absence |
+| `429` | Rate limit exceeded | Back off — see [Rate limiting](#rate-limiting) |
+| `500` | Internal / database error | Retry with backoff |
+
+<Note>
+**Gotcha: not every rejection is an HTTP error.**
+`POST /api/v1/dsl/validate` answers a bad expression with `200` and
+`valid: false`. A strategy that can't fire for want of a fund or credentials
+records a `skip_reason` on its execution rather than failing a request — see
+[Funds & Credentials](/krisis/funds-credentials#how-a-funding-or-credential-failure-surfaces).
+A `200` and a healthy-looking strategy do not mean the engine is trading.
+</Note>
+
+## Tier limits
+
+Your account carries a Krisis tier that caps how much of the engine you can
+use. A create call that would exceed a cap fails `400` — e.g.
+`{ "error": "Strategy limit reached for your tier" }`. The tier carries:
+
+| Limit | Effect |
+|---|---|
+| `max_strategies` | Ceiling on concurrently held strategies. Every conditional order is one strategy, so a bracket costs two slots and an OTO bracket three |
+| `max_total_cost` | Ceiling on the total cost of the strategies you hold |
+| `allow_expressions` | Whether you may supply a raw DSL `expression` |
+| `allow_indicators` | Whether indicator functions are available to you — on top of the engine-wide limits on what an armed expression can reference (see [DSL variables](/krisis/strategies#dsl-variables)) |
+| `allow_multi_market` | Whether strategies may span more than one market |
+| `allow_custom_cooldown` | Whether you may set your own trigger cooldown |
+| `allow_advanced_actions` | Whether the advanced action types are available |
+
+Tiers are administered by Kairos; there is no public endpoint to read or
+change your own.
+
+## Rate limiting
+
+The API enforces a global request-rate limit. When exceeded, requests get
+`429` with:
+
+```json
+{ "error": "Too many requests. Please slow down." }
+```
+
+## What's in this chapter
+
+| Page | Covers |
+|---|---|
+| [Strategies & DSL](/krisis/strategies) | Strategy CRUD, legs, and the `dsl/validate` + `dsl/evaluate` endpoints |
+| [Conditional Orders](/krisis/conditional-orders) | Single conditional orders, OCO/OTO brackets, TWAP, and market-making |
+| [Funds & Credentials](/krisis/funds-credentials) | Spending funds and exchange API credentials |
+| [Positions & PnL](/krisis/positions-pnl) | Orders, executions, positions, equity curve, PnL summary, and the real-time events stream |
+| [Market Data](/krisis/market-data) | Orderbook snapshots and the backtest endpoint |
+
+Most integrations start with [Conditional Orders](/krisis/conditional-orders) — the
+dedicated stop-loss, bracket, TWAP, and market-maker endpoints — and only drop
+down to [Strategies & DSL](/krisis/strategies) for custom conditions.

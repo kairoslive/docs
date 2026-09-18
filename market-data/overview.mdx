@@ -1,0 +1,145 @@
+---
+title: "Overview"
+description: "Kairos Market Data API (beta) — candles, trades, markets, resolutions, marks"
+---
+
+The Market Data API is a read-only HTTP API for Kairos market data: OHLCV
+candles, trade history, market metadata, resolutions, and mark prices. Use it
+to paint charts, backfill history, resolve venue identifiers, and check
+settlement outcomes. It is currently in **beta**.
+
+## Start here
+
+Base URL:
+
+```
+https://md.kairos.trade
+```
+
+**No signup is required.** Every endpoint works anonymously on the
+[free tier](/market-data/authentication) with low per-IP rate limits.
+This request runs as-is:
+
+```bash
+curl "https://md.kairos.trade/v1/markets?provider=polymarket&limit=5"
+```
+
+For production budgets, move to
+[API-key authentication](/market-data/authentication#api-keys).
+
+The machine-readable contract is published as OpenAPI 3.1 —
+[`/openapi/market-data-api.yaml`](https://app.kairos.trade/openapi/market-data-api.yaml) ·
+[`/openapi/market-data-api.json`](https://app.kairos.trade/openapi/market-data-api.json). The
+[API Reference](/api-reference) renders it with live try-it panels.
+
+## Endpoints
+
+| Data | Endpoints | Page |
+|---|---|---|
+| OHLCV candles (1s → 1d) | `GET /v1/candles`, `POST /v1/candles/batch` | [Candles](/market-data/candles) |
+| Trade history + volume metrics | `GET /v1/trades`, `GET /v1/trades/metrics` | [Trades](/market-data/trades) |
+| Market metadata, identifier resolution + enumeration | `GET /v1/markets/{provider}/{market_id}`, `POST /v1/markets/batch`, `POST /v1/market-identifiers/resolve`, `GET /v1/markets` | [Markets](/market-data/markets) |
+| Settled outcomes | `GET /v1/resolutions` | [Markets](/market-data/markets#settled-outcomes) |
+| Resolution lifecycle (state + timeline) | `GET /v1/markets/{provider}/{market_id}/resolution`, `GET /v1/markets/{provider}/{market_id}/resolution/events` | [Markets](/market-data/markets#resolution-lifecycle) |
+| Latest mark prices | `GET /v1/marks` | [Markets](/market-data/markets#last-traded-prices-marks) |
+| Live perpetual snapshot (beta, flag-gated) | `GET /v1/perpetuals/{venue}/{instrument}/snapshot` | [Perpetuals](/perpetuals/overview) |
+| Liveness / readiness probes | `GET /health`, `GET /ready` | — |
+
+Supported providers: `kalshi`, `polymarket`, `predictfun`, `hyperliquid`.
+(`opinion` is accepted for historical reads.)
+
+Portfolio and PnL endpoints are served by the [REST API](/rest/pnl), not
+by this one.
+
+## Conventions
+
+- **Prices** are quoted on the **0–100 scale** (implied probability × 100)
+  throughout — candles, trades, and marks. Two decimal places of precision
+  are significant.
+- **Timestamps**: request parameters accept ISO 8601
+  (`2026-07-15T00:00:00Z`); response timestamps are unix seconds (fractional
+  where the source has millisecond precision) except candle `bucket_start`,
+  which is ISO 8601 with an explicit UTC offset.
+- **Identifiers**: `contract_id` is the venue's market identifier;
+  [`token_id`](/learn/glossary) identifies a specific outcome token
+  within a market. On multi-outcome markets every outcome has an independent
+  token and independent prices.
+- **Volumes** are contract quantities on candles and trades; `*_usd` fields
+  are [notional](/learn/glossary) (`size × price / 100`).
+
+## Data semantics
+
+- **Candles are sparse.** Buckets with no trades are omitted rather than
+  zero-filled. Gaps in a candle series reflect periods with no trading.
+- **A mark is the last traded price** of an outcome token. Marks are
+  point-in-time snapshots; for streaming updates, use the
+  [WebSocket API](/websocket/market-data-websocket).
+
+<Warning>
+**Absence is a valid answer, not an error.** Unresolved markets are omitted
+from `/v1/resolutions`, never-traded pairs are omitted from `/v1/marks`, and
+empty candle windows return `200` with an empty array. Do not treat any of
+these as failures.
+</Warning>
+
+## Response formats
+
+- JSON by default. All responses support gzip via `Accept-Encoding`.
+- Candles are also available in a compact
+  [binary format](/market-data/candles#binary-format).
+- Historical responses carry `Cache-Control` and `ETag` headers — conditional
+  requests with `If-None-Match` return `304 Not Modified`.
+
+## Two products, one API
+
+Kairos serves **prediction markets** and **perpetual futures** from the same
+services. They share transport, auth, and error envelopes, and differ in
+identity and price semantics:
+
+| | Prediction markets | Perpetual futures |
+|---|---|---|
+| Venues | `kalshi`, `polymarket`, `predictfun`, `hyperliquid` (HIP-4), `opinion` | `hyperliquid`, `polymarket_perps`, `kalshi_margin` |
+| Price meaning | Implied probability | Direct venue price |
+| Price scale | 0–100 on REST, ×10,000 on the WebSocket | Exact decimal strings on REST; per-snapshot scale on the WebSocket |
+| Outcomes | Two or more per market | None — one instrument, one book |
+| Endpoints | The table above | `GET /v1/perpetuals/{venue}/{instrument}/snapshot` |
+
+> **Never apply prediction-market probability math to a perpetual price.** A
+> perpetual price is a venue price, not a 0–100 probability. Dividing one by
+> 100 produces a silently wrong number.
+
+> **Hyperliquid appears in both columns and the two are never
+> interchangeable.** Its **HIP-4 outcome markets** are prediction markets
+> (venue coins look like `#1210`), read under `provider=hyperliquid`. Its
+> **perpetuals** are bare coins (`BTC`, `kPEPE`) with their own identity
+> scheme, read under `GET /v1/perpetuals/hyperliquid/...`. See
+> [Perpetuals](/perpetuals/overview).
+
+The perpetual surface is live on this base URL but is **beta and flag-gated**:
+`PERPETUALS_PUBLIC_API_ENABLED` is on in production and staging, and a
+deployment with it off returns `404` for the snapshot route. Coverage is not
+the full venue catalog either — Hyperliquid enrollment is capped. Read
+[Perpetuals → Overview](/perpetuals/overview) before writing any code
+against it.
+
+## Errors
+
+All errors use one envelope:
+
+```json
+{ "error": { "code": "invalid_request", "message": "unknown provider \"foo\"" } }
+```
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| `400` | `invalid_request` | Validation failure | Read `message` — it names the offending parameter. Fix the request; retrying it unchanged will fail again |
+| `401` | `unauthorized` | Invalid, incomplete, or revoked credentials | Check all three API-key headers. Sending *no* credential headers is allowed and rides the free tier; sending some but not all does not |
+| `403` | `ip_not_whitelisted` | The API key was presented from a source IP outside its whitelist | Call from a whitelisted IP, or ask the team to add yours. This is the only `403` the service emits |
+| `404` | `not_found` | The market, or its resolution state, does not exist | Verify the `{provider}/{market_id}` pair; resolve venue identifiers with `POST /v1/market-identifiers/resolve` |
+| `429` | `rate_limited` | Rate limited | Wait for `Retry-After` seconds, then retry. See [rate limits](/market-data/authentication#rate-limits) |
+| `500` | `internal` | A query or the credential lookup failed | Safe to retry |
+| `502` | `upstream` | An upstream (metadata cache, or a perpetual venue) failed | Retry with backoff |
+| `503` | `cache_cold`, `unavailable`, `rate_limiter_unavailable` | Temporarily unavailable | Retry with backoff, honoring `Retry-After` when present. `unavailable` means the deployment has no metadata cache configured and will not resolve on retry |
+
+`GET /ready` is the one exception to the envelope. On `503` it answers
+`{"ready": false, "failing": "clickhouse"}` (or `"redis"`).

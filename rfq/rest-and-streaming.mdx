@@ -1,0 +1,345 @@
+---
+title: "REST and Streaming"
+description: "Authenticate, create RFQs, discover venue flow, quote, and consume lifecycle events"
+---
+
+This page is the REST and WebSocket contract for the RFQ Network: how to
+authenticate, which scope each endpoint needs, how to create and accept RFQs,
+what states a resource moves through, and how to consume the replayable event
+stream. Read [Overview](/rfq/overview) first for the two roles and the
+consistency rules; use [FIX protocol](/rfq/fix) instead if you connect over FIX.
+
+Use REST for commands and snapshots and WebSocket for cursor-replayable
+lifecycle events. The production base URL is `https://rfq.kairos.trade`.
+
+## Authentication
+
+Two credential forms are accepted.
+
+**API credentials** use all three headers together:
+
+```http
+X-Client-Id: <client-id>
+X-Api-Key: <api-key>
+X-Api-Secret: <api-secret>
+```
+
+**Bearer JWTs** are also accepted: `RS256`, issuer `kairos.trade`, audience
+`kairos-api`, with `sid` and `ver: 1` claims and a required `exp`.
+
+Every JWT is checked for revocation on connect and, on the WebSocket, again
+every 30 seconds. Authentication fails closed with
+`503 auth_dependency_unavailable` when revocation status cannot be verified.
+
+API-credential principals carry the scopes stored on the credential, and an
+`ipWhitelist` on the credential is enforced against the client IP.
+
+<Note>
+**Gotcha: an IP-allowlist miss is a `403`, not a `401`.** A non-allowlisted
+source gets `403 forbidden`, which is easy to misread as a scope problem.
+Check the source address before you re-issue credentials.
+</Note>
+
+### Scopes
+
+| Scope | Allows |
+| --- | --- |
+| `rfq:read` | Read owned RFQs, quotes, executions, and events |
+| `rfq:create` | Create and cancel requester RFQs |
+| `rfq:quote` | Discover venue RFQs, create/revise/withdraw/read own quotes |
+| `rfq:accept` | Accept a quote |
+
+The scope `*` satisfies every check.
+
+<Note>
+**Gotcha: a JWT with no `scopes` claim cannot quote.** It is granted
+`rfq:read`, `rfq:create`, and `rfq:accept` — **not** `rfq:quote`. Market
+makers need a credential that carries `rfq:quote` explicitly.
+</Note>
+
+## Endpoint index
+
+| Method | Path | Scope | Success | Purpose |
+| --- | --- | --- | ---: | --- |
+| `POST` | `/v1/rfqs` | `rfq:create` | `201` | Create and fan out an RFQ |
+| `GET` | `/v1/rfqs` | `rfq:read` | `200` | List the caller's RFQs |
+| `GET` | `/v1/rfqs/{rfq_id}` | `rfq:read` | `200` | Read one owned RFQ |
+| `GET` | `/v1/rfqs/{rfq_id}/quotes` | `rfq:read` | `200` | List quotes on an owned RFQ |
+| `POST` | `/v1/rfqs/{rfq_id}/cancel` | `rfq:create` | `200` | Cancel an RFQ |
+| `GET` | `/v1/exchange-rfqs` | `rfq:quote` | `200` | List currently open venue-originated RFQs |
+| `POST` | `/v1/quotes` | `rfq:quote` | `201` | Submit an MM quote |
+| `GET` | `/v1/quotes/{quote_id}` | `rfq:quote` | `200` | Read your own quote |
+| `PUT` | `/v1/quotes/{quote_id}` | `rfq:quote` | `200` | Revise a quote |
+| `DELETE` | `/v1/quotes/{quote_id}` | `rfq:quote` | `200` | Withdraw a quote |
+| `POST` | `/v1/quotes/{quote_id}/accept` | `rfq:accept` | `202` | Reserve and route an acceptance |
+| `GET` | `/v1/executions/{acceptance_id}` | `rfq:read` | `200` | Read acceptance/execution state |
+| `GET` | `/v1/venues/capabilities` | — | `200` | Inspect enabled venue capabilities |
+| `GET` | `/v1/stream` | `rfq:read` | `101` | Upgrade to the replayable event stream |
+
+`/v1/venues/capabilities` needs authentication but no particular scope.
+
+### Rules that apply to every request
+
+| Rule | Detail |
+| --- | --- |
+| Idempotency header | `POST`, `PUT`, and `DELETE` all require an `Idempotency-Key` header |
+| Body size | Request bodies are capped at 1 MiB |
+| Body shape | Exactly one JSON value; unknown fields are rejected |
+| Decimals | Quantities and prices are strings, not JSON numbers |
+| Rate limit | 25 requests/second with a burst of 50, keyed by principal, falling back to client IP |
+
+## The requester flow
+
+1. **Check venue capabilities.** `GET /v1/venues/capabilities` tells you what
+   each venue currently supports. Do this before selecting `venues` — see
+   [Create an RFQ](#create-an-rfq) for what happens when a venue cannot accept
+   requester fanout.
+2. **Create the RFQ.** `POST /v1/rfqs` with a fresh `Idempotency-Key` returns
+   `201` and an `rfq_id`.
+3. **Watch for quotes.** Connect to [`GET /v1/stream`](#stream-recovery) and
+   consume `quote.created` / `quote.revised` / `quote.withdrawn`, or poll
+   `GET /v1/rfqs/{rfq_id}/quotes`.
+4. **Accept one.** `POST /v1/quotes/{quote_id}/accept` returns `202` and an
+   acceptance in `pending_routing`. This reserves quantity; it does not fill.
+5. **Follow the acceptance to a terminal state** via
+   `GET /v1/executions/{acceptance_id}` or the `acceptance.*` events. `executed`
+   also emits `execution.normalized.v1`.
+6. **Cancel what you no longer want.** `POST /v1/rfqs/{rfq_id}/cancel` moves the
+   RFQ to `cancelled` and its live quotes to `withdrawn`.
+
+## The market-maker flow
+
+1. **Confirm your credential carries `rfq:quote`.** A scopeless JWT does not.
+2. **Discover open venue RFQs** with
+   [`GET /v1/exchange-rfqs`](#discover-venue-rfqs), or consume the maker
+   broadcast stream, which callers holding `rfq:quote` receive on
+   [`GET /v1/stream`](#stream-recovery).
+3. **Quote it.** `POST /v1/quotes` returns `201`.
+4. **Revise or withdraw.** `PUT /v1/quotes/{quote_id}` requires the new revision
+   to be exactly `current + 1`; `DELETE /v1/quotes/{quote_id}` withdraws.
+5. **Watch `quote.disposition` and the `acceptance.*` events** for the outcome.
+
+## Create an RFQ
+
+```
+POST /v1/rfqs
+```
+
+Creates a requester RFQ and fans it out to the selected venues. Returns `201`.
+
+**Scope:** `rfq:create`. **Requires an `Idempotency-Key` header.**
+
+### Example
+
+```bash
+curl https://rfq.kairos.trade/v1/rfqs \
+  -X POST \
+  -H 'X-Client-Id: <client-id>' \
+  -H 'X-Api-Key: <api-key>' \
+  -H 'X-Api-Secret: <api-secret>' \
+  -H 'Idempotency-Key: desk-rfq-20260810-001' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "currency": "USD",
+    "package_quantity": "100",
+    "minimum_partial": "10",
+    "requested_sides": ["bid", "offer"],
+    "expires_at": "2026-08-10T18:00:00Z",
+    "venues": ["kalshi"],
+    "priority_venue": "kalshi",
+    "legs": [{
+      "leg_id": "yes",
+      "ratio": "1",
+      "source_venue": "kalshi",
+      "market_id": "MARKET-TICKER",
+      "outcome": "yes"
+    }]
+  }'
+```
+
+### Validation
+
+A request that breaks any of these is rejected `400 invalid_request`.
+
+| Field | Rule |
+| --- | --- |
+| `expires_at` | Must be in the future |
+| `legs` | Non-empty, with unique `leg_id`s and non-zero decimal `ratio`s |
+| `requested_sides` | `bid`, `offer`, or both, with no duplicates |
+| `minimum_partial` | Must not exceed `package_quantity` |
+| `priority_venue` | Must name a venue Kairos knows and, when `venues` is non-empty, must appear in it |
+
+Decimal quantities and prices are strings.
+
+### Gotchas
+
+> **Idempotency ignores the body.** Keys are `(principal, operation, key)`.
+> Replaying a key returns the resource the first call created and never performs
+> a second mutation — so a replay with a *different* body still returns the
+> original resource. Treat a key as bound to one command.
+
+> **Requester fanout is not live yet.** Every venue adapter currently reports
+> `requester_rfq: false`, so each entry in `venues` comes back as a `targets`
+> entry with `state: "excluded"` and a `reason`, plus a `mapping_warnings`
+> entry. The `201` is not evidence that anything reached a venue. Read
+> `/v1/venues/capabilities` before relying on fanout.
+
+## List your RFQs
+
+```
+GET /v1/rfqs
+```
+
+**Scope:** `rfq:read`.
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `limit` | integer | No | `50` | Page size. **A value above `200` falls back to `50`** rather than erroring or clamping to `200` |
+
+## Discover venue RFQs
+
+```
+GET /v1/exchange-rfqs
+```
+
+Lists the venue-originated RFQs currently open for you to quote. **Scope:**
+`rfq:quote`.
+
+### Example
+
+```http
+GET /v1/exchange-rfqs?venue=kalshi&limit=100
+```
+
+| Name | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `venue` | string | No | — | Restrict results to one venue |
+| `limit` | integer | No | `100` | Page size. **A value above `500` falls back to `100`** |
+| `cursor` | string | No | — | Opaque cursor from a previous `next_cursor`. A malformed value returns `400 invalid_request` |
+
+### Response
+
+Results are expiry ordered and include an opaque `next_cursor` plus
+`observed_at`, which reports the local projection's last mutation time.
+
+### Errors
+
+| Status | `error` | When it happens | What to do |
+| ---: | --- | --- | --- |
+| `400` | `invalid_request` | Malformed `cursor` | Restart pagination without a cursor |
+| `403` | `insufficient_scope` | Credential lacks `rfq:quote` | Use a maker credential |
+| `503` | `exchange_rfq_index_unavailable` | That gateway's node-local projection is unavailable | Retry against another gateway or region |
+
+## Lifecycle states
+
+### RFQ
+
+| State | Entered when | Terminal |
+| --- | --- | --- |
+| `open` | Created | No |
+| `partially_filled` | Some accepted quantity has executed | No |
+| `filled` | The full package quantity has executed | Yes |
+| `cancelled` | Cancelled from `open` or `partially_filled`. **Also moves the RFQ's live quotes to `withdrawn`** | Yes |
+| `expired` | `expires_at` passed while still `open` or `partially_filled` | Yes |
+
+### Quote
+
+| State | Entered when | Terminal |
+| --- | --- | --- |
+| `live` | Created. A revision replaces the quote in place and keeps it `live` | No |
+| `partially_filled` | Some quoted quantity has executed | No |
+| `filled` | The quote is fully executed | Yes |
+| `withdrawn` | `DELETE /v1/quotes/{quote_id}`, or the parent RFQ was cancelled | Yes |
+| `expired` | Every priced side has passed its `expires_at` | Yes |
+
+### Acceptance
+
+| State | Entered when | Terminal |
+| --- | --- | --- |
+| `pending_routing` | The `202` from `POST /v1/quotes/{quote_id}/accept` | No |
+| `venue_accepted` | The venue acknowledged the routed acceptance | No |
+| `executed` | The trade completed. **Also emits `execution.normalized.v1` to both sides** | Yes |
+| `rejected` | The venue or the engine refused it | Yes |
+| `expired` | The reservation lapsed | Yes |
+| `execution_unknown` | The outcome could not be determined | No |
+
+<Warning>
+**Gotcha: acceptance is a reservation, not a fill.** It binds
+`quote_revision`, `side`, `quantity`, `expected_price`, and
+`mapping_snapshot_id` atomically and holds `reserved_quantity` on both the RFQ
+and the price level until the acceptance reaches a terminal state. Do not book
+a trade on the `202`.
+</Warning>
+
+## Errors
+
+Errors are JSON objects whose only field is `error`, except where noted.
+
+| Status | `error` | When it happens | What to do |
+| ---: | --- | --- | --- |
+| `400` | `idempotency_key_required` | Mutation sent without an `Idempotency-Key` header | Add the header to every `POST`/`PUT`/`DELETE` |
+| `400` | `invalid_json` | Unparseable body, unknown field, oversize body, or extra JSON value | Read the added `message` field; send exactly one JSON value under 1 MiB with no unknown fields |
+| `400` | `invalid_request` | Domain validation failed, or a bad `exchange-rfqs` cursor | Fix the field named by the request rules above |
+| `401` | `unauthorized` | Missing, malformed, unknown, or revoked credentials | Re-issue credentials |
+| `403` | `forbidden` | Credential IP allowlist miss, or the resource is not yours | Check the source IP first, then ownership |
+| `403` | `insufficient_scope` | Authenticated but missing the scope | Read the added `required_scope` field and re-scope the credential |
+| `404` | `not_found` | Unknown RFQ, quote, or acceptance | Confirm the id and that it belongs to you |
+| `409` | `conflict` | Terminal or non-cancellable state, or a mapping snapshot mismatch | Re-read the resource; do not retry blindly |
+| `409` | `stale_quote_revision` | Revision is not `current + 1` on revise, does not match on accept, or `expected_price` mismatched | Re-read the quote and resubmit against the current revision |
+| `409` | `quote_expired` | The RFQ or the accepted price level has already expired | Request or discover a fresh quote |
+| `409` | `insufficient_remaining_quantity` | Quantity below the level minimum or above what is unreserved | Re-read remaining quantity and resize |
+| `429` | `rate_limited` | Over the 25 rps / 50 burst budget | Honour the returned `Retry-After: 1` header |
+| `500` | `internal_error` | Unclassified failure | Retry with backoff |
+| `503` | `auth_dependency_unavailable` | JWT revocation status could not be verified | Retry with backoff; auth fails closed by design |
+| `503` | `exchange_rfq_index_unavailable` | `/v1/exchange-rfqs` on a gateway without a local projection | Retry against another gateway or region |
+
+## Stream recovery
+
+```
+GET /v1/stream
+```
+
+**Scope:** `rfq:read`. Upgrades to a WebSocket (`101`).
+
+1. Connect to `/v1/stream`.
+2. Persist the `sequence` of the last event you processed.
+3. On reconnect, pass `after=<sequence>` to replay missed durable events.
+
+Events are delivered as JSON text frames with `sequence`, `event_id`,
+`resource_id`, `type`, `occurred_at`, and `data`. The gateway polls roughly
+every 250 ms and sends at most 250 events per poll.
+
+> **Gotcha: the stream is server-push only.** There are no client-to-server
+> messages, and `after` is the sole subscription control — you cannot filter or
+> subscribe selectively once connected.
+
+> **Gotcha: always process events idempotently.** A reconnect can redeliver an
+> event that was received immediately before the disconnect.
+
+### Event types
+
+| Group | `type` values |
+| --- | --- |
+| RFQ | `rfq.created`, `rfq.cancelled`, `rfq.expired` |
+| Quote | `quote.created`, `quote.submitted`, `quote.revised`, `quote.withdrawn`, `quote.expired`, `quote.disposition` |
+| Acceptance | `acceptance.pending`, `acceptance.venue_accepted`, `acceptance.executed`, `acceptance.rejected`, `acceptance.expired`, `acceptance.execution_unknown` |
+| Execution | `execution.normalized.v1` |
+
+Callers holding `rfq:quote` additionally receive the maker broadcast stream of
+venue-originated RFQ events.
+
+### Close codes
+
+| Code | Reason text | When it happens | What to do |
+| --- | --- | --- | --- |
+| `1000` | `closed` | Normal shutdown of the request context | Reconnect with your last `after` |
+| `1008` | `authentication revoked or unavailable` | The 30-second recheck found a revoked token, or could not reach the revocation checker | Get a fresh token before reconnecting |
+| `1011` | `event replay failed` | The event query failed | Reconnect with the **same** `after` |
+
+Scope and authentication failures happen before the upgrade and surface as an
+ordinary HTTP error rather than a close frame.
+
+## Machine-readable contract
+
+The complete machine-readable contract lives in the RFQ service's
+`spec/openapi.yaml` and `spec/asyncapi.yaml` files.

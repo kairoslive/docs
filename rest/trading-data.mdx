@@ -1,0 +1,429 @@
+---
+title: "Trading Data"
+description: "Candles, live trade proxies, and normalized volume metrics from the Data API"
+---
+
+Historical candles, venue trade proxies, and trade history/metrics. Use these endpoints to chart a market, replay its tape, or read aggregate volume for a contract.
+
+Full parameter reference and a live tester: [API Reference](/api-reference).
+
+## Base URL
+
+```
+https://data.kairos.trade
+```
+
+All paths on this page are relative to that host.
+
+## Authentication
+
+Every endpoint accepts an API key (`X-Client-Id` + `X-Api-Key` + `X-Api-Secret`), a first-party session JWT, or an admin secret. Session-JWT callers additionally pass the invite gate; API-key and admin callers bypass it.
+
+Examples below read credentials from `KAIROS_CLIENT_ID`, `KAIROS_API_KEY`, and `KAIROS_API_SECRET` in your shell.
+
+**Candle routes** (`GET /candles`, `POST /candles/batch`) need no scope and are not platform-gated. They share one `candles` rate-limit group at 200 requests/minute, so the two endpoints draw on a single budget; an operator tier can raise or lower it at runtime.
+
+**`/trades/*` routes** need the `trade:read` scope on API-key credentials (admin and JWT callers bypass the scope check). They also enforce [platform access](/guides/authentication#platform-access) for API-key callers: the fixed proxy routes check their fixed provider, while history and metrics check the `provider` query value.
+
+The `/trades/*` routes carry no explicit limit decorator, so they fall back to the service-wide default of 100 requests/minute per route, keyed on the authenticated user (or the client IP when unauthenticated).
+
+## Get candles
+
+```
+GET /candles
+```
+
+Fetch OHLCV candles for a single `(provider, contract_id, outcome)` series over `[start, end)`, bucketed at `timeframe_seconds`.
+
+**Auth:** API key, session JWT, or admin secret — no scope required. 200 requests/minute (shared `candles` group).
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | Yes | — | A registered provider. Venue identifier, matched case-insensitively (`kalshi`, `polymarket`, `dome`, `opinion`, ...) |
+| `contract_id` | string | Yes | — | 1–128 chars. Provider-specific contract/market/token identifier |
+| `timeframe_seconds` | integer | Yes | — | One of 1, 60, 300, 900, 3600, 14400, 86400. Candle bucket width |
+| `start` | string | Yes | — | ISO 8601. Window start (normalized to UTC) |
+| `end` | string | Yes | — | ISO 8601, after `start`. Window end |
+| `outcome` | integer | No | `0` | ≥0. Zero-based outcome index for multi-outcome markets |
+| `rebuild` | boolean | No | `false` | Bypass the cache and force a fresh rebuild |
+
+```bash
+curl -G "https://data.kairos.trade/candles" \
+  --data-urlencode "provider=kalshi" \
+  --data-urlencode "contract_id=KXPRESPOLAND-24-DT" \
+  --data-urlencode "timeframe_seconds=60" \
+  --data-urlencode "start=2026-07-21T00:00:00Z" \
+  --data-urlencode "end=2026-07-22T00:00:00Z" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Unless `rebuild=true`, the handler first checks for a byte-identical cached response and streams it straight back** — a miss (or `rebuild=true`) falls through to reconstructing the candles from the underlying trade data and repopulates the cache. There is no "wait for ingestion" mode.
+
+<Warning>
+**Gotcha:** `start` is silently clamped, never rejected. Each timeframe has a maximum lookback measured back from `end`; asking for more returns the clamped window rather than an error. Compare `candles[].bucket_start` against the `start` you sent if the exact window matters.
+</Warning>
+
+| `timeframe_seconds` | Max lookback |
+|---|---|
+| 1 | 1 day |
+| 60 | 30 days |
+| 300 | 90 days |
+| 900 | 180 days |
+| 3600 | 365 days |
+| 14400 | 365 days |
+| 86400 | 730 days |
+
+`end` is likewise clamped forward to the current bucket. A 1-second request whose window ends more than 24 hours ago is past retention and returns `"candles": []` — not an error.
+
+### Response
+
+```json
+{
+  "candles": [
+    {
+      "contract_id": "KXPRESPOLAND-24-DT",
+      "bucket_start": "2026-07-21T14:32:00+00:00",
+      "timeframe_seconds": 60,
+      "open": 63.5,
+      "high": 64.0,
+      "low": 63.0,
+      "close": 63.8,
+      "volume": 1250
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `candles[].contract_id` | string | Echoes the requested contract |
+| `candles[].timeframe_seconds` | integer | Echoes the requested bucket width |
+| `candles[].bucket_start` | string | Bucket start time, ISO 8601 UTC |
+| `candles[].open` / `high` / `low` / `close` | number | Prices, 0–100 cents scale |
+| `candles[].volume` | integer | Contracts traded in the bucket |
+| `candles[].token_id` | string | Outcome token id; present only when the series is token-scoped (e.g. multi-outcome Polymarket markets) |
+
+## Batch candles
+
+```
+POST /candles/batch
+```
+
+Fetch up to 200 candle series in one call. Each item accepts the same fields as `GET /candles`.
+
+**Auth:** same as `GET /candles`. 200 requests/minute — the same `candles` limit group, so the two endpoints share one budget.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `requests` | array | Yes | — | 1–200 items. Each item takes the same fields, per-field rules, and per-timeframe lookback clamp as `GET /candles`. A legacy `items` key with the identical shape is accepted as a fallback |
+
+```bash
+curl -X POST https://data.kairos.trade/candles/batch \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "requests": [
+      { "provider": "kalshi", "contract_id": "KXPRESPOLAND-24-DT",
+        "timeframe_seconds": 60,
+        "start": "2026-07-21T00:00:00Z", "end": "2026-07-22T00:00:00Z" }
+    ]
+  }'
+```
+
+Every item is checked against the cache in parallel first; only the uncached tail is rebuilt from the underlying trade data.
+
+**There is also a whole-batch size budget.** After clamping, the estimated bar count across every item must not exceed **400,000**; over that the request fails with `400 batch implies <n> candles; maximum is 400000`. The request body itself is capped at 8 MiB (`413` beyond that).
+
+**A single bad or failed item never fails the whole batch.** An empty window comes back as `"candles": []`, not an error. If the rebuild step fails after some items were already cached, those still return normally and every uncached item instead gets `"candles": [], "error": "<message>"`. Only when **no** item could be served at all does the request fail with 500. Check `results[].error` per item rather than relying on the HTTP status.
+
+### Response
+
+```json
+{
+  "results": [
+    { "index": 0, "candles": [ { "...": "..." } ] },
+    { "index": 1, "candles": [], "error": "unknown provider \"acme\"" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `results[].index` | integer | Position matching the corresponding item's index in `requests` |
+| `results[].candles` | array | Candle objects, same shape as `GET /candles` |
+| `results[].error` | string | Present only when this specific item failed while others in the batch succeeded |
+
+## Kalshi trade proxy
+
+```
+GET /trades/kalshi
+```
+
+Thin proxy over Kalshi's own `GET /trade-api/v2/markets/trades`, with Kairos-computed volume metrics appended.
+
+**Auth:** API key or session JWT; API-key credentials need `trade:read` and Kalshi must be enabled globally for them. 100 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `ticker` | string | Yes | — | 1–128 chars. Kalshi market ticker |
+| `min_ts` | integer | No | — | Unix seconds. Inclusive lower bound, passed upstream and re-applied locally before `metrics` is computed |
+| `max_ts` | integer | No | — | Unix seconds. Inclusive upper bound, passed upstream and re-applied locally before `metrics` is computed |
+| `limit` | integer | No | `100` | 1–500. Max trades, passed through to Kalshi |
+| `cursor` | string | No | — | ≤512 chars. Upstream pagination cursor |
+
+```bash
+curl "https://data.kairos.trade/trades/kalshi?ticker=KXPRESPOLAND-24-DT&limit=100" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Cached briefly** (250 ms — burst de-duplication, not a real cache window) before falling through to Kalshi's live API; a non-2xx or network failure returns 502. The rest of Kalshi's response body is passed through verbatim with `metrics` merged in.
+
+The `metrics` object is computed locally over the *time-filtered* trades, since Kalshi's API doesn't filter server-side beyond `min_ts`/`max_ts` passthrough, and its `window_seconds` is hardcoded to 86400 regardless of the requested span.
+
+<Note>
+**Gotcha:** The `trades` array is Kalshi's unfiltered list. The local time filter narrows only what `metrics` is derived from, so `metrics.trade_count` can be smaller than `trades.length`. Re-apply `min_ts`/`max_ts` client-side if you need the two to agree.
+</Note>
+
+### Response
+
+```json
+{
+  "trades": [ { "...": "raw Kalshi trade objects, unmodified" } ],
+  "cursor": "eyJhbGciOiJ...",
+  "metrics": {
+    "volume_usd": 154320.55,
+    "outcome_0_volume_usd": 98210.1,
+    "outcome_1_volume_usd": 56110.45,
+    "outcome_0_pressure_pct": 63.65,
+    "trade_count": 842,
+    "window_seconds": 86400,
+    "coverage_pct": 100.0,
+    "source": "external",
+    "indexing": false
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `trades` | array | Raw Kalshi trade objects, passed through unmodified |
+| `cursor` | string | Upstream pagination cursor, present when Kalshi returns one |
+| `metrics.outcome_0_pressure_pct` | number | Share of `volume_usd` on outcome 0, 0–100 |
+| `metrics.source` | string | Always `"external"` on this proxy |
+| `metrics.indexing` | boolean | Always `false` here — no ingestion pipeline is involved on the live proxy endpoints |
+
+## Polymarket trade proxy
+
+```
+GET /trades/polymarket
+```
+
+Thin proxy over Polymarket's `GET https://data-api.polymarket.com/trades`, with the same metrics shape as `/trades/kalshi`.
+
+**Auth:** same model as `/trades/kalshi`, gated on Polymarket API access instead of Kalshi's. 100 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `market` | string | Yes | — | 1–128 chars. Condition ID (`0x...`), market ID, or token ID |
+| `after` | integer | No | — | Unix seconds. Inclusive lower bound, passed upstream and re-applied locally before `metrics` is computed |
+| `before` | integer | No | — | Unix seconds. Inclusive upper bound, passed to upstream only |
+| `limit` | integer | No | `100` | 1–500. Max trades, passed through to Polymarket |
+
+```bash
+curl "https://data.kairos.trade/trades/polymarket?market=0xabc123&limit=100" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+**Non-`0x` values are resolved to a condition ID before querying upstream** — via the market-metadata cache, with a provider-API lookup as a last resort. If resolution never yields a `0x...` value, the endpoint short-circuits and returns `{"trades": [], "metrics": {}}` without ever calling Polymarket.
+
+Cached briefly; a non-2xx/network error from Polymarket returns 502. `metrics` approximates `outcome_0`/`outcome_1` as the top two outcomes by traded volume in the window — an approximation, not a guaranteed yes/no mapping.
+
+### Response
+
+`{ "trades": [...], "metrics": {...} }` — the `metrics` object has the same shape as `/trades/kalshi`'s, and `trades` is Polymarket's raw trade array (fields like `proxyWallet`, `side`, `asset`, `price`). There is **no `cursor` field** on this endpoint. As on `/trades/kalshi`, the returned `trades` are unfiltered while `metrics` is derived from the `after`-filtered subset.
+
+<Note>
+**Gotcha:** `price` on these raw Polymarket trades is on a 0–1 scale — not the 0–100 cents scale used by candles and `/trades/history` elsewhere in this API.
+</Note>
+
+## Trade history
+
+```
+GET /trades/history
+```
+
+Normalized trade history for one `(provider, contract_id)`, served from Kairos's own trade store. Unlike the two proxy endpoints above, this is not a live upstream call — coverage depends on how much history has been backfilled/streamed for that contract.
+
+**Auth:** API key or session JWT; API-key credentials need `trade:read` and the requested `provider` must be enabled globally for them. 100 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | Yes | — | A registered provider. Venue identifier |
+| `contract_id` | string | Yes | — | 1–128 chars. Contract identifier |
+| `window_seconds` | integer | No | `86400` | 3600–86400. Lower bound of the query, always measured back from **now** |
+| `before` | integer | No | — | Unix seconds. Upper bound — trades at or before this timestamp |
+| `limit` | integer | No | `500` | 1–500. Max trades |
+| `trigger_ingest` | boolean | No | `false` | Accepted for compatibility; currently has no effect |
+
+```bash
+curl "https://data.kairos.trade/trades/history?provider=kalshi&contract_id=KXPRESPOLAND-24-DT&window_seconds=86400&limit=500" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+<Note>
+**Gotcha:** `window_seconds` and `before` are independent bounds, not a sliding window. The lower bound is always `now − window_seconds`; `before` only moves the upper bound. Walking backwards by feeding the oldest returned timestamp into `before` therefore narrows the window rather than shifting it.
+</Note>
+
+If that window matches nothing, the endpoint retries once with the lower bound removed and returns the newest trades at or before `before` instead — so an empty `trades` array means the contract has no ingested trades at all, not merely none in the window.
+
+**`trigger_ingest` is inert.** It is validated and ignored: no ingestion job is started, and `indexing` is always `false` on this endpoint.
+
+### Response
+
+```json
+{
+  "trades": [
+    {
+      "trade_id": "kalshi:KXPRESPOLAND-24-DT:9f2a1c",
+      "order_id": null,
+      "contract_id": "KXPRESPOLAND-24-DT",
+      "size": 50,
+      "price": 63.0,
+      "outcome": "yes",
+      "timestamp": 1753142400.0,
+      "yes_price": 63.0,
+      "no_price": 37.0,
+      "taker_side": "yes"
+    }
+  ],
+  "has_more": true,
+  "oldest_available_ts": 1750000000.0,
+  "source": "clickhouse",
+  "coverage_hours": 24.0,
+  "indexing": false
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `trades[].order_id` | string \| null | Venue order identifier/hash shared by fills from the same order; null when unavailable. This is not a Kairos order UUID. |
+| `trades[].price` | number | Price of the traded outcome, 0–100 cents scale |
+| `trades[].timestamp` | number | Execution time, unix seconds (fractional) |
+| `trades[].size` | integer | Contracts traded |
+| `trades[].outcome` | string | Outcome the trade executed against (e.g. `yes`, `no`, or a token-based label) — the canonical field |
+| `trades[].yes_price` / `no_price` / `taker_side` | number / number / string | Legacy fields derived from `price`/`outcome`, kept for backward compatibility; the pair is `price` and `100 − price` assigned by outcome, and `taker_side` is always equal to `outcome` |
+| `trades[].side` | string | `BUY` or `SELL`, taker direction — distinct from `outcome`; present only when known |
+| `trades[].token_id` | string | Outcome token id; omitted when unknown |
+| `trades[].taker_address` / `maker_address` | string | Wallet addresses on on-chain venues; each omitted when unknown |
+| `trades[].metadata` | string | Provider-specific JSON blob, as a string; omitted when empty |
+| `has_more` | boolean | The page came back full (`limit` rows) — more may exist |
+| `oldest_available_ts` | number \| null | Oldest timestamp **in this response**, unix seconds; null when no trades matched |
+| `source` | string | Opaque internal marker for how the response was produced — not part of the stable contract |
+| `coverage_hours` | number | Hours between `oldest_available_ts` and now, to 1 decimal; `0.0` when no trades matched |
+| `indexing` | boolean | Always `false` — see `trigger_ingest` above |
+
+<Note>
+**Gotcha:** `trades[].timestamp` and `oldest_available_ts` are **unix seconds** (fractional), not milliseconds. Multiplying by 1000 before feeding a JavaScript `Date` is the usual fix.
+</Note>
+
+## Volume metrics
+
+```
+GET /trades/metrics
+```
+
+Aggregate volume and outcome-pressure metrics for one `(provider, contract_id)` over a lookback window — the same backing store as `/trades/history`, not a live upstream proxy. There's no buy/sell breakdown: metrics split by outcome (`outcome_0`/`outcome_1`), since trade direction can't be reliably derived from every provider's exchange data.
+
+**Auth:** same as `/trades/history`. 100 requests/minute.
+
+### Request
+
+| Name | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `provider` | string | Yes | — | A registered provider. Venue identifier |
+| `contract_id` | string | Yes | — | 1–128 chars. Contract identifier |
+| `window_seconds` | integer | No | `86400` | 3600–86400. Lookback window ending now |
+| `trigger_ingest` | boolean | No | `false` | Accepted for compatibility; currently has no effect |
+
+```bash
+curl "https://data.kairos.trade/trades/metrics?provider=kalshi&contract_id=KXPRESPOLAND-24-DT&window_seconds=86400" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
+
+Responses are cached per `(provider, contract_id, window_seconds)`, with a shorter TTL when `coverage_pct` came back low.
+
+### Response
+
+```json
+{
+  "metrics": {
+    "volume_usd": 154320.55,
+    "outcome_0_volume_usd": 98210.1,
+    "outcome_1_volume_usd": 56110.45,
+    "outcome_0_pressure_pct": 63.65,
+    "trade_count": 842,
+    "window_seconds": 86400,
+    "coverage_pct": 100.0,
+    "source": "clickhouse",
+    "indexing": false
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `metrics.outcome_0_pressure_pct` | number | Share of `volume_usd` on outcome 0, 0–100 |
+| `metrics.coverage_pct` | number | Estimated data coverage for the window, 0–100; below 100 typically means a recently listed contract |
+| `metrics.source` | string | Opaque internal marker for how the response was produced — not part of the stable contract; do not depend on its value |
+| `metrics.indexing` | boolean | Always `false` — see `trigger_ingest` above |
+
+**An empty window is not an error.** It returns zeroed volumes, `trade_count: 0`, `coverage_pct: 0.0`, and `outcome_0_pressure_pct: 50.0` — the neutral midpoint, not a measurement. Read `trade_count` before you trust a pressure value.
+
+## Errors
+
+Errors are returned as `{ "detail": "<message>" }`. Two shapes deviate: 422s use FastAPI's standard validation envelope, and 429s use `{ "error": "Rate limit exceeded: <limit>" }` alongside `X-RateLimit-*` and `Retry-After` headers. The Code column holds the exact `detail` string the service returns; `—` means the body has no fixed message.
+
+| Status | Code | When it happens | What to do |
+|---|---|---|---|
+| 400 | `Unknown provider: acme` | Unknown `provider` | Use a registered provider id and resend — deterministic, retrying unchanged returns the same error |
+| 400 | `contract_id is required` / `ticker is too long` | Missing or over-long `contract_id`, `ticker`, or `market` (128-char cap) | Fix the identifier and resend |
+| 400 | `Invalid timeframe. Must be one of: [1, 60, 300, 900, 3600, 14400, 86400]` | `timeframe_seconds` not one of the allowed widths | Pick one of the listed widths |
+| 400 | `Invalid timestamp format` / `end must be after start` | Unparseable or out-of-order `start`/`end` | Send ISO 8601 timestamps with `end` after `start` |
+| 400 | `requests array is empty` / `Max 200 requests` / `Item 3 missing required field` | Malformed batch body or item — not an array, empty, over 200 items, non-object item, missing field, non-integer `timeframe_seconds`/`outcome` | Fix the named item and resend; split oversized batches |
+| 400 | `batch implies 512000 candles; maximum is 400000` | Batch exceeds the 400,000-candle budget | Split the batch, shorten the windows, or widen `timeframe_seconds` |
+| 400 | — | `outcome` index the market cannot have (detected once the provider is known) | Send a valid zero-based `outcome` for that market |
+| 400 | `cursor is too long` | `cursor` longer than 512 chars (`/trades/kalshi`) | Send the cursor exactly as Kalshi returned it |
+| 401 | `Authentication required (JWT token / API key / admin secret)` | No credentials, or `X-Client-Id` sent without `X-Api-Key`/`X-Api-Secret` | Send all three API-key headers together, or a session JWT / admin secret — see [Authentication](#authentication) |
+| 403 | `API key missing required scope: trade:read` | API-key credential missing the `trade:read` scope (`/trades/*` only; candle routes need no scope) | Use a credential that carries `trade:read`; retrying with the same key always fails |
+| 403 | `API access is disabled for kalshi` | API-key access to the requested provider is disabled (`/trades/*` only) — an operator reason may be appended | Do not retry — the block is an operator setting. Read the appended reason and escalate |
+| 403 | `Invite required` | Session-JWT caller has not passed the invite gate (API-key and admin callers bypass it) | Use API-key credentials, or get the user invited |
+| 413 | `Request body too large` | Request body over 8 MiB — `POST /candles/batch` only | Split the batch into smaller requests |
+| 422 | — | FastAPI parameter validation failure (e.g. `window_seconds` or `limit` out of range, `timeframe_seconds < 1`, non-integer where an integer is required) | Read the FastAPI validation body for the offending field, fix it, and resend |
+| 429 | `Rate limit exceeded: <limit>` | Rate limit exceeded (`error` key, not `detail`) | Back off and retry; `Retry-After` says how long. A 429 does not consume quota |
+| 500 | `Candle fetch failed` / `Candle batch fetch failed` / `Trade history fetch failed` / `Trade metrics fetch failed` | Backend fetch/rebuild failure | Safe to retry — these requests are read-only. Report to support with the response body if it persists |
+| 502 | `Kalshi API error` / `Polymarket API error` | Upstream API error or network failure — `/trades/kalshi` and `/trades/polymarket` only | Safe to retry; the failure is at the venue, not in your request |
+| 503 | `Unable to verify platform API access` | Platform-access setting could not be read or parsed | Safe to retry — nothing about the request is wrong. Report to support if it persists |
+
+A batch whose ClickHouse tail fails but whose cache answered part of the request does **not** return 500 — see [Batch candles](#batch-candles).

@@ -1,0 +1,10 @@
+overlay: 1.1.0
+info:
+  title: Kairos docs adjustments for the Agora spec
+  version: 1.0.0
+extends: ../agora.yaml
+actions:
+  # The private WebSocket upgrade is not a REST endpoint and fails Mintlify's
+  # OpenAPI error-envelope validation. It is documented in prose instead.
+  - target: $.paths['/v1/stream']
+    remove: true
