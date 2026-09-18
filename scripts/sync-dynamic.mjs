@@ -218,54 +218,6 @@ function renderGeo(data) {
   const exchanges = data.exchanges ?? [];
   const globals = countries.filter((c) => c.globalBlocked);
   const specific = countries.filter((c) => !c.globalBlocked);
-  const W = 720;
-  const H = 360;
-  const project = (lat, lng) => [
-    ((lng + 180) / 360) * W,
-    ((90 - lat) / 180) * H,
-  ];
-
-  const dots = [];
-  for (const c of countries) {
-    const geo = centroids[c.code];
-    if (!geo) continue;
-    const [x, y] = project(geo.lat, geo.lng);
-    const blocked = c.globalBlocked
-      ? "Global block — " + (c.globalReason || "restricted")
-      : `${geo.name} — ${Object.entries(c.exchangeBlocks ?? {})
-          .filter(([, b]) => b.blocked)
-          .map(([id, b]) => `${id}: ${b.reason}`)
-          .join(", ")}`;
-    const color = c.globalBlocked ? "#ef4444" : "#f59e0b";
-    dots.push(
-      `  <g><title>${blocked}</title><circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="${color}" fill-opacity="0.9" stroke="#0a0a0f" stroke-width="0.6"/></g>`,
-    );
-  }
-
-  const grid = [];
-  for (let lng = -180; lng <= 180; lng += 30) {
-    const [x] = project(0, lng);
-    grid.push(
-      `  <line x1="${x.toFixed(1)}" y1="0" x2="${x.toFixed(1)}" y2="${H}" stroke="#2a2a3a" stroke-width="0.5"/>`,
-    );
-  }
-  for (let lat = -60; lat <= 60; lat += 30) {
-    const [, y] = project(lat, 0);
-    grid.push(
-      `  <line x1="0" y1="${y.toFixed(1)}" x2="${W}" y2="${y.toFixed(1)}" stroke="#2a2a3a" stroke-width="0.5"/>`,
-    );
-  }
-
-  const svg = `<svg width="100%" viewBox="0 0 ${W} ${H}" role="img" aria-label="Map of geo-restricted countries" xmlns="http://www.w3.org/2000/svg">
-  <rect width="${W}" height="${H}" rx="10" fill="#0a0a0f"/>
-  ${grid.join("\n")}
-${dots.join("\n")}
-  <g transform="translate(14,${H - 46})">
-    <rect width="360" height="36" rx="6" fill="#111113" stroke="#27272a"/>
-    <circle cx="16" cy="18" r="4" fill="#ef4444"/><text x="28" y="22" fill="#a1a1aa" font-family="system-ui,sans-serif" font-size="11">Globally blocked</text>
-    <circle cx="150" cy="18" r="4" fill="#f59e0b"/><text x="162" y="22" fill="#a1a1aa" font-family="system-ui,sans-serif" font-size="11">Exchange-specific block</text>
-  </g>
-</svg>`;
 
   const globalRows = globals
     .map((c) => `| ${centroids[c.code]?.name ?? c.code} | \`${c.code}\` | ${c.globalReason || "—"} |`)
@@ -288,8 +240,6 @@ description: "Countries blocked from accessing Kairos exchanges — generated fr
 ---
 
 Kairos enforces geo restrictions at both the account level and the exchange level, so the list in force changes over time. Everything below is generated from the live \`geo.getBlockedCountries\` configuration.
-
-${svg}
 
 ## Globally blocked countries
 
