@@ -1,7 +1,7 @@
 ---
 title: "Market Data API: Markets and Resolutions Endpoints"
 sidebarTitle: "Markets"
-description: "Fetch market metadata, paginate active markets, resolve venue identifiers, and query resolution lifecycle events using the Market Data API."
+description: "Fetch market metadata, paginate active markets, query tick grids, resolve venue identifiers, and query resolution lifecycle events using the Market Data API."
 ---
 
 The Markets group of the Market Data API gives you everything you need to discover and inspect prediction markets across Polymarket, Kalshi, Predict.fun, and other supported venues. Use these endpoints to paginate the active market catalog, hydrate individual markets by ID, resolve venue-native identifiers to Kairos canonical IDs, and track a market's full resolution lifecycle — all without authentication.
@@ -193,6 +193,151 @@ curl -X POST "https://md.kairos.trade/v1/markets/batch" \
   ]
 }
 ```
+
+---
+
+### Get Tick Size
+
+Return the price grid a venue currently enforces for one market — the same grid your limit order is validated against. Tick sizes change while a market trades (Polymarket tightens the grid near `0.04` and `0.96`), so query this before you place a limit order rather than caching a value from listing time.
+
+```
+GET /v1/markets/tick-size
+```
+
+The response describes the grid; it never snaps a price for you.
+
+#### Parameters
+
+<ParamField query="provider" type="string" required>
+  The venue. Accepted values: `polymarket`, `kalshi`, `predictfun`.
+</ParamField>
+
+<ParamField query="contract_id" type="string" required>
+  Kalshi ticker, or Polymarket condition id / market id.
+</ParamField>
+
+<ParamField query="asset_id" type="string">
+  Polymarket CLOB token id. When given, the per-token grid is returned, which is where a live tick change lands first.
+</ParamField>
+
+#### Example Request
+
+```bash
+curl "https://md.kairos.trade/v1/markets/tick-size?provider=kalshi&contract_id=KXBTC15M-26JUL221600-00"
+```
+
+#### Example Response
+
+```json
+{
+  "provider": "kalshi",
+  "contract_id": "KXBTC15M-26JUL221600-00",
+  "asset_id": null,
+  "ranges": [
+    { "start": "0",    "end": "0.04", "step": "0.001" },
+    { "start": "0.04", "end": "0.96", "step": "0.01" },
+    { "start": "0.96", "end": "1",    "step": "0.001" }
+  ],
+  "min_tick": "0.001",
+  "source": "kalshi_price_ranges",
+  "synthetic": false,
+  "price_level_structure": "tapered",
+  "as_of": "2026-09-18T12:00:00Z"
+}
+```
+
+#### Response Fields
+
+<ResponseField name="ranges" type="array">
+  The price bands, lowest first. `step` applies to prices in `[start, end)`; the last band includes `end`.
+
+  <Expandable title="Range object fields">
+    <ResponseField name="start" type="string">Band start, decimal string.</ResponseField>
+    <ResponseField name="end" type="string">Band end, decimal string.</ResponseField>
+    <ResponseField name="step" type="string">Tick size within the band, decimal string.</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="min_tick" type="string">
+  The finest step anywhere on the grid, decimal string.
+</ResponseField>
+
+<ResponseField name="source" type="string">
+  Where the grid came from, for example `kalshi_price_ranges` or `metadata_cache`.
+</ResponseField>
+
+<ResponseField name="synthetic" type="boolean">
+  `true` when the grid was derived rather than published by the venue.
+</ResponseField>
+
+<ResponseField name="price_level_structure" type="string | null">
+  `tapered` for a grid that tightens at the extremes, `null` for a flat grid.
+</ResponseField>
+
+<ResponseField name="as_of" type="string">
+  When the grid was read, RFC 3339.
+</ResponseField>
+
+<Warning>
+`start`, `end`, `step` and `min_tick` are decimal strings. Parse them as decimals, not floats — a float `0.001` is not exactly `0.001`, and an off-grid price is rejected by the venue.
+</Warning>
+
+Polymarket returns one flat `[0, 1]` band with `source: "metadata_cache"`. `predictfun` has no per-market tick, so it returns `{ "provider": "predictfun", "contract_id": "…", "supported": false, "reason": "…" }` rather than a fabricated grid.
+
+#### Errors
+
+| Status | Code | When |
+|---|---|---|
+| `400` | `invalid_request` | Unknown provider or empty `contract_id` |
+| `404` | `not_found` | The market does not exist |
+| `502` | `tick_unavailable` | The market is known but has no usable grid yet |
+| `503` | `cache_cold` | Metadata is still warming; retry after `Retry-After` |
+
+<Note>
+This is the same request and response as the Data API's `GET /markets/tick-size`, with `as_of` added and no authentication required. Moving an integration over is a base-URL change.
+</Note>
+
+---
+
+### Batch Tick Sizes
+
+The same grids for up to 200 markets of **one** provider, in one round trip.
+
+```
+POST /v1/markets/tick-size/batch
+```
+
+#### Request Body
+
+<ParamField body="provider" type="string" required>
+  One provider for the whole call.
+</ParamField>
+
+<ParamField body="items" type="array" required>
+  1–200 objects of `{ "contract_id": string, "asset_id"?: string }`.
+</ParamField>
+
+#### Example Request
+
+```bash
+curl -X POST "https://md.kairos.trade/v1/markets/tick-size/batch" \
+  -H "Content-Type: application/json" \
+  -d '{ "provider": "polymarket", "items": [ { "contract_id": "0x…", "asset_id": "7789…" }, { "contract_id": "0x…" } ] }'
+```
+
+#### Example Response
+
+```json
+{
+  "provider": "polymarket",
+  "results": [
+    { "provider": "polymarket", "contract_id": "0x…", "asset_id": "7789…", "ranges": [ { "start": "0", "end": "1", "step": "0.01" } ], "min_tick": "0.01", "source": "metadata_cache", "synthetic": false, "price_level_structure": null, "as_of": "2026-09-18T12:00:00Z" },
+    { "contract_id": "0x…", "asset_id": null, "error": { "code": "not_found", "message": "market not found" } }
+  ]
+}
+```
+
+`results` is positional: `results[i]` answers `items[i]`. Each entry is a grid, the `predictfun` payload, or a per-item `error` carrying the code the single endpoint would have returned, so one bad id does not fail the batch. Responses are `Cache-Control: no-store`.
 
 ---
 
