@@ -113,7 +113,11 @@ curl -s -X POST "https://data.kairos.trade/markets/batch-prices" \
 
 ## GET `/markets/tick-size`
 
-Get the current valid tick grid for a market. Tick sizes may vary dynamically as market prices move, so always query this before placing a limit order.
+Get the current valid tick grid for a market. Tick sizes change while a market trades, so query this before placing a limit order.
+
+<Note>
+The Market Data API serves the same grid at [`GET /v1/markets/tick-size`](/api/market-data/markets#get-tick-size) with no authentication and a batch variant. Prefer it for new integrations; the request parameters and response body are identical.
+</Note>
 
 **Parameters**
 
@@ -121,29 +125,42 @@ Get the current valid tick grid for a market. Tick sizes may vary dynamically as
   The venue (`polymarket`, `kalshi`, or `predictfun`).
 </ParamField>
 
-<ParamField query="market_id" type="string" required>
-  The provider-scoped market identifier.
+<ParamField query="contract_id" type="string" required>
+  Kalshi ticker, or Polymarket condition id / market id.
+</ParamField>
+
+<ParamField query="asset_id" type="string">
+  Polymarket CLOB token id, to read the per-token grid.
 </ParamField>
 
 ```bash
 curl -s "https://data.kairos.trade/markets/tick-size" \
   -H "Authorization: Bearer <your-api-key>" \
   -G \
-  --data-urlencode "provider=polymarket" \
-  --data-urlencode "market_id=0xabc123"
+  --data-urlencode "provider=kalshi" \
+  --data-urlencode "contract_id=KXBTC15M-26JUL221600-00"
 ```
 
 **Example response**
 
 ```json
 {
-  "market_id": "0xabc123",
-  "provider": "polymarket",
-  "tick_size": 0.01,
-  "min_price": 0.01,
-  "max_price": 0.99
+  "provider": "kalshi",
+  "contract_id": "KXBTC15M-26JUL221600-00",
+  "asset_id": null,
+  "ranges": [
+    { "start": "0",    "end": "0.04", "step": "0.001" },
+    { "start": "0.04", "end": "0.96", "step": "0.01" },
+    { "start": "0.96", "end": "1",    "step": "0.001" }
+  ],
+  "min_tick": "0.001",
+  "source": "kalshi_price_ranges",
+  "synthetic": false,
+  "price_level_structure": "tapered"
 }
 ```
+
+`start`, `end`, `step` and `min_tick` are decimal strings; `step` applies to prices in `[start, end)`. `predictfun` returns `{ "supported": false, "reason": "…" }` because the venue has no per-market tick.
 
 ---
 
