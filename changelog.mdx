@@ -1,0 +1,76 @@
+---
+title: "Changelog"
+description: "Product updates and announcements across the Kairos APIs and app"
+rss: true
+---
+
+<Update label="August 13, 2026" description="deprecation" tags={["deprecation","api","rest"]}>
+
+## Subdomain "agora.kairos.trade" deprecation notice
+
+API subdomain is being migrated to "md.kairos.trade"
+
+Deprecation Date TBD
+
+</Update>
+
+<Update label="July 3, 2026" description="feature" tags={["feature","API","market data","WebSocket"]}>
+
+API users can now stream real-time crypto spot prices over the Market Data WebSocket.
+
+- **Always-on spot prices** for BTC, ETH, SOL, XRP, DOGE, HYPE, and BNB — subscribe with `provider: "oracle"` and `topics: ["price"]`.
+- Price arrives in the `raw_price_cents` field scaled by 100,000 (note: `mid_price`/`best_bid`/`best_ask` are always 0 for oracle updates).
+- **Historical prices** via a new REST endpoint, `GET /markets/crypto/oracle-history`, at up to 1-second resolution.
+- **Predict.fun is now a documented public provider** (`provider_id 8` / `"predictfun"`) alongside Kalshi and Polymarket, and the docs overview now consolidates the live Market Data, Order Execution, and fee-quote streams in one place.
+
+</Update>
+
+<Update label="July 3, 2026" description="feature" tags={["feature","search"]}>
+
+Search got faster and much better at organizing results.
+
+- **Paste a market or event URL** directly into search and jump straight to the matching Kairos market.
+- **Cross-venue grouping** — when the same real-world event is listed on multiple exchanges, search now groups them with an "also available on" rail so you can compare pricing across venues and add both sides in one step.
+- **Compact market ladders** — multi-strike markets (e.g. "will X be above $Y") now render as quieter, interactive ladders with clearer strike grouping and an add-all-strikes shortcut.
+- **Recurring series collapsed** — repeating daily/weekly markets are grouped under a single result instead of cluttering the list with near-duplicates.
+- **More venues searchable** — search now surfaces markets from Predict.fun and Hyperliquid alongside existing venues.
+- **Snappier results** — smoother search-as-you-type with better debouncing and faster filtering, especially on broad queries.
+
+</Update>
+
+<Update label="July 3, 2026" description="feature" tags={["feature","trading","order ticket"]}>
+
+Trading UX fixes so the numbers you see are the numbers you get.
+
+- **Real cash-out quote for parlays** — the price shown before closing a combo/parlay is now a real, fee-inclusive quote, so early sells match what you're quoted rather than an estimate.
+- **Fee-aware Max sizing** — the order ticket's **Max** button now reserves exact per-exchange trading fees, so a maxed-out order won't get rejected for insufficient balance once fees apply.
+- **Clearer Close button** — the Close (sell) button now greys out and explains why when there's no current bid to sell into, instead of silently failing.
+- **Liquidity-rewards helper** — the ticket shows a minimum-size message and a one-click quick-fill preset when a trade needs to hit a minimum size to qualify for liquidity-provider rewards.
+- **Parlays count toward competitions** — trading volume from combo/parlay bets now counts toward Kairos competition leaderboards.
+- **Terminal power-user features** — a redesigned advanced-orders panel with history toggle, plus save-and-reselect custom terminal layouts.
+
+</Update>
+
+<Update label="July 3, 2026" description="feature" tags={["feature","wallet","portfolio","trading"]}>
+
+A set of improvements to how you fund, track, and settle positions.
+
+- **Import your own wallet for Predict.fun** — link and trade with an existing wallet on Predict.fun, matching the import option already available for Polymarket. No need to create a fresh wallet just to trade that market.
+- **Hedge-aware At-Risk** — your portfolio's At-Risk figure now accounts for offsetting positions, so hedged exposure is reflected accurately instead of being overstated.
+- **Redeem winning parlays in one click** — won combo/parlay bets now show a **Redeem** button directly in Active Combos, and winnings are auto-redeemed in the background so you never have to chase down settlement.
+- **Cleaner portfolio details** — Predict.fun positions now display readable, human-friendly names, settlements/redeems appear distinctly in trade history, and trader profiles show loading skeletons instead of a blank screen while data loads.
+
+</Update>
+
+<Update label="July 3, 2026" description="announcement" tags={["announcement","execution","market makers","API"]}>
+
+Approved market makers can now execute on Kairos while keeping full custody of their own keys. You bring the wallet, funds, and gas; Kairos builds the exact payload, verifies your signature, and forwards it to the venue — we never hold your key or move funds you didn't sign for.
+
+- **Bring-your-own-signer order flow** — sign orders locally with your own EOA over REST or a low-latency WebSocket signing channel, with sub-second fill events. Removes the signing round-trip of managed keys.
+- **Regional execution nodes** — two production nodes are live for lowest-latency routing: **Ireland**, colocated with Polymarket, and **Tokyo**, colocated with Predict.fun. Live orderbook and execution route regionally; candles, history, PnL, and the trade tape stay central.
+- **Self-signing is live today for Polymarket orders** (all order types, both time-in-force, off-chain cancels). The Tokyo node is live for execution generally; self-signing support for additional venues and on-chain operations (approvals, redemptions, split/merge) is coming soon.
+- **Access is approval-gated** — contact your Kairos account manager to get allow-listed and register your signing wallet.
+
+Public integration docs, including signing walkthroughs with example code, are available for approved partners.
+
+</Update>

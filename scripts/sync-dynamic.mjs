@@ -182,6 +182,37 @@ ${exchange}
 `;
 }
 
+function renderChangelog(data) {
+  const entries = [...(data.entries ?? [])].sort((a, b) =>
+    (b.publishedAt ?? "").localeCompare(a.publishedAt ?? ""),
+  );
+  const blocks = entries
+    .map((e) => {
+      const label = new Date(e.publishedAt).toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+        timeZone: "UTC",
+      });
+      const attrs = [`label=${JSON.stringify(label)}`];
+      const desc = e.version ? `v${e.version}` : e.category;
+      if (desc) attrs.push(`description=${JSON.stringify(String(desc))}`);
+      const tags = [...new Set([e.category, ...(e.affectedAreas ?? [])].filter(Boolean))];
+      if (tags.length) attrs.push(`tags={${JSON.stringify(tags)}}`);
+      return `<Update ${attrs.join(" ")}>\n\n${(e.body ?? "").trim()}\n\n</Update>`;
+    })
+    .join("\n\n");
+
+  return `---
+title: "Changelog"
+description: "Product updates and announcements across the Kairos APIs and app"
+rss: true
+---
+
+${blocks}
+`;
+}
+
 function renderGeo(data) {
   const countries = data.countries ?? [];
   const exchanges = data.exchanges ?? [];
@@ -290,6 +321,8 @@ async function main() {
   write("trading/fees.mdx", renderFees(tiers));
   const geo = await getJSON(`${RPC}/geo.getBlockedCountries`);
   write("compliance/geo-restrictions.mdx", renderGeo(geo));
+  const changelog = await getJSON(`${RPC}/changelog.list`);
+  write("changelog.mdx", renderChangelog(changelog));
 }
 
 main().catch((err) => {

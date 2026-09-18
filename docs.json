@@ -133,6 +133,13 @@
             "pages": [
               "compliance/geo-restrictions"
             ]
+          },
+          {
+            "group": "Updates",
+            "icon": "megaphone",
+            "pages": [
+              "changelog"
+            ]
           }
         ]
       },
