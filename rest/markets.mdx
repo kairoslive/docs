@@ -1,6 +1,6 @@
 ---
 title: "Markets"
-description: "Market details, prices, metadata, tick sizes, outcomes, crypto contracts, and discovery"
+description: "Market details, prices, metadata, outcomes, crypto contracts, and discovery"
 sidebarTitle: "Markets & Prices"
 icon: "store"
 ---
@@ -211,56 +211,12 @@ Flat object keyed by the requested `market_id`, no wrapper:
 
 ## Tick size
 
-```
-GET /markets/tick-size
-```
+Retired. Tick grids are served by the Market Data API at
+[`GET /v1/markets/tick-size`](/market-data/markets#tick-size), with a batch
+variant and no API key required. The request parameters (`provider`,
+`contract_id`, `asset_id`) and the response body are the same, so moving an
+integration is a base-URL change.
 
-The same authoritative tick grid the order executor validates against — tick size is the smallest price increment a venue accepts. This endpoint describes the grid, never snaps or rounds a price. It falls back to a narrow direct-venue lookup on a cache miss:
-
-- **polymarket** — a single flat range over `[0, 1]` (flips 0.01↔0.001 at the 0.96/0.04 extremes). Falls back to the Polymarket CLOB tick-size endpoint, which requires `asset_id`.
-- **kalshi** — the tapered `price_ranges` grid (`min_tick` = finest step). Kalshi's tick is algorithmic, with band boundaries that differ per market. If only a flat tick is available, returns one range with `synthetic: true`.
-- **predictfun** — no per-market dynamic tick endpoint. Returns `supported: false` with a `reason` (a `200`, not an error) — no grid is ever fabricated.
-
-Any provider besides kalshi/polymarket/predictfun is rejected with `400`.
-
-`x-kairos-auth: api-key` · 200 req/min
-
-### Request
-
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `provider` | string | Yes | — | kalshi, polymarket, predictfun. Must also be active in ProviderConfig |
-| `contract_id` | string | Yes | — | Non-empty after trimming. Kalshi ticker or Polymarket condition id |
-| `asset_id` | string | No | — | Polymarket CLOB token id; required for the CLOB fallback |
-
-```bash
-curl "https://data.kairos.trade/markets/tick-size?provider=kalshi&contract_id=KXBTC15M-26JUL221600-00" \
-  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
-  -H "X-Api-Key: $KAIROS_API_KEY" \
-  -H "X-Api-Secret: $KAIROS_API_SECRET"
-```
-
-### Response
-
-```json
-{
-  "provider": "kalshi",
-  "contract_id": "KXBTC15M-26JUL221600-00",
-  "ranges": [{"start": "0", "end": "1", "step": "0.001"}],
-  "min_tick": "0.001",
-  "source": "metadata_cache",
-  "synthetic": false
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `ranges`/`min_tick` | string(s) | Decimal strings, to avoid float precision loss |
-| `source` | string | `metadata_cache`, `polymarket_clob`, `kalshi_price_ranges`, or `kalshi_tick_size_deprecated` |
-
-On predict.fun the shape is instead `{"provider": "predictfun", "contract_id": "...", "supported": false, "reason": "..."}`.
-
-`502` means both the cache and the direct-venue fallback failed to resolve a tick.
 
 ## Market metadata
 
