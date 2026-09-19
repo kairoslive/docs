@@ -1,0 +1,11 @@
+overlay: 1.1.0
+info:
+  title: Kairos docs notes for the Market Data API
+  version: 1.0.0
+extends: ../market-data-api.yaml
+actions:
+  - target: $['paths']['/v1/markets']['get']
+    update:
+      x-mint:
+        content: |
+          Cursor page: pass the returned `next_cursor` back as `cursor`, and stop when `has_more` is `false`. This endpoint returns market identity (ids, outcomes, token ids) only — use `/v1/marks` for prices and `/v1/candles` for history.

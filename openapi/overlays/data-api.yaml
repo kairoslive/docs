@@ -1,0 +1,16 @@
+overlay: 1.1.0
+info:
+  title: Kairos docs notes for the Data API
+  version: 1.0.0
+extends: ../data-api.yaml
+actions:
+  - target: $['paths']['/markets/tick-size']['get']
+    update:
+      x-mint:
+        content: |
+          Tick grids are **decimal strings**: parse `start` / `end` / `step` / `min_tick` as decimals, never floats, and treat `ranges` as ordered bands. The grid changes as a market trades, so read it before placing a limit order.
+  - target: $['paths']['/markets/active']['get']
+    update:
+      x-mint:
+        content: |
+          Cursor page: pass the returned `next_cursor` back as `cursor`, and stop when `has_more` is `false`.

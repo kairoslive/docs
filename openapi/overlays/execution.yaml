@@ -1,0 +1,15 @@
+overlay: 1.1.0
+info:
+  title: Kairos docs notes for the Execution API
+  version: 1.0.0
+extends: ../execution.yaml
+actions:
+  - target: $['paths']['/orders']['post']
+    update:
+      x-mint:
+        content: |
+          **Before you submit**
+
+          - `price` is required on **every** order, including market orders — it is the limit you are willing to cross, not a sentinel.
+          - `quantity` must be positive. API-key BUYs also have a minimum notional.
+          - Prefer the [WebSocket order execution guide](/websocket/order-execution): one persistent connection, one round trip, and pushed fills instead of polling.

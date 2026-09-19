@@ -45,6 +45,135 @@
   "navigation": {
     "tabs": [
       {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "icon": "book",
+            "pages": [
+              "api-reference"
+            ]
+          },
+          {
+            "group": "Market Data API",
+            "icon": "database",
+            "openapi": {
+              "source": "openapi/market-data-api.yaml",
+              "directory": "api-reference/market-data",
+              "overlays": [
+                "openapi/overlays/market-data-api.yaml"
+              ]
+            }
+          },
+          {
+            "group": "Data API",
+            "icon": "server",
+            "openapi": {
+              "source": "openapi/data-api.yaml",
+              "directory": "api-reference/data",
+              "overlays": [
+                "openapi/overlays/data-api.yaml"
+              ]
+            }
+          },
+          {
+            "group": "Execution API",
+            "icon": "paper-plane",
+            "openapi": {
+              "source": "openapi/execution.yaml",
+              "directory": "api-reference/execution",
+              "overlays": [
+                "openapi/overlays/execution.yaml"
+              ]
+            }
+          },
+          {
+            "group": "Agora Auction API",
+            "icon": "gavel",
+            "openapi": {
+              "source": "openapi/agora.yaml",
+              "directory": "api-reference/agora",
+              "overlays": [
+                "openapi/overlays/agora.yaml"
+              ]
+            }
+          },
+          {
+            "group": "REST Guides",
+            "icon": "compass",
+            "pages": [
+              "rest/orders",
+              "rest/exchanges",
+              "rest/ctf",
+              "rest/combo",
+              "rest/markets",
+              "rest/search",
+              "rest/trading-data",
+              "rest/providers",
+              "rest/sports",
+              "rest/pnl",
+              "rest/trader-stats",
+              "rest/top-holders",
+              "rest/matched-markets"
+            ]
+          },
+          {
+            "group": "Market Data Guides",
+            "icon": "chart-column",
+            "pages": [
+              "market-data/overview",
+              "market-data/authentication",
+              "market-data/candles",
+              "market-data/trades",
+              "market-data/markets"
+            ]
+          },
+          {
+            "group": "RPC Guides",
+            "icon": "plug",
+            "pages": [
+              "rpc/overview",
+              "rpc/api-keys",
+              "rpc/positions",
+              "rpc/portfolio"
+            ]
+          },
+          {
+            "group": "RFQ Guides",
+            "icon": "comments",
+            "pages": [
+              "rfq/overview",
+              "rfq/rest-and-streaming",
+              "rfq/fix"
+            ]
+          },
+          {
+            "group": "WebSocket Guides",
+            "icon": "bolt",
+            "pages": [
+              "websocket/order-execution",
+              "websocket/order-updates",
+              "websocket/market-data-websocket",
+              "websocket/fee-quote",
+              "websocket/synthetic-books",
+              "websocket/protobuf-reference"
+            ]
+          },
+          {
+            "group": "Krisis Guides",
+            "icon": "robot",
+            "pages": [
+              "krisis/overview",
+              "krisis/strategies",
+              "krisis/conditional-orders",
+              "krisis/funds-credentials",
+              "krisis/positions-pnl",
+              "krisis/market-data"
+            ]
+          }
+        ]
+      },
+      {
         "tab": "Documentation",
         "groups": [
           {
@@ -86,10 +215,10 @@
               "guides/overview",
               "guides/authentication",
               "guides/order-types",
-              "guides/synthetic-books",
-              "guides/auctions",
               "guides/cross-venue-routing",
-              "guides/combos"
+              "guides/combos",
+              "guides/auctions",
+              "guides/synthetic-books"
             ]
           },
           {
@@ -140,123 +269,6 @@
             "pages": [
               "changelog"
             ]
-          }
-        ]
-      },
-      {
-        "tab": "API Reference",
-        "groups": [
-          {
-            "group": "Overview",
-            "icon": "book",
-            "pages": [
-              "api-reference"
-            ]
-          },
-          {
-            "group": "REST API",
-            "icon": "server",
-            "pages": [
-              "rest/orders",
-              "rest/ctf",
-              "rest/markets",
-              "rest/trading-data",
-              "rest/pnl",
-              "rest/search",
-              "rest/providers",
-              "rest/sports",
-              "rest/trader-stats",
-              "rest/top-holders",
-              "rest/matched-markets",
-              "rest/combo",
-              "rest/exchanges"
-            ]
-          },
-          {
-            "group": "Market Data API",
-            "icon": "database",
-            "pages": [
-              "market-data/overview",
-              "market-data/authentication",
-              "market-data/candles",
-              "market-data/trades",
-              "market-data/markets"
-            ]
-          },
-          {
-            "group": "RPC API",
-            "icon": "plug",
-            "pages": [
-              "rpc/overview",
-              "rpc/positions",
-              "rpc/portfolio",
-              "rpc/api-keys"
-            ]
-          },
-          {
-            "group": "RFQ Network",
-            "icon": "comments",
-            "pages": [
-              "rfq/overview",
-              "rfq/rest-and-streaming",
-              "rfq/fix"
-            ]
-          },
-          {
-            "group": "WebSocket",
-            "icon": "bolt",
-            "pages": [
-              "websocket/market-data-websocket",
-              "websocket/order-updates",
-              "websocket/order-execution",
-              "websocket/fee-quote",
-              "websocket/synthetic-books",
-              "websocket/protobuf-reference"
-            ]
-          },
-          {
-            "group": "Krisis Engine",
-            "icon": "robot",
-            "pages": [
-              "krisis/overview",
-              "krisis/strategies",
-              "krisis/conditional-orders",
-              "krisis/funds-credentials",
-              "krisis/positions-pnl",
-              "krisis/market-data"
-            ]
-          },
-          {
-            "group": "Market Data API (OpenAPI)",
-            "icon": "code",
-            "openapi": {
-              "source": "openapi/market-data-api.yaml",
-              "directory": "api-reference/market-data"
-            }
-          },
-          {
-            "group": "Data API (OpenAPI)",
-            "icon": "code",
-            "openapi": {
-              "source": "openapi/data-api.yaml",
-              "directory": "api-reference/data"
-            }
-          },
-          {
-            "group": "Execution API (OpenAPI)",
-            "icon": "code",
-            "openapi": {
-              "source": "openapi/execution.yaml",
-              "directory": "api-reference/execution"
-            }
-          },
-          {
-            "group": "Agora Auction API (OpenAPI)",
-            "icon": "code",
-            "openapi": {
-              "source": "openapi/agora.yaml",
-              "directory": "api-reference/agora"
-            }
           }
         ]
       }
