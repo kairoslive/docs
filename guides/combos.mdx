@@ -51,7 +51,14 @@ curl -X POST "https://execution.kairos.trade/combo/quote" \
 ```
 
 ```python
+import os
 import httpx
+
+API_HEADERS = {
+    "X-Client-Id": os.environ["KAIROS_CLIENT_ID"],
+    "X-Api-Key": os.environ["KAIROS_API_KEY"],
+    "X-Api-Secret": os.environ["KAIROS_API_SECRET"],
+}
 
 payload = {
     "legs": [
@@ -65,7 +72,7 @@ payload = {
 resp = httpx.post(
     "https://execution.kairos.trade/combo/quote",
     json=payload,
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 quote = resp.json()
 print(f"Combo price: {quote['price']} — Cost: {quote['cost_usdc']} USDC")
@@ -126,7 +133,7 @@ resp = httpx.post(
         "legs": payload["legs"],
         "size": 1000,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 position = resp.json()
 combo_id = position["combo_id"]
@@ -164,13 +171,15 @@ List all your open and historical combo positions:
 
 ```bash
 curl "https://execution.kairos.trade/combo/positions" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```python
 resp = httpx.get(
     "https://execution.kairos.trade/combo/positions",
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 positions = resp.json()["positions"]
 for p in positions:
@@ -224,7 +233,7 @@ curl -X POST "https://execution.kairos.trade/combo/cash-out-quote" \
 resp = httpx.post(
     "https://execution.kairos.trade/combo/cash-out-quote",
     json={"combo_id": "cbo_7gXp2mNkQwY3", "size": 1000},
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 co_quote = resp.json()
 print(f"Cash-out price: {co_quote['price']} — Proceeds: {co_quote['proceeds_usdc']} USDC")
@@ -267,7 +276,7 @@ resp = httpx.post(
         "combo_id": "cbo_7gXp2mNkQwY3",
         "size": 1000,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 print(resp.json())
 ```
@@ -304,7 +313,7 @@ curl -X POST "https://execution.kairos.trade/combo/redeem" \
 resp = httpx.post(
     "https://execution.kairos.trade/combo/redeem",
     json={"combo_id": "cbo_7gXp2mNkQwY3"},
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 result = resp.json()
 print(f"Redeemed: {result['payout_usdc']} USDC")
@@ -356,7 +365,7 @@ quote → execute → [monitor] → cash-out (early exit)
 import httpx
 
 BASE = "https://execution.kairos.trade"
-HEADERS = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+HEADERS = {**API_HEADERS, "Content-Type": "application/json"}
 
 LEGS = [
     {"market_id": "0xabc123", "outcome": "YES"},

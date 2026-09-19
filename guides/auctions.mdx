@@ -54,7 +54,11 @@ curl -X POST "https://agora.kairos.trade/v1/auctions/preflight" \
 ```
 
 ```python
+import os
 import httpx
+
+AUTH_HEADERS = {"Authorization": f"Bearer {os.environ['KAIROS_JWT']}"}
+MAKER_HEADERS = {"Authorization": f"Bearer {os.environ['KAIROS_MAKER_JWT']}"}
 
 resp = httpx.post(
     "https://agora.kairos.trade/v1/auctions/preflight",
@@ -65,7 +69,7 @@ resp = httpx.post(
         "side": "buy",
         "size": 10000,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=AUTH_HEADERS,
 )
 print(resp.json())
 ```
@@ -122,7 +126,7 @@ resp = httpx.post(
         "invited_makers": ["maker_alpha", "maker_beta", "maker_gamma"],
         "notes": "Looking for YES exposure before the FOMC meeting",
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=AUTH_HEADERS,
 )
 auction = resp.json()
 auction_id = auction["auction_id"]
@@ -192,7 +196,7 @@ If you are an invited maker, you receive an invitation through the private event
 
 ```bash
 curl -X POST "https://agora.kairos.trade/v1/auctions/auc_7gXp2mNkQwY3/quotes" \
-  -H "Authorization: Bearer $MAKER_API_KEY" \
+  -H "Authorization: Bearer $KAIROS_MAKER_JWT" \
   -H "Content-Type: application/json" \
   -d '{
     "price": 0.615,
@@ -204,7 +208,7 @@ curl -X POST "https://agora.kairos.trade/v1/auctions/auc_7gXp2mNkQwY3/quotes" \
 resp = httpx.post(
     f"https://agora.kairos.trade/v1/auctions/{auction_id}/quotes",
     json={"price": 0.615, "size": 10000},
-    headers={"Authorization": f"Bearer {maker_api_key}"},
+    headers=MAKER_HEADERS,
 )
 print(resp.json())
 ```
@@ -232,7 +236,7 @@ Before submitting a quote, verify that you have the inventory to back it:
 
 ```bash
 curl -X POST "https://agora.kairos.trade/v1/auctions/auc_7gXp2mNkQwY3/quotes/preflight" \
-  -H "Authorization: Bearer $MAKER_API_KEY" \
+  -H "Authorization: Bearer $KAIROS_MAKER_JWT" \
   -H "Content-Type: application/json" \
   -d '{"price": 0.615, "size": 10000}'
 ```
@@ -243,7 +247,7 @@ To pull your quote before the auction closes:
 
 ```bash
 curl -X DELETE "https://agora.kairos.trade/v1/auctions/auc_7gXp2mNkQwY3/quotes" \
-  -H "Authorization: Bearer $MAKER_API_KEY"
+  -H "Authorization: Bearer $KAIROS_MAKER_JWT"
 ```
 
 ---
@@ -277,7 +281,7 @@ As a market maker, check your durable invitation inbox for pending and historica
 
 ```bash
 curl "https://agora.kairos.trade/v1/invitations" \
-  -H "Authorization: Bearer $MAKER_API_KEY"
+  -H "Authorization: Bearer $KAIROS_MAKER_JWT"
 ```
 
 ---

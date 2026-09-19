@@ -42,7 +42,14 @@ curl -X POST "https://execution.kairos.trade/orders/market-links" \
 ```
 
 ```python
+import os
 import httpx
+
+API_HEADERS = {
+    "X-Client-Id": os.environ["KAIROS_CLIENT_ID"],
+    "X-Api-Key": os.environ["KAIROS_API_KEY"],
+    "X-Api-Secret": os.environ["KAIROS_API_SECRET"],
+}
 
 resp = httpx.post(
     "https://execution.kairos.trade/orders/market-links",
@@ -51,7 +58,7 @@ resp = httpx.post(
         "kalshi_market_id": "FED-25JAN-T0.5",
         "preview": False,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 link = resp.json()
 link_id = link["link_id"]
@@ -88,7 +95,9 @@ Before committing to a routed trade, fetch a price quote across both legs. This 
 
 ```bash
 curl "https://execution.kairos.trade/orders/route-quote?link_id=lnk_4fPq7rHsKzM1&side=buy&size=5000" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```python
@@ -99,7 +108,7 @@ resp = httpx.get(
         "side": "buy",
         "size": 5000,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 quote = resp.json()
 print(quote)
@@ -143,7 +152,9 @@ View the per-leg fee structure for a market link before trading:
 
 ```bash
 curl "https://execution.kairos.trade/orders/route-fees?link_id=lnk_4fPq7rHsKzM1" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 **Example response:**
@@ -197,7 +208,7 @@ resp = httpx.post(
         "size": 5000,
         "max_slippage": 0.005,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 route_order = resp.json()
 route_id = route_order["route_id"]
@@ -243,13 +254,15 @@ Retrieve all your routed parent orders and their individual legs:
 
 ```bash
 curl "https://execution.kairos.trade/orders/routes" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```python
 resp = httpx.get(
     "https://execution.kairos.trade/orders/routes",
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 routes = resp.json()["routes"]
 for r in routes:
@@ -281,7 +294,7 @@ resp = httpx.post(
         "route_id": "rte_9qHf3kDsEmV2",
         "size": 5000,
     },
-    headers={"Authorization": f"Bearer {api_key}"},
+    headers=API_HEADERS,
 )
 print(resp.json())
 ```
@@ -318,7 +331,7 @@ print(resp.json())
 import httpx
 
 BASE = "https://execution.kairos.trade"
-HEADERS = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+HEADERS = {**API_HEADERS, "Content-Type": "application/json"}
 
 # 1. Create market link
 link = httpx.post(f"{BASE}/orders/market-links", json={
