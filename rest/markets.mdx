@@ -216,7 +216,7 @@ GET /markets/tick-size
 The same authoritative tick grid the order executor validates against — tick size is the smallest price increment a venue accepts. This endpoint describes the grid, never snaps or rounds a price. It falls back to a narrow direct-venue lookup on a cache miss:
 
 - **polymarket** — a single flat range over `[0, 1]` (flips 0.01↔0.001 at the 0.96/0.04 extremes). Falls back to the Polymarket CLOB tick-size endpoint, which requires `asset_id`.
-- **kalshi** — the tapered `price_ranges` grid (`min_tick` = finest step). If only the deprecated flat `tick_size` field exists, returns one range with `synthetic: true`.
+- **kalshi** — the tapered `price_ranges` grid (`min_tick` = finest step). Kalshi's tick is algorithmic, with band boundaries that differ per market. If only a flat tick is available, returns one range with `synthetic: true`.
 - **predictfun** — no per-market dynamic tick endpoint. Returns `supported: false` with a `reason` (a `200`, not an error) — no grid is ever fabricated.
 
 Any provider besides kalshi/polymarket/predictfun is rejected with `400`.

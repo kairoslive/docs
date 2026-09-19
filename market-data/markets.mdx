@@ -168,6 +168,10 @@ curl "https://md.kairos.trade/v1/markets/tick-size?provider=kalshi&contract_id=K
 }
 ```
 
+<Note>
+**Kalshi's tick is algorithmic** — finer at the tails, coarser in the middle, with boundaries that differ per market. When the live band layout is available you get it, as above. When it is not, you get a single flat band at the finest step, with `source: "streamer_projection"` and `synthetic: true`: the minimum tick is correct (it is the orderbook streamer's projection of the venue's own finest step, tracked live), but the boundaries are not described. Render the ladder at `min_tick` in that case — a price the venue's coarser middle band would reject is caught when the order is submitted.
+</Note>
+
 ### Response fields
 
 <ResponseField name="ranges" type="array">
@@ -185,11 +189,11 @@ curl "https://md.kairos.trade/v1/markets/tick-size?provider=kalshi&contract_id=K
 </ResponseField>
 
 <ResponseField name="source" type="string">
-  Where the grid came from, for example `kalshi_price_ranges` or `metadata_cache`.
+  Where the grid came from: `kalshi_price_ranges`, `metadata_cache`, or `streamer_projection`.
 </ResponseField>
 
 <ResponseField name="synthetic" type="boolean">
-  `true` when the grid was derived rather than published by the venue.
+  `true` when the band layout is not currently known and a single flat band at the finest step stands in for it. The minimum tick is still correct.
 </ResponseField>
 
 <ResponseField name="price_level_structure" type="string | null">

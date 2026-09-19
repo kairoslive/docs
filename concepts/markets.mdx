@@ -110,7 +110,9 @@ curl "https://md.kairos.trade/v1/markets/tick-size?provider=polymarket&contract_
 }
 ```
 
-Grids can have several bands: Kalshi markets tick at `0.001` below `0.04` and above `0.96`, and `0.01` in between. Read `ranges`, not a single tick size, and treat the values as decimals rather than floats.
+Grids can have several bands. Kalshi's tick is **algorithmic** — finer at the tails, coarser in the middle, with boundaries that differ per market (one market ticks at `0.001` below `0.04` and above `0.96`, and `0.01` in between). Read `ranges`, not a single tick size, and treat the values as decimals rather than floats.
+
+When a Kalshi market's live band layout is not available you get one flat band at the finest step, marked `"synthetic": true`. The minimum tick is correct; the boundaries are not described, so render the ladder at `min_tick` and let the venue reject anything its coarser band disallows at submit.
 
 <Tip>
 Always fetch tick size before submitting a limit order. Orders at off-grid prices are rejected by the venue.
