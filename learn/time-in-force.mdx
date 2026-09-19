@@ -102,53 +102,6 @@ rejected, not downgraded. See [Order Types](/guides/order-types#time-in-force).
 
 ## How to Choose
 
-<div style="margin:8px 0 18px">
-<svg xmlns="http://www.w3.org/2000/svg" width="100%" viewBox="0 0 440 220" fill="none">
-  <rect width="440" height="220" rx="10" fill="#111113"/>
-  <rect x="1" y="1" width="438" height="218" rx="9" stroke="#27272a" stroke-width="1"/>
-  {/* Root */}
-  <rect x="130" y="12" width="180" height="28" rx="6" fill="#818cf8" opacity="0.1" stroke="#818cf8" stroke-opacity="0.3"/>
-  <text x="220" y="30" text-anchor="middle" fill="#a5b4fc" font-family="system-ui,sans-serif" font-size="10" font-weight="500">Need it filled RIGHT NOW?</text>
-  {/* Branches from root */}
-  <line x1="175" y1="40" x2="120" y2="62" stroke="#3f3f46" stroke-width="1"/>
-  <text x="140" y="55" fill="#4ade80" font-family="system-ui,sans-serif" font-size="9" font-weight="600">Yes</text>
-  <line x1="265" y1="40" x2="320" y2="62" stroke="#3f3f46" stroke-width="1"/>
-  <text x="298" y="55" fill="#f87171" font-family="system-ui,sans-serif" font-size="9" font-weight="600">No</text>
-  {/* Left sub-question */}
-  <rect x="30" y="64" width="180" height="28" rx="6" fill="#818cf8" opacity="0.06" stroke="#818cf8" stroke-opacity="0.2"/>
-  <text x="120" y="82" text-anchor="middle" fill="#a5b4fc" font-family="system-ui,sans-serif" font-size="10" font-weight="500">Need ALL of it?</text>
-  {/* Right sub-question */}
-  <rect x="230" y="64" width="180" height="28" rx="6" fill="#818cf8" opacity="0.06" stroke="#818cf8" stroke-opacity="0.2"/>
-  <text x="320" y="82" text-anchor="middle" fill="#a5b4fc" font-family="system-ui,sans-serif" font-size="10" font-weight="500">Want an expiration?</text>
-  {/* Left-Left: FOK */}
-  <line x1="80" y1="92" x2="60" y2="114" stroke="#3f3f46" stroke-width="1"/>
-  <text x="62" y="108" fill="#4ade80" font-family="system-ui,sans-serif" font-size="8" font-weight="600">Yes</text>
-  <rect x="14" y="116" width="92" height="30" rx="6" fill="#f59e0b" opacity="0.12" stroke="#f59e0b" stroke-opacity="0.3"/>
-  <text x="60" y="133" text-anchor="middle" fill="#fbbf24" font-family="ui-monospace,monospace" font-size="13" font-weight="700">FOK</text>
-  <text x="60" y="160" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">All or nothing,</text>
-  <text x="60" y="170" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">right now</text>
-  {/* Left-Right: IOC */}
-  <line x1="160" y1="92" x2="170" y2="114" stroke="#3f3f46" stroke-width="1"/>
-  <text x="172" y="108" fill="#f87171" font-family="system-ui,sans-serif" font-size="8" font-weight="600">No</text>
-  <rect x="124" y="116" width="92" height="30" rx="6" fill="#3b82f6" opacity="0.12" stroke="#3b82f6" stroke-opacity="0.3"/>
-  <text x="170" y="130" text-anchor="middle" fill="#60a5fa" font-family="ui-monospace,monospace" font-size="11" font-weight="700">IOC/FAK</text>
-  <text x="170" y="160" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">Grab what you can,</text>
-  <text x="170" y="170" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">cancel rest</text>
-  {/* Right-Left: GTD */}
-  <line x1="280" y1="92" x2="270" y2="114" stroke="#3f3f46" stroke-width="1"/>
-  <text x="268" y="108" fill="#4ade80" font-family="system-ui,sans-serif" font-size="8" font-weight="600">Yes</text>
-  <rect x="224" y="116" width="92" height="30" rx="6" fill="#a855f7" opacity="0.12" stroke="#a855f7" stroke-opacity="0.3"/>
-  <text x="270" y="133" text-anchor="middle" fill="#c084fc" font-family="ui-monospace,monospace" font-size="13" font-weight="700">GTD</text>
-  <text x="270" y="160" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">Wait for price,</text>
-  <text x="270" y="170" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">with a deadline</text>
-  {/* Right-Right: GTC */}
-  <line x1="360" y1="92" x2="380" y2="114" stroke="#3f3f46" stroke-width="1"/>
-  <text x="376" y="108" fill="#f87171" font-family="system-ui,sans-serif" font-size="8" font-weight="600">No</text>
-  <rect x="334" y="116" width="92" height="30" rx="6" fill="#22c55e" opacity="0.12" stroke="#22c55e" stroke-opacity="0.3"/>
-  <text x="380" y="133" text-anchor="middle" fill="#4ade80" font-family="ui-monospace,monospace" font-size="13" font-weight="700">GTC</text>
-  <text x="380" y="160" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">Wait for price,</text>
-  <text x="380" y="170" text-anchor="middle" fill="#52525b" font-family="system-ui,sans-serif" font-size="8">no deadline</text>
-</svg>
-</div>
+![Decision tree for choosing a time-in-force](/images/docs/learn/time-in-force-tree.png)
 
 **Next:** [Execution & Slippage](/learn/execution-and-slippage) — what actually happens to your order once it reaches the book.
