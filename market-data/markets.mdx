@@ -222,7 +222,7 @@ Polymarket returns one flat `[0, 1]` band with `source: "metadata_cache"`. `pred
 | `503` | `cache_cold` | Metadata is still warming; retry after `Retry-After` |
 
 <Note>
-This is the same request and response as the Data API's [`GET /markets/tick-size`](/rest/markets#tick-size), with `as_of` added and no authentication required. Moving an integration over is a base-URL change.
+This is the canonical tick-size endpoint — the Data API's former `GET /markets/tick-size` route was retired in its favor (the request parameters and response body are the same, so moving an integration is a base-URL change).
 </Note>
 
 ## Batch tick sizes
