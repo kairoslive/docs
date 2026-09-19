@@ -160,6 +160,8 @@ function renderFees(tiers) {
   return `---
 title: "Fees"
 description: "Kairos platform fee policy — live fee tiers, per-venue exchange fees, and fee quotes"
+sidebarTitle: "Fees"
+icon: "receipt"
 ---
 
 ${platform}
@@ -176,11 +178,16 @@ ${platform}
 | --- | --- | --- | --- | --- |
 ${ladder}
 
+Gas sponsorship for a tier is typical, not a billing guarantee — availability depends on your wallet and chain integration. See the [glossary](/learn/glossary).
+
 ${schedules}
 
 ${exchange}
 `;
 }
+
+const slugTag = (t) =>
+  String(t).toLowerCase().trim().replace(/\s+/g, "-");
 
 function renderChangelog(data) {
   const entries = [...(data.entries ?? [])].sort((a, b) =>
@@ -188,16 +195,19 @@ function renderChangelog(data) {
   );
   const blocks = entries
     .map((e) => {
-      const label = new Date(e.publishedAt).toLocaleDateString("en-US", {
+      const date = new Date(e.publishedAt).toLocaleDateString("en-US", {
         year: "numeric",
         month: "long",
         day: "numeric",
         timeZone: "UTC",
       });
+      const label = e.category ? `${date} · ${e.category}` : date;
       const attrs = [`label=${JSON.stringify(label)}`];
-      const desc = e.version ? `v${e.version}` : e.category;
+      const desc = e.version ? `v${e.version}` : undefined;
       if (desc) attrs.push(`description=${JSON.stringify(String(desc))}`);
-      const tags = [...new Set([e.category, ...(e.affectedAreas ?? [])].filter(Boolean))];
+      const tags = [
+        ...new Set([e.category, ...(e.affectedAreas ?? [])].filter(Boolean)),
+      ].map(slugTag);
       if (tags.length) attrs.push(`tags={${JSON.stringify(tags)}}`);
       return `<Update ${attrs.join(" ")}>\n\n${(e.body ?? "").trim()}\n\n</Update>`;
     })
@@ -206,8 +216,12 @@ function renderChangelog(data) {
   return `---
 title: "Changelog"
 description: "Product updates and announcements across the Kairos APIs and app"
+sidebarTitle: "Changelog"
+icon: "megaphone"
 rss: true
 ---
+
+Product updates across the Kairos app and APIs, newest first. Use the RSS button on this page to subscribe.
 
 ${blocks}
 `;
@@ -237,13 +251,17 @@ function renderGeo(data) {
   return `---
 title: "Geo Restrictions"
 description: "Countries blocked from accessing Kairos exchanges — generated from the live gating configuration"
+sidebarTitle: "Geo Restrictions"
+icon: "earth-americas"
 ---
 
-Kairos enforces geo restrictions at both the account level and the exchange level, so the list in force changes over time. Everything below is generated from the live \`geo.getBlockedCountries\` configuration.
+Kairos enforces geo restrictions at the account and exchange level, so the blocked-country list changes over time. This page is generated from the live \`geo.getBlockedCountries\` configuration — what you see is the list currently in force.
+
+Access is denied **server-side on every request** and fails closed: an account in a blocked region is rejected regardless of client behavior.
 
 ## Globally blocked countries
 
-Accounts in these countries are blocked from every Kairos venue.
+Global blocks deny every Kairos venue.
 
 | Country | Code | Reason |
 | --- | --- | --- |
@@ -251,14 +269,14 @@ ${globalRows}
 
 ## Exchange-specific blocks
 
-These countries can use Kairos, but are blocked from the listed venues.
+Exchange-specific blocks deny only the listed venues; the account can still use Kairos elsewhere.
 
 | Country | Code | Exchange | Reason |
 | --- | --- | --- | --- |
-${specRows || "| — | — | — | — |"}
+${specRows || "| _No exchange-specific blocks are currently configured._ | | | |"}
 
 <Note>
-  Exchanges currently evaluated for gating: ${exchanges.map((e) => e.name).join(", ") || "—"}. Access is denied **server-side** on every request and fails closed.
+  Exchanges currently evaluated for gating: ${exchanges.map((e) => e.name).join(", ") || "—"}. To check a specific request's access from your application, call \`geo.checkAccess\` — see the [RPC API](/rpc/overview).
 </Note>
 `;
 }

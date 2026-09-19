@@ -1,6 +1,8 @@
 ---
 title: "CTF Operations"
 description: "Split, merge, and redeem conditional-token positions on-chain, across exchanges"
+sidebarTitle: "CTF Operations"
+icon: "scissors"
 ---
 
 Move between **collateral** and a market's **outcome tokens** directly on-chain, without going through the order book. Outcome tokens are issued by the **CTF** — the on-chain conditional-token contracts behind each market — and these three endpoints operate on them directly: **split** mints a complete outcome-token set from collateral, **merge** burns one back into collateral before resolution, and **redeem** converts winning tokens into collateral after the market resolves. Each is an on-chain transaction, and a successful response carries a `tx_hash`.

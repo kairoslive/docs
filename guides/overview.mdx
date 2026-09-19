@@ -1,7 +1,12 @@
 ---
 title: "API Overview"
 description: "Kairos REST API and WebSocket quick start — base URLs, modules, auth, and rate limits"
+sidebarTitle: "Overview"
+icon: "compass"
 ---
+<Note>
+  **Prefer WebSocket for order submission.** Placing and cancelling orders over the persistent `/ws` socket is lower-latency (one round trip instead of the REST submit/poll pair) and simpler to build: one connection, one auth handshake, and pushed `order_update`/`fill` events instead of polling. See [Order Execution over WebSocket](/websocket/order-execution).
+</Note>
 
 Kairos exposes prediction market data, trading, portfolio analytics, sports markets, and trader intelligence across multiple providers over REST and WebSocket. This page is the map: where each service lives, how to make your first authenticated call, and what the shared conventions are for errors, rate limits, and status codes. Start here, then follow the links into the module reference.
 

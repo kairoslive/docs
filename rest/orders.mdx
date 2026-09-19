@@ -1,7 +1,12 @@
 ---
 title: "Orders"
 description: "Submit, query, and cancel orders on the custodial (Kairos-signed) order lane"
+sidebarTitle: "Orders"
+icon: "paper-plane"
 ---
+<Note>
+  **Prefer WebSocket for order submission.** Placing and cancelling orders over the persistent `/ws` socket is lower-latency (one round trip instead of the REST submit/poll pair) and simpler to build: one connection, one auth handshake, and pushed `order_update`/`fill` events instead of polling. See [Order Execution over WebSocket](/websocket/order-execution).
+</Note>
 
 Submit, cancel, and query orders on the custodial lane, where Kairos signs and routes on your behalf — see [External Execution](/external-execution/overview) for the self-custody signing lane. Use this page when you are placing orders from a bot or backend and need the exact request shape, status semantics, and error codes.
 

@@ -2,6 +2,7 @@
 title: "Trading Venues on Kairos: Polymarket, Kalshi, and More"
 sidebarTitle: "Venues"
 description: "Kairos connects to Polymarket, Kalshi, Predict.fun, Opinion, and Hyperliquid. Compare collateral types and how to list available venues via the API."
+icon: "building-columns"
 ---
 
 A **venue** (also called a **provider**) is an exchange that Kairos connects to on your behalf. Instead of managing separate accounts, API keys, and wallets for each exchange, you authenticate once with Kairos and route orders to any supported venue through a single unified API. Each venue has its own collateral type, order model, and onboarding flow.
@@ -84,7 +85,9 @@ Use `GET /exchanges` to list every venue registered in the Kairos deployment you
 
 ```bash
 curl https://execution.kairos.trade/exchanges \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```json
@@ -134,7 +137,9 @@ curl https://data.kairos.trade/providers/configs/kalshi
 
 ```bash
 curl https://data.kairos.trade/providers/api-access \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ## Venue Capabilities
@@ -143,7 +148,9 @@ Every venue exposes a capabilities object that describes what operations it supp
 
 ```bash
 curl https://execution.kairos.trade/exchanges/polymarket/capabilities \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 Capabilities include flags such as:

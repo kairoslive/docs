@@ -1,7 +1,12 @@
 ---
 title: "Order Updates"
 description: "Real-time order status updates, fills, positions, and balance changes via WebSocket"
+sidebarTitle: "Order Updates"
+icon: "bell"
 ---
+<Note>
+  **Prefer WebSocket for order submission.** Placing and cancelling orders over the persistent `/ws` socket is lower-latency (one round trip instead of the REST submit/poll pair) and simpler to build: one connection, one auth handshake, and pushed `order_update`/`fill` events instead of polling. See [Order Execution over WebSocket](/websocket/order-execution).
+</Note>
 
 Receive real-time order status updates, fill notifications, position changes, and balance updates over the order execution WebSocket. Connect to it whenever you need to know what happened to your orders without polling REST. The same socket also carries the [Order Execution](/websocket/order-execution) commands and the [Fee Quote (RFQ)](/websocket/fee-quote) stream — one connection, three surfaces.
 

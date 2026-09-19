@@ -2,7 +2,11 @@
 title: "Order Types, Fields, and Lifecycle in Kairos Explained"
 sidebarTitle: "Orders"
 description: "How Kairos handles order submission, fills, and cancellation. Covers limit and market orders, EIP-712 self-custody signing, and fee quotes before trading."
+icon: "receipt"
 ---
+<Note>
+  **Prefer WebSocket for order submission.** Placing and cancelling orders over the persistent `/ws` socket is lower-latency (one round trip instead of the REST submit/poll pair) and simpler to build: one connection, one auth handshake, and pushed `order_update`/`fill` events instead of polling. See [Order Execution over WebSocket](/websocket/order-execution).
+</Note>
 
 Kairos provides a unified order entry layer that abstracts the differences between venue order models. You submit orders through a single Execution API, and Kairos handles the translation, routing, and signature requirements for each underlying venue. This page covers how orders are structured, how they move through their lifecycle, and how to cancel them when needed.
 
@@ -55,7 +59,9 @@ Submit it with `POST /orders`:
 
 ```bash
 curl -X POST https://execution.kairos.trade/orders \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "exchange": "polymarket",
@@ -94,7 +100,9 @@ Fetch a single order by its Kairos-assigned ID:
 
 ```bash
 curl https://execution.kairos.trade/orders/ord_abc123xyz \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```json
@@ -121,7 +129,9 @@ Before submitting an order, request a combined platform + venue fee quote so you
 
 ```bash
 curl "https://execution.kairos.trade/orders/fee-quote?exchange=polymarket&side=BUY&price=0.62&size=100" \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```json
@@ -147,7 +157,9 @@ Kairos offers two execution modes for on-chain venues (Polymarket, Predict.fun, 
 
     ```bash
     curl -X POST https://execution.kairos.trade/orders \
-      -H "Authorization: Bearer <your-api-key>" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET" \
       -H "Content-Type: application/json" \
       -d '{ "exchange": "polymarket", ... }'
     ```
@@ -158,7 +170,9 @@ Kairos offers two execution modes for on-chain venues (Polymarket, Predict.fun, 
     **Step 1 — Build the intent:**
     ```bash
     curl -X POST https://execution.kairos.trade/v2/orders/intent \
-      -H "Authorization: Bearer <your-api-key>" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET" \
       -H "Content-Type: application/json" \
       -d '{ "exchange": "polymarket", "side": "BUY", "price": 0.62, "size": 100, ... }'
     ```
@@ -166,7 +180,9 @@ Kairos offers two execution modes for on-chain venues (Polymarket, Predict.fun, 
     **Step 2 — Sign and submit:**
     ```bash
     curl -X POST https://execution.kairos.trade/v2/orders/submit \
-      -H "Authorization: Bearer <your-api-key>" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET" \
       -H "Content-Type: application/json" \
       -d '{ "intent_id": "int_xyz789", "signature": "0x..." }'
     ```
@@ -200,7 +216,9 @@ EIP-712 signing keeps your private key off Kairos servers entirely. The signatur
 
 ```bash
 curl -X POST https://execution.kairos.trade/orders/ord_abc123xyz/cancel \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ### Cancel a specific set of orders atomically
@@ -209,7 +227,9 @@ Use `POST /orders/cancel-batch` to cancel multiple order IDs in a single atomic 
 
 ```bash
 curl -X POST https://execution.kairos.trade/orders/cancel-batch \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{ "order_ids": ["ord_abc123", "ord_def456", "ord_ghi789"] }'
 ```
@@ -218,7 +238,9 @@ curl -X POST https://execution.kairos.trade/orders/cancel-batch \
 
 ```bash
 curl -X POST https://execution.kairos.trade/orders/cancel-all \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{ "exchange": "polymarket" }'
 ```
@@ -235,7 +257,9 @@ When the same market exists on multiple venues (e.g., matched on both Polymarket
 
 ```bash
 curl "https://execution.kairos.trade/orders/route-quote?link_id=<link_id>&side=BUY&size=500" \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 The response shows the expected fill price and per-leg breakdown. If the route looks good, execute it:
@@ -244,7 +268,9 @@ The response shows the expected fill price and per-leg breakdown. If the route l
 
 ```bash
 curl -X POST https://execution.kairos.trade/orders/route-buy \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{ "link_id": "<link_id>", "side": "BUY", "size": 500 }'
 ```
@@ -269,5 +295,7 @@ Check your live position exposure across all open orders and fills:
 
 ```bash
 curl https://execution.kairos.trade/positions/exposure \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```

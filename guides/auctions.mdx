@@ -2,12 +2,13 @@
 title: "Run Private Block Trade Auctions on the Kairos Agora API"
 sidebarTitle: "Auctions"
 description: "Use the Kairos Agora Auction House API to create private auctions, invite market makers, collect firm quotes, and execute institutional block trades."
+icon: "gavel"
 ---
 
 Agora is the Kairos private auction house for institutional block trades. When you need to move a large position without signaling to the open market, Agora lets you run a sealed, invitation-only auction: you specify the contract and size, invite selected market makers, collect firm executable quotes, and settle against the best price — all through a structured API flow.
 
 <Info>
-  All Agora API calls require an `Authorization: Bearer <your-api-key>` header. Contact the Kairos team to enable Agora access on your account. Base URL: `https://agora.kairos.trade`.
+  All Agora API calls require a first-party session JWT: `Authorization: Bearer <jwt>`. Contact the Kairos team to enable Agora access on your account. Base URL: `https://agora.kairos.trade`.
 </Info>
 
 ---
@@ -39,7 +40,9 @@ Before creating an auction, verify that you have the collateral capacity to supp
 
 ```bash
 curl -X POST "https://agora.kairos.trade/v1/auctions/preflight" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "polymarket",
@@ -90,7 +93,9 @@ When preflight passes, open the auction with `POST /v1/auctions`. Set `expires_i
 
 ```bash
 curl -X POST "https://agora.kairos.trade/v1/auctions" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "provider": "polymarket",
@@ -150,7 +155,7 @@ Poll `GET /v1/auctions/{auctionID}` to see incoming quotes and current status. T
 
 ```bash
 curl "https://agora.kairos.trade/v1/auctions/auc_7gXp2mNkQwY3" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "Authorization: Bearer $KAIROS_JWT"
 ```
 
 **Example response (originator view):**
@@ -176,7 +181,7 @@ For a full audit timeline of all events on an auction, use `GET /v1/auctions/{au
 
 ```bash
 curl "https://agora.kairos.trade/v1/auctions" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "Authorization: Bearer $KAIROS_JWT"
 ```
 
 ---
@@ -249,7 +254,7 @@ The originator can cancel an open auction at any time before settlement:
 
 ```bash
 curl -X POST "https://agora.kairos.trade/v1/auctions/auc_7gXp2mNkQwY3/cancel" \
-  -H "Authorization: Bearer $KAIROS_API_KEY"
+  -H "Authorization: Bearer $KAIROS_JWT"
 ```
 
 **Example response:**
