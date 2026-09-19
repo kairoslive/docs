@@ -21,9 +21,9 @@
   Do not edit by hand; they are regenerated on build.
 - `openapi/*.yaml` — vendored OpenAPI 3.1 specs. `openapi/overlays/` holds Mintlify-only
   overlays applied to those specs (e.g. removing the Agora WebSocket from the REST ref).
-- `scripts/sync-dynamic.mjs` — regenerates `openapi/*.yaml`, `trading/fees.mdx`, and
-  `compliance/geo-restrictions.mdx` from live Kairos sources. Run manually with
-  `node scripts/sync-dynamic.mjs`.
+- `scripts/sync-dynamic.mjs` — regenerates `openapi/*.yaml`, `trading/fees.mdx`,
+  `compliance/geo-restrictions.mdx`, and `changelog.mdx` from live Kairos sources. Run
+  manually with `node scripts/sync-dynamic.mjs`.
 
 ## Dynamic content
 
@@ -33,6 +33,7 @@ Fees, geo restrictions, and the OpenAPI references are **generated, not hand-edi
 - Geo restrictions — live `geo.getBlockedCountries` list + dot map
   (`compliance/geo-restrictions.mdx`).
 - API reference — OpenAPI specs synced from `https://app.kairos.trade/openapi`.
+- Changelog — live `changelog.list` entries with an RSS feed (`changelog.mdx`).
 
 `.github/workflows/sync-dynamic.yml` runs daily and commits changes, which triggers a
 Mintlify deploy. Edit `scripts/` / `scripts/templates/` rather than the generated pages.

@@ -2,12 +2,13 @@
 title: "Trade Polymarket Combos and Multi-Leg Parlays with Kairos"
 sidebarTitle: "Combos"
 description: "Build, price, and execute Polymarket combo (parlay) positions — and cash out or redeem them — using the Kairos Execution API combo endpoints."
+icon: "puzzle-piece"
 ---
 
 A Polymarket combo, also called a parlay, is a single position that combines bets on multiple independent prediction markets. Instead of buying YES on three separate markets individually, you buy a combo that pays off only if all three resolve YES — which means the price is lower and the potential payout is higher. Kairos routes combo orders through the Polymarket RFQ gateway, handles all the position tracking, and gives you clean endpoints to quote, execute, cash out, or redeem.
 
 <Info>
-  All combo endpoints require an `Authorization: Bearer <your-api-key>` header. Base URL: `https://execution.kairos.trade`.
+  All combo endpoints require the API key triple (`X-Client-Id` / `X-Api-Key` / `X-Api-Secret`). Base URL: `https://execution.kairos.trade`.
 </Info>
 
 ---
@@ -26,7 +27,9 @@ Always get a quote before executing. `POST /combo/quote` prices the combo via th
 
 ```bash
 curl -X POST "https://execution.kairos.trade/combo/quote" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "legs": [
@@ -100,7 +103,9 @@ Pass the `quote_id` from the previous step to execute at the quoted price. Omit 
 
 ```bash
 curl -X POST "https://execution.kairos.trade/combo/execute" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "quote_id": "cqt_5nRa1bWcXzY8",
@@ -205,7 +210,9 @@ If you want to exit before all legs resolve, sell your combo back to pUSD via th
 
 ```bash
 curl -X POST "https://execution.kairos.trade/combo/cash-out-quote" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "combo_id": "cbo_7gXp2mNkQwY3",
@@ -241,7 +248,9 @@ print(f"Cash-out price: {co_quote['price']} — Proceeds: {co_quote['proceeds_us
 
 ```bash
 curl -X POST "https://execution.kairos.trade/combo/cash-out" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "cash_out_quote_id": "coq_2xKj9mQpLvT4",
@@ -282,7 +291,9 @@ When all legs resolve in your favour, redeem the combo to collect your pUSD payo
 
 ```bash
 curl -X POST "https://execution.kairos.trade/combo/redeem" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "combo_id": "cbo_7gXp2mNkQwY3"

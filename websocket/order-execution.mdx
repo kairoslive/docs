@@ -1,7 +1,12 @@
 ---
 title: "Order Execution"
 description: "Submit and cancel orders via WebSocket"
+sidebarTitle: "Order Execution"
+icon: "paper-plane"
 ---
+<Note>
+  **Prefer WebSocket for order submission.** Placing and cancelling orders over the persistent `/ws` socket is lower-latency (one round trip instead of the REST submit/poll pair) and simpler to build: one connection, one auth handshake, and pushed `order_update`/`fill` events instead of polling. See [Order Execution over WebSocket](/websocket/order-execution).
+</Note>
 
 Submit orders, cancel orders, and manage trades over the order execution WebSocket. This is the recommended path for programmatic trading when you need real-time feedback: commands and the resulting fill/status events travel on one connection.
 

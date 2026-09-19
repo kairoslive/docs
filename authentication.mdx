@@ -2,9 +2,10 @@
 title: "Kairos API Authentication: Keys, Scopes, and Rate Limits"
 sidebarTitle: "Authentication"
 description: "Learn how to obtain your Kairos API key, authenticate requests, and handle common auth errors like 401 Unauthorized and 403 Forbidden."
+icon: "key"
 ---
 
-Most Kairos APIs require an API key, but you can start exploring immediately without one. The Market Data API is completely open — no account or key required. The Data API, Execution API, and Agora Auction API all require a Bearer token passed in the `Authorization` header of every request.
+Most Kairos APIs require credentials, but you can start exploring immediately without them. The Market Data API is completely open — no account or key required. The Data API, Execution API, and Agora Auction API require either an **API key triple** (three headers) for programmatic access or a **session JWT** for first-party apps. This page covers both.
 
 ## Which APIs require authentication?
 
@@ -45,21 +46,25 @@ You need an account at [app.kairos.trade](https://app.kairos.trade) to create an
   Never embed your API key in client-side code, commit it to a public repository, or share it in logs. If a key is compromised, revoke it immediately from the API Keys settings page and generate a new one.
 </Warning>
 
-## Pass the key in every request
+## Pass your key in every request
 
-For all authenticated APIs, include your key as a Bearer token in the `Authorization` HTTP header:
+For programmatic access, send all three credential headers together on every authenticated request:
 
 ```
-Authorization: Bearer <your-api-key>
+X-Client-Id: kairos_ck_...
+X-Api-Key: <64 hex chars>
+X-Api-Secret: <64 hex chars>
 ```
 
-Here is how that looks in practice across different tools:
+All three belong to the same key — a partial set fails with `401`. Here is how that looks in practice:
 
 <Tabs>
   <Tab title="curl">
     ```bash
-    curl "https://data.kairos.trade/providers/configs" \
-      -H "Authorization: Bearer $KAIROS_API_KEY"
+    curl "https://data.kairos.trade/markets/active?provider=polymarket" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET"
     ```
   </Tab>
   <Tab title="Python">
@@ -67,76 +72,96 @@ Here is how that looks in practice across different tools:
     import os
     import requests
 
-    api_key = os.environ["KAIROS_API_KEY"]
+    headers = {
+        "X-Client-Id": os.environ["KAIROS_CLIENT_ID"],
+        "X-Api-Key": os.environ["KAIROS_API_KEY"],
+        "X-Api-Secret": os.environ["KAIROS_API_SECRET"],
+    }
 
     response = requests.get(
-        "https://data.kairos.trade/providers/configs",
-        headers={"Authorization": f"Bearer {api_key}"},
+        "https://data.kairos.trade/markets/active",
+        params={"provider": "polymarket"},
+        headers=headers,
     )
     response.raise_for_status()
     print(response.json())
     ```
 
-    For multiple requests, use a `Session` so the header is attached automatically:
+    For multiple requests, attach the headers to a `Session` once:
 
     ```python
     import os
     import requests
 
     session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {os.environ['KAIROS_API_KEY']}"})
+    session.headers.update({
+        "X-Client-Id": os.environ["KAIROS_CLIENT_ID"],
+        "X-Api-Key": os.environ["KAIROS_API_KEY"],
+        "X-Api-Secret": os.environ["KAIROS_API_SECRET"],
+    })
 
-    configs = session.get("https://data.kairos.trade/providers/configs").json()
     markets = session.get("https://data.kairos.trade/markets/active",
                           params={"provider": "polymarket"}).json()
     ```
   </Tab>
   <Tab title="JavaScript">
     ```javascript
-    const apiKey = process.env.KAIROS_API_KEY;
+    const headers = {
+      "X-Client-Id": process.env.KAIROS_CLIENT_ID,
+      "X-Api-Key": process.env.KAIROS_API_KEY,
+      "X-Api-Secret": process.env.KAIROS_API_SECRET,
+    };
 
-    const response = await fetch("https://data.kairos.trade/providers/configs", {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    const response = await fetch(
+      "https://data.kairos.trade/markets/active?provider=polymarket",
+      { headers }
+    );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const configs = await response.json();
-    console.log(configs);
+    console.log(await response.json());
     ```
 
     For a reusable helper across your application:
 
     ```javascript
     function kairosRequest(path, options = {}) {
-      const base = "https://data.kairos.trade";
-      return fetch(`${base}${path}`, {
+      return fetch(`https://data.kairos.trade${path}`, {
         ...options,
         headers: {
-          Authorization: `Bearer ${process.env.KAIROS_API_KEY}`,
-          "Content-Type": "application/json",
+          "X-Client-Id": process.env.KAIROS_CLIENT_ID,
+          "X-Api-Key": process.env.KAIROS_API_KEY,
+          "X-Api-Secret": process.env.KAIROS_API_SECRET,
           ...options.headers,
         },
       });
     }
-
-    const configs = await kairosRequest("/providers/configs").then(r => r.json());
     ```
   </Tab>
 </Tabs>
+
+### The session JWT (first-party apps only)
+
+The web app authenticates with a short-lived session JWT instead of the triple:
+
+```
+Authorization: Bearer <jwt>
+```
+
+JWTs are minted by the Kairos login flow and are **not issued to API consumers**. Use the header triple for integrations; the JWT exists so the app can call the same APIs. For a full comparison, see [API Key Auth](/guides/authentication).
 
 ## API key scopes
 
 When you create a key, you assign it one or more scopes that control which operations it can perform. Granting only the scopes your application needs limits the blast radius if a key is ever leaked.
 
 | Scope | What it grants |
-|-------|----------------|
-| `data:read` | Read access to the Data API — markets, candles, search, sports, analytics |
-| `execution:read` | Read access to orders, positions, and exchange info via the Execution API |
-| `execution:write` | Submit, cancel, and route orders; onboard to venues |
-| `agora:read` | View auctions, quotes, and invitation inbox via the Agora API |
-| `agora:write` | Create auctions, submit quotes, and cancel open auctions |
+| --- | --- |
+| `trade:read` | View trade history and metrics (`/trades/*`) |
+| `trade:execute` | Submit and cancel orders, plus supported execution mutations such as redeem and CTF split/merge |
+| `position:read` | View positions, PnL, and portfolio data (`/pnl/*`, RPC position procedures) |
+| `auction:create` | Create and cancel Agora auctions |
+| `auction:quote` | Submit, revise, and withdraw Agora quotes |
 
 <Tip>
-  For a read-only analytics integration, issue a key with only `data:read`. For a trading bot, add `execution:read` and `execution:write`. Reserve `agora:*` scopes for institutional workflows.
+  For a read-only analytics integration, issue a key with `trade:read` and `position:read`. For a trading bot, add `trade:execute`. Reserve `auction:*` for institutional workflows.
 </Tip>
 
 ## Rate limits
@@ -215,7 +240,9 @@ Apply exponential backoff with jitter when you receive a 429:
 
   **Fix:** Ensure every request to an authenticated endpoint includes:
   ```
-  Authorization: Bearer <your-api-key>
+  X-Client-Id: kairos_ck_...
+  X-Api-Key: <64 hex chars>
+  X-Api-Secret: <64 hex chars>
   ```
   Double-check there are no extra spaces, missing `Bearer` prefix, or accidental newlines in the header value.
 </Accordion>

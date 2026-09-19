@@ -2,6 +2,7 @@
 title: "Kairos Wallet Modes: Hosted, Self-Custody, and Allowances"
 sidebarTitle: "Wallets"
 description: "Compare hosted and self-custody wallet modes on Kairos. Learn about deposit wallets, on-chain ERC-20 allowances, EIP-712 signing, and CTF outcome tokens."
+icon: "wallet"
 ---
 
 Before you can trade on any on-chain venue, you need a wallet. Kairos gives you two custody models: a **hosted** mode where Kairos manages signing keys on your behalf, and a **self-custody** mode where you sign every transaction with your own private key. Understanding the difference — and completing the right onboarding steps — determines how your funds are held and how orders are submitted.
@@ -34,7 +35,9 @@ Kairos manages allowances for you during the onboarding flow, but you can also r
 ```bash
 # Read current allowances for a venue
 curl https://execution.kairos.trade/exchanges/polymarket/allowances \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ```json
@@ -55,7 +58,9 @@ curl https://execution.kairos.trade/exchanges/polymarket/allowances \
 ```bash
 # Set allowances (triggers an on-chain transaction)
 curl -X POST https://execution.kairos.trade/exchanges/polymarket/allowances \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{ "token": "pUSD", "amount": "unlimited" }'
 ```
@@ -81,7 +86,9 @@ If you're onboarding to Polymarket for the first time, deploy your deposit walle
 
 ```bash
 curl -X POST https://execution.kairos.trade/exchanges/polymarket/deposit-wallet/onboard \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 This single call deploys the Safe contract, configures the CLOB trading approvals, and links the deposit wallet to your Kairos account.
@@ -91,11 +98,15 @@ This single call deploys the Safe contract, configures the CLOB trading approval
 ```bash
 # EOA balances (USDC and pUSD on the signing wallet)
 curl -X POST https://execution.kairos.trade/exchanges/polymarket/deposit-wallet/eoa-balances \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 
 # Safe vault balances (USDC, USDC.e, and pUSD in the deposit wallet)
 curl -X POST https://execution.kairos.trade/exchanges/polymarket/deposit-wallet/safe-balances \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 ## Venue Onboarding Flows
@@ -108,7 +119,9 @@ Each venue has its own one-time setup step. Complete these before submitting you
 
     ```bash
     curl -X POST https://execution.kairos.trade/exchanges/polymarket/enable-trading \
-      -H "Authorization: Bearer <your-api-key>"
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET"
     ```
 
     If you're importing an existing Polymarket wallet, use `POST /exchanges/polymarket/enable-imported-trading` instead.
@@ -118,7 +131,9 @@ Each venue has its own one-time setup step. Complete these before submitting you
 
     ```bash
     curl -X POST https://execution.kairos.trade/exchanges/kalshi/enable-trading \
-      -H "Authorization: Bearer <your-api-key>" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET" \
       -H "Content-Type: application/json" \
       -d '{
         "kalshi_api_key_id": "your-kalshi-key-id",
@@ -131,7 +146,9 @@ Each venue has its own one-time setup step. Complete these before submitting you
 
     ```bash
     curl -X POST https://execution.kairos.trade/exchanges/predictfun/enable-trading \
-      -H "Authorization: Bearer <your-api-key>"
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET"
     ```
   </Step>
   <Step title="Opinion">
@@ -139,7 +156,9 @@ Each venue has its own one-time setup step. Complete these before submitting you
 
     ```bash
     curl -X POST https://execution.kairos.trade/exchanges/opinion/enable-trading \
-      -H "Authorization: Bearer <your-api-key>"
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET"
     ```
   </Step>
 </Steps>
@@ -154,7 +173,9 @@ For self-custody order submission, Kairos uses a two-step flow built on EIP-712 
 
     ```bash
     curl -X POST https://execution.kairos.trade/v2/orders/intent \
-      -H "Authorization: Bearer <your-api-key>" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET" \
       -H "Content-Type: application/json" \
       -d '{
         "exchange": "polymarket",
@@ -194,7 +215,9 @@ For self-custody order submission, Kairos uses a two-step flow built on EIP-712 
 
     ```bash
     curl -X POST https://execution.kairos.trade/v2/orders/submit \
-      -H "Authorization: Bearer <your-api-key>" \
+      -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+      -H "X-Api-Key: $KAIROS_API_KEY" \
+      -H "X-Api-Secret: $KAIROS_API_SECRET" \
       -H "Content-Type: application/json" \
       -d '{
         "intent_id": "int_xyz789",
@@ -219,7 +242,9 @@ Kairos exposes CTF operations directly if you need to manage tokens at the contr
 ```bash
 # Redeem winning tokens after a market resolves YES
 curl -X POST https://execution.kairos.trade/exchanges/polymarket/redeem \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "market_id": "0xdef456...",
@@ -234,13 +259,17 @@ Hyperliquid requires signed typed data for withdrawals and spot↔perp transfers
 ```bash
 # Step 1: Build withdrawal typed data
 curl -X POST https://execution.kairos.trade/exchanges/hyperliquid/withdraw/prepare \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{ "amount": "100", "destination": "0xmywallet..." }'
 
 # Step 2: Sign the typed data and submit
 curl -X POST https://execution.kairos.trade/exchanges/hyperliquid/withdraw \
-  -H "Authorization: Bearer <your-api-key>" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{ "typed_data_id": "wd_abc123", "signature": "0x..." }'
 ```

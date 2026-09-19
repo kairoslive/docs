@@ -1,6 +1,8 @@
 ---
 title: "Positions"
 description: "Read, recalculate, and close positions for the authenticated user"
+sidebarTitle: "Positions"
+icon: "briefcase"
 ---
 
 The `positions.*` router is the **authoritative source** for a user's current holdings across every venue Kairos routes to — `polymarket`, `kalshi` (with `kalshi_offchain` canonicalised to it), `predictfun`, `hyperliquid`, and `opinion`. Reach for it when a bot needs to know what it currently holds, what a position is worth, or how to close one. It reads from the Kairos database — the same positions state that drives the UI's portfolio screen and the bot engine's fill tracking — so it reflects any fill the moment our executor records it.

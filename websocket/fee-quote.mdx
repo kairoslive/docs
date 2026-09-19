@@ -1,6 +1,8 @@
 ---
 title: "Fee Quote (RFQ)"
 description: "Stream live fee quotes for a trade you're eyeing over WebSocket"
+sidebarTitle: "Fee Quote"
+icon: "receipt"
 ---
 
 Lock the trade you're eyeing and stream the fees you can expect to pay. Instead of polling `GET /orders/fee-quote`, you send one `subscribe_fee_quote` message and the server pushes a `fee_quote` frame immediately, then again **whenever the number changes** — a request-for-quote (RFQ) feed suitable for both UIs and bots.

@@ -2,12 +2,13 @@
 title: "Route Orders Across Venues with Kairos Cross-Venue Routing"
 sidebarTitle: "Cross-Venue Routing"
 description: "Fill large prediction market positions by routing orders across linked markets on Polymarket and Kalshi simultaneously using Kairos route execution."
+icon: "route"
 ---
 
 Cross-venue routing lets you buy or sell a large prediction market position by splitting the order across matched markets on Polymarket and Kalshi at the same time. Instead of exhausting a thin book on one venue or moving the price against yourself, Kairos splits your size across both legs simultaneously — giving you a better average fill price and deeper effective liquidity.
 
 <Info>
-  All routing endpoints require an `Authorization: Bearer <your-api-key>` header. Base URL: `https://execution.kairos.trade`.
+  All routing endpoints require the API key triple (`X-Client-Id` / `X-Api-Key` / `X-Api-Secret`). Base URL: `https://execution.kairos.trade`.
 </Info>
 
 ---
@@ -29,7 +30,9 @@ Before routing, you need a market link connecting the two venues. Use `POST /ord
 
 ```bash
 curl -X POST "https://execution.kairos.trade/orders/market-links" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "polymarket_market_id": "0xabc123",
@@ -173,7 +176,9 @@ When you're ready to trade, call `POST /orders/route-buy`. Kairos executes both 
 
 ```bash
 curl -X POST "https://execution.kairos.trade/orders/route-buy" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "link_id": "lnk_4fPq7rHsKzM1",
@@ -259,7 +264,9 @@ To unwind your cross-venue position, call `POST /orders/route-close`. Kairos sub
 
 ```bash
 curl -X POST "https://execution.kairos.trade/orders/route-close" \
-  -H "Authorization: Bearer $KAIROS_API_KEY" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET" \
   -H "Content-Type: application/json" \
   -d '{
     "route_id": "rte_9qHf3kDsEmV2",

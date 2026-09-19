@@ -1,13 +1,17 @@
 ---
 title: "Geo Restrictions"
 description: "Countries blocked from accessing Kairos exchanges — generated from the live gating configuration"
+sidebarTitle: "Geo Restrictions"
+icon: "earth-americas"
 ---
 
-Kairos enforces geo restrictions at both the account level and the exchange level, so the list in force changes over time. Everything below is generated from the live `geo.getBlockedCountries` configuration.
+Kairos enforces geo restrictions at the account and exchange level, so the blocked-country list changes over time. This page is generated from the live `geo.getBlockedCountries` configuration — what you see is the list currently in force.
+
+Access is denied **server-side on every request** and fails closed: an account in a blocked region is rejected regardless of client behavior.
 
 ## Globally blocked countries
 
-Accounts in these countries are blocked from every Kairos venue.
+Global blocks deny every Kairos venue.
 
 | Country | Code | Reason |
 | --- | --- | --- |
@@ -36,7 +40,7 @@ Accounts in these countries are blocked from every Kairos venue.
 
 ## Exchange-specific blocks
 
-These countries can use Kairos, but are blocked from the listed venues.
+Exchange-specific blocks deny only the listed venues; the account can still use Kairos elsewhere.
 
 | Country | Code | Exchange | Reason |
 | --- | --- | --- | --- |
@@ -44,5 +48,5 @@ These countries can use Kairos, but are blocked from the listed venues.
 | United States | `US` | Predict.fun | Restricted Region |
 
 <Note>
-  Exchanges currently evaluated for gating: Polymarket, Kalshi, Predict.fun. Access is denied **server-side** on every request and fails closed.
+  Exchanges currently evaluated for gating: Polymarket, Kalshi, Predict.fun. To check a specific request's access from your application, call `geo.checkAccess` — see the [RPC API](/rpc/overview).
 </Note>

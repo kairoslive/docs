@@ -2,6 +2,7 @@
 title: "Prediction Markets in Kairos: Outcomes and Contracts"
 sidebarTitle: "Markets"
 description: "Learn how Kairos structures prediction markets: the hierarchy of markets, outcomes, contracts, canonical IDs, and lifecycle states across venues."
+icon: "chart-line"
 ---
 
 Kairos organizes every tradeable question into a three-level hierarchy: a **market** poses a question, **outcomes** enumerate the possible answers, and **contracts** are the on-chain or off-chain tokens you actually buy and sell. Understanding this structure helps you query the right endpoints and interpret the data you receive.
@@ -141,7 +142,9 @@ Kairos provides a dedicated endpoint for short-horizon crypto up-or-down predict
 
 ```bash
 curl "https://data.kairos.trade/markets/crypto?asset=BTC&window=1h" \
-  -H "Authorization: Bearer <your-api-key>"
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
 ```
 
 Use `GET /markets/crypto/ptb` to fetch the current **Price-to-Beat** (PTB) value — the strike price an asset must exceed for the UP contract to resolve YES.

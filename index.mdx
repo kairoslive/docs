@@ -1,34 +1,35 @@
 ---
 title: "Kairos: Unified Prediction Market & Perpetuals Platform"
 sidebarTitle: "Home"
-description: "Kairos gives you a single API surface to trade, stream, and analyze prediction markets and perpetuals across Polymarket, Kalshi, Predict.fun, and more."
+description: "One API surface to trade, stream, and analyze prediction markets and perpetuals across Polymarket, Kalshi, Predict.fun, and more."
+icon: "house"
 ---
 
-Kairos is a unified trading platform for prediction markets and perpetuals. Whether you're building an algorithmic strategy, pulling live market data into your app, or executing large block trades through private auctions, Kairos provides a single set of APIs that works across all major venues — Polymarket, Kalshi, Predict.fun, and beyond.
+Kairos is a unified trading platform for prediction markets and perpetuals. Whether you're building an algorithmic strategy, pulling live market data into your app, or executing large block trades through private auctions, Kairos provides a single set of APIs that works across every major venue — Polymarket, Kalshi, Predict.fun, and beyond.
 
 <CardGroup cols={2}>
   <Card title="Quick Start" icon="rocket" href="/quickstart">
     Make your first API call in minutes — no signup required for market data.
   </Card>
-  <Card title="Authentication" icon="key" href="/authentication">
-    Learn how to get your API key and authenticate every request.
+  <Card title="Authentication" icon="key" href="/guides/authentication">
+    Get an API key and send the credential triple the right way.
   </Card>
-  <Card title="API Reference" icon="code" href="/market-data/overview">
-    Explore all 155 endpoints across four APIs with live request examples.
+  <Card title="API Reference" icon="code" href="/api-reference">
+    Browse every endpoint across all of Kairos's APIs, with request examples.
   </Card>
   <Card title="WebSocket Streams" icon="bolt" href="/websocket/market-data-websocket">
-    Subscribe to real-time orderbooks, trades, and price updates.
+    Consume orderbooks, trades, and prices in real time.
   </Card>
 </CardGroup>
 
 ## What You Can Build
 
 <CardGroup cols={3}>
-  <Card title="Trading Bots" icon="robot" href="/guides/overview">
-    Submit, manage, and cancel orders across multiple venues from a single endpoint.
+  <Card title="Trading Bots" icon="robot" href="/websocket/order-execution">
+    Place, manage, and cancel orders over one persistent WebSocket — the lowest-latency path.
   </Card>
   <Card title="Market Analytics" icon="chart-line" href="/market-data/overview">
-    Stream candles, trades, and metadata for thousands of prediction markets.
+    Pull candles, trades, and metadata for thousands of prediction markets.
   </Card>
   <Card title="Cross-Venue Routing" icon="route" href="/guides/cross-venue-routing">
     Fill large sizes by routing orders across both legs of linked markets automatically.
@@ -39,36 +40,41 @@ Kairos is a unified trading platform for prediction markets and perpetuals. Whet
   <Card title="Combo Markets" icon="layer-group" href="/guides/combos">
     Buy and manage Polymarket parlay positions with a single API call.
   </Card>
-  <Card title="Trader Analytics" icon="user-chart" href="/rest/trader-stats">
+  <Card title="Trader Analytics" icon="chart-simple" href="/rest/trader-stats">
     Query PnL history, open positions, and trade fills by wallet address.
   </Card>
 </CardGroup>
 
 ## APIs at a Glance
 
-Kairos exposes four distinct API services, each optimized for a specific use case:
+Kairos exposes several API services, each optimized for a specific use case:
 
-| API | Base URL | Purpose |
-|-----|----------|---------|
-| **Market Data API** | `md.kairos.trade` | Free, key-free read access to markets, candles, trades, and perpetuals |
-| **Data API** | `data.kairos.trade` | Full data plane — search, sports, analytics, PnL, and discovery |
-| **Execution API** | `execution.kairos.trade` | Order entry, cancellation, routing, combos, and onboarding |
-| **Agora Auction API** | `agora.kairos.trade` | Private institutional auction house with WebSocket event streams |
+| API | Base URL | Auth | Purpose |
+| --- | --- | --- | --- |
+| **Market Data API** | `https://md.kairos.trade` | None | Free, key-free read access to markets, candles, trades, and perpetuals |
+| **Data API** | `https://data.kairos.trade` | API key | Full data plane — search, sports, analytics, PnL, and discovery |
+| **Execution API** | `https://execution.kairos.trade` | API key | Order entry, cancellation, routing, combos, and onboarding |
+| **Agora Auction API** | `https://agora.kairos.trade` | API key / JWT | Private institutional auction house with a WebSocket event stream |
+| **RPC API** | `https://rpc.kairos.trade/api/rpc` | API key / JWT | Account-scoped trading state (positions, balances, copy trading) |
+| **RFQ Network** | `https://rfq.kairos.trade` | API key / JWT | Cross-venue request-for-quote over REST, WebSocket, and FIX |
 
 <Note>
-  The **Market Data API** is completely free and requires no signup or API key. Start streaming live data immediately.
+  The **Market Data API** is completely free and requires no signup or API key. Start fetching live data immediately.
 </Note>
 
-## Get Started in 3 Steps
+## Get Started in 4 Steps
 
 <Steps>
   <Step title="Try market data for free">
-    The Market Data API (`md.kairos.trade`) requires no authentication. Fetch live market data right now with a single GET request.
+    The Market Data API (`md.kairos.trade`) requires no authentication. Fetch live market data right now with a single `GET /v1/markets` request — see the [Quickstart](/quickstart).
   </Step>
   <Step title="Get your API key">
-    Sign up at [app.kairos.trade](https://app.kairos.trade) to get your API key for the Data, Execution, and Agora APIs.
+    Create an account at [app.kairos.trade](https://app.kairos.trade) and generate a key under **Settings → API Keys**. You receive a credential triple (`X-Client-Id`, `X-Api-Key`, `X-Api-Secret`) — see [Authentication](/guides/authentication).
   </Step>
   <Step title="Connect your venue accounts">
-    Use the Execution API's onboarding endpoints to link your Polymarket, Kalshi, or Predict.fun accounts and start trading.
+    Use the Execution API's onboarding endpoints to link your Polymarket, Kalshi, or Predict.fun account and enable trading.
+  </Step>
+  <Step title="Trade over WebSocket">
+    Submit and cancel orders on the persistent `/ws` socket rather than polling REST — it's faster and simpler to build. See [Order Execution over WebSocket](/websocket/order-execution).
   </Step>
 </Steps>

@@ -2,16 +2,39 @@
 title: "API Reference"
 sidebarTitle: "Overview"
 description: "Every public Kairos API in one place — REST, streaming, and OpenAPI-generated endpoint references across four services."
+icon: "book"
 ---
+<Note>
+  **Prefer WebSocket for order submission.** Placing and cancelling orders over the persistent `/ws` socket is lower-latency (one round trip instead of the REST submit/poll pair) and simpler to build: one connection, one auth handshake, and pushed `order_update`/`fill` events instead of polling. See [Order Execution over WebSocket](/websocket/order-execution).
+</Note>
 
-Kairos exposes four purpose-built API services. Each has its own base URL, but they share authentication, pagination, and error conventions.
+Kairos exposes several API services. Each has its own base URL, authentication model, pagination style, and error envelope — the only thing genuinely shared is the API-key header triple. This page maps them; the navigation holds the hand-written guides and the OpenAPI-generated endpoint references.
 
 | API | Base URL | Auth | Purpose |
 | --- | --- | --- | --- |
-| **Market Data API** | `https://md.kairos.trade` | None | Free, key-free market data: markets, candles, trades, resolutions, perpetuals |
-| **Data API** | `https://data.kairos.trade` | API key or JWT | Markets, search, sports, trader analytics, PnL, discovery |
-| **Execution API** | `https://execution.kairos.trade` | API key or JWT | Order entry, cancellation, routing, combos, external signing |
-| **Agora Auction API** | `https://agora.kairos.trade` | API key or JWT | Private institutional auctions with firm quotes and a WebSocket event stream |
+| **Market Data API** | `https://md.kairos.trade` | None | Free market data: markets, candles, trades, resolutions, perpetuals |
+| **Data API** | `https://data.kairos.trade` | API key | Markets, search, sports, trader analytics, PnL, discovery |
+| **Execution API** | `https://execution.kairos.trade` | API key | Order entry, cancellation, routing, combos, external signing |
+| **Agora Auction API** | `https://agora.kairos.trade` | Session JWT | Private institutional auctions with firm quotes and a WebSocket event stream |
+| **RPC API** | `https://rpc.kairos.trade/api/rpc` | API key / JWT | Account-scoped state: positions, balances, copy trading (tRPC) |
+| **RFQ Network** | `https://rfq.kairos.trade` | API key / JWT | Cross-venue request-for-quote over REST, WebSocket, and FIX |
+
+## Your first request
+
+The Market Data API needs no credentials — call it right now:
+
+```bash
+curl "https://md.kairos.trade/v1/markets?provider=polymarket&limit=5"
+```
+
+For an authenticated service, send the API-key triple on every request:
+
+```bash
+curl "https://data.kairos.trade/markets/active?provider=polymarket&limit=5" \
+  -H "X-Client-Id: $KAIROS_CLIENT_ID" \
+  -H "X-Api-Key: $KAIROS_API_KEY" \
+  -H "X-Api-Secret: $KAIROS_API_SECRET"
+```
 
 <CardGroup cols={2}>
   <Card title="Submit an order" icon="paper-plane" href="/rest/orders">
@@ -24,13 +47,13 @@ Kairos exposes four purpose-built API services. Each has its own base URL, but t
     Platform tiers, per-venue exchange fees, and the live fee-quote endpoint.
   </Card>
   <Card title="Get an API key" icon="key" href="/guides/authentication">
-    API keys, JWTs, and scopes for the Data and Execution APIs.
+    API keys, scopes, the session JWT, and how each service reports auth failures.
   </Card>
 </CardGroup>
 
 ## Machine-readable specifications
 
-Every public API is described by an OpenAPI 3.1 specification. The copies below power the auto-generated endpoint references in this section; download them to generate clients or feed your own tooling.
+Every public API is described by an OpenAPI 3.1 specification. The copies below power the auto-generated endpoint references; download them to generate clients or feed your own tooling.
 
 | Spec | Service |
 | --- | --- |
@@ -45,7 +68,7 @@ Every public API is described by an OpenAPI 3.1 specification. The copies below 
 
 ## Conventions
 
-- **Authentication** — the Market Data API is anonymous and free. The Data, Execution, and Agora APIs accept a Kairos API key (`X-Client-Id`, `X-Api-Key`, `X-Api-Secret`) or a session JWT, gated per-operation by scopes. See [Authentication](/guides/authentication).
-- **Pagination** — cursor-based. Responses carry an opaque `nextCursor`; pass it back to fetch the next page.
-- **Errors** — standard HTTP status codes with a JSON body. `401` means missing or invalid credentials, `403` means the credential lacks the required scope, and `429` means a rate limit was hit.
-- **Rate limits** — per-IP on the free tier and per-key on authenticated tiers. Honor `429` with exponential backoff.
+- **Authentication** — the Market Data API is anonymous and free. The Data and Execution APIs accept the API-key triple; Agora requires a first-party session JWT; the RPC API accepts either. Scopes are per-operation. See [API Key Auth](/guides/authentication).
+- **Pagination** — mixed. The Market Data API, `/markets/active`, `/trades/kalshi`, and `/matched-markets` are cursor-based (pass the returned `next_cursor` back as `cursor`). Most Data API list endpoints and all RPC list procedures use `limit`/`offset`.
+- **Errors** — each service has its own envelope: Execution returns `error_details.code`, the Data API returns `{"detail": ...}`, the Market Data API returns `{"error": {"code", "message"}}`, and the RPC API returns a tRPC error with `error.data.code`. Status codes are standard HTTP.
+- **Rate limits** — per-IP on the free tier, per-key on authenticated tiers. Honor `429` with exponential backoff.
