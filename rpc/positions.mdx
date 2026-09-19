@@ -7,7 +7,7 @@ icon: "briefcase"
 
 The `positions.*` router is the **authoritative source** for a user's current holdings across every venue Kairos routes to — `polymarket`, `kalshi` (with `kalshi_offchain` canonicalised to it), `predictfun`, `hyperliquid`, and `opinion`. Reach for it when a bot needs to know what it currently holds, what a position is worth, or how to close one. It reads from the Kairos database — the same positions state that drives the UI's portfolio screen and the bot engine's fill tracking — so it reflects any fill the moment our executor records it.
 
-For programmatic bots / liquidation scripts, prefer `positions.getPositions` over the public `GET /trader-stats/profile/{wallet_address}` REST endpoint. That REST endpoint proxies third-party on-chain indexing for Polymarket and can lag or miss positions that were settled off-exchange (walk-the-book partial fills, redeemed positions, etc.).
+For programmatic bots / liquidation scripts, prefer `positions.getPositions` over the public `GET /trader-stats/positions/{wallet_address}` REST endpoint. That REST endpoint proxies third-party on-chain indexing for Polymarket and can lag or miss positions that were settled off-exchange (walk-the-book partial fills, redeemed positions, etc.).
 
 **Auth:** `getPositions` and `getPosition` accept an API key with the **`position:read`** scope (not the general `read` scope — see [API Keys](/rpc/api-keys#scopes)); `closePosition` requires the `trade` scope. Pass your credential as the `X-Client-Id` / `X-Api-Key` / `X-Api-Secret` headers. Position management/maintenance procedures are not exposed to API keys.
 
@@ -153,7 +153,7 @@ async def list_stuck_positions(headers: dict) -> list[dict]:
 > only need one venue.
 
 > **Don't fall back to trader-stats when this call is slow.** The trader-stats
-> REST endpoint (`GET /trader-stats/profile/{wallet}`) caches responses keyed
+> REST endpoint (`GET /trader-stats/positions/{wallet}`) caches responses keyed
 > by wallet + query params. If a transient upstream outage causes a zero-volume
 > response to be cached, subsequent calls can keep seeing `total_volume: 0`
 > until the cache refreshes. `positions.getPositions` reads live position state
