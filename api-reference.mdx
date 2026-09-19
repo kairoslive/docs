@@ -19,6 +19,10 @@ Kairos exposes several API services. Each has its own base URL, authentication m
 | **RPC API** | `https://rpc.kairos.trade/api/rpc` | API key / JWT | Account-scoped state: positions, balances, copy trading (tRPC) |
 | **RFQ Network** | `https://rfq.kairos.trade` | API key / JWT | Cross-venue request-for-quote over REST, WebSocket, and FIX |
 
+<Note>
+  The four API groups below the overview are **generated from the OpenAPI specs**, so they always reflect the current wire contract — parameters, request bodies, and responses. The **Guides** beneath them add the caveats that don't fit in a schema: pagination quirks, field casing, price scales, and error handling. Read the generated page for the exact fields, then the matching guide for the gotchas.
+</Note>
+
 ## Your first request
 
 The Market Data API needs no credentials — call it right now:
@@ -65,6 +69,17 @@ Every public API is described by an OpenAPI 3.1 specification. The copies below 
 <Note>
   WebSocket surfaces are described separately with AsyncAPI. See the [WebSocket](/websocket/market-data-websocket) section for the wire contracts and [Protobuf Schema](/websocket/protobuf-reference) for the generated message definitions.
 </Note>
+
+## What trips people up first
+
+These bite almost every first integration. Each links to the guide with the full detail.
+
+- **`price` is required on every order** — including market orders, where it is the limit you are willing to cross, not a sentinel. Omitting it is a `400`. See [Orders](/rest/orders).
+- **Tick grids change while a market trades.** Read `ranges` and `min_tick` (and treat them as decimal strings, not floats), not a single cached tick size. See [Markets, Resolutions & Marks](/market-data/markets).
+- **Casing is per-service.** `/orders` and most REST is `snake_case`; `/combo/*` is `camelCase`; the RPC API uses `camelCase`. Copy the generated reference for the service you're calling. See [Combos & Parlays](/rest/combo).
+- **Price scales differ by surface.** Candles and trades are on a `0–100` scale; marks and resolution payouts are `0–1`; some discovery feeds return `camelCase` with a `24h` suffix. See [Markets & Prices](/rest/markets).
+- **A bad credential triple on an execution mutation is `403`, not `401`.** Handle both. See [Orders](/rest/orders#errors).
+- **The fastest way to trade is the WebSocket.** Submit and cancel over `/ws` instead of the REST submit/poll pair. See [Order Execution over WebSocket](/websocket/order-execution).
 
 ## Conventions
 
