@@ -1,6 +1,6 @@
 ---
 title: "Markets"
-description: "Market details, prices, metadata, outcomes, crypto contracts, and discovery"
+description: "Market details, prices, metadata, tick sizes, outcomes, crypto contracts, and discovery"
 sidebarTitle: "Markets & Prices"
 icon: "store"
 ---
@@ -211,12 +211,9 @@ Flat object keyed by the requested `market_id`, no wrapper:
 
 ## Tick size
 
-Retired. Tick grids are served by the Market Data API at
-[`GET /v1/markets/tick-size`](/market-data/markets#tick-size), with a batch
-variant and no API key required. The request parameters (`provider`,
-`contract_id`, `asset_id`) and the response body are the same, so moving an
-integration is a base-URL change.
-
+<Note>
+Retired. Tick grids are served by the Market Data API at [`GET /v1/markets/tick-size`](/market-data/markets#tick-size), which also has a batch variant and needs no API key. The request parameters (`provider`, `contract_id`, `asset_id`) and the response body are the same, so moving an integration is a base-URL change.
+</Note>
 
 ## Market metadata
 
